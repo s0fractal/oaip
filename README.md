@@ -73,6 +73,21 @@ Claims           formalized assertions about states
 Git / CAS        content-addressed bytes
 ```
 
+## The bridge generalizes: graduating decisions
+
+The `accept` bridge isn't code-specific. The same *subject + evidence + reason →
+signed Warrant* move graduates **any** decision that is attributed and
+tamper-evident but not yet **signed** — for instance a `decision` node in a
+[mind-os / workos](https://github.com/s0fractal/mind-os) thought-graph, whose own
+README calls per-author cryptographic signatures *"the deliberate next tier."*
+This bridge **is** that tier: it reads the decision's public projection and files
+a Warrant that ratifies it, citing the source as evidence — without the source
+taking a hard dependency on Warrant. See
+[`examples/graduate-decision.sh`](examples/graduate-decision.sh). So the four
+repos compose into one stack: Σ-GLYPH computes checks, OAIP observes doing,
+mind-os records reasoning, and Warrant is the signed-decision tier both provenance
+halves graduate into.
+
 ## Status
 
 `v0.1` DRAFT — see [`SPEC.md`](SPEC.md). Reference implementation in

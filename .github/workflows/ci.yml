@@ -21,3 +21,10 @@ jobs:
           export WARRANT_CLI="python3 /tmp/warrant/impl/warrant.py"
           bash examples/auth-demo.sh | tee /dev/stderr \
             | grep -q "correctly refused: execution success is not acceptance"
+      - name: Graduation bridge (an unsigned decision → a signed Warrant)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export WARRANT_CLI="python3 /tmp/warrant/impl/warrant.py"
+          bash examples/graduate-decision.sh | tee /dev/stderr \
+            | grep -q "graduated -> signed Warrant"
