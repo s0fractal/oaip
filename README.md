@@ -22,25 +22,29 @@ Because those treat **an agent's own JSON as fact**: it wrote "fixed auth", so t
 
 So the bridge **refuses** to accept a claim whose check failed — even if the command returned 0. That refusal is the whole product.
 
-## Ten minutes
+## Ten seconds
 
 ```bash
 cd your-git-repo
 oaip=~/…/oaip/impl/oaip.py
-
 python3 $oaip init                                  # ledger + a local Warrant store + dev key
-I=$(python3 $oaip intent "make login reject expired tokens")
-python3 $oaip run --intent $I -- your-agent-command # snapshots workspace before/after, records effects
-python3 $oaip claim --execution <id> \
+
+# one-shot: intent → run the agent action → validate → accept ONLY if the check passes
+python3 $oaip do --intent "make login reject expired tokens" \
         --predicate auth.rejects-expired \
-        --check "python3 tests/test_auth.py"        # a SEPARATE validation, not the exit code
-python3 $oaip accept --claim <id> --actor you@host  # -> a signed Warrant (refused if the check failed)
+        --check "python3 tests/test_auth.py" \
+        --actor you@host \
+        -- your-agent-command
 
 python3 $oaip log        # intent → execution → effects → claim → warrant
 python3 $oaip verify     # the Warrant store verifies
 ```
 
-`examples/auth-demo.sh` runs the whole thing, including the refusal case.
+If the validation check passes, `do` files a signed Warrant. If the command
+exits 0 but the check **fails**, `do` refuses and files nothing — that refusal
+is the whole point (SPEC §4). The four verbs (`intent` / `run` / `claim` /
+`accept`) are also available separately when you want to inspect each step;
+`examples/auth-demo.sh` walks them, including the refusal case.
 
 ## What it gets right by construction
 

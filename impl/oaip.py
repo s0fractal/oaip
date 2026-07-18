@@ -27,12 +27,11 @@ Principles it already honors:
 
 Usage:
   oaip.py init
-  oaip.py intent "Refactor auth module"
-  oaip.py run --intent <id> -- <command...>
-  oaip.py claim --execution <id> --predicate auth.rejects-expired --check "<cmd>"
-  oaip.py accept --claim <id> --actor me@host
+  oaip.py do --intent "..." --predicate p --check "<cmd>" --actor me@host -- <command...>
+  # or step by step: intent / run / claim / accept
   oaip.py log
   oaip.py verify
+  oaip.py conformance [vectors.json]
 
 Stdlib only (+ the Warrant reference CLI for the bridge). Run inside a git repo.
 """
@@ -188,6 +187,7 @@ def cmd_intent(a):
                 (i, a.description, a.parent, int(time.time())))
     con.commit()
     print(i)
+    return i
 
 
 def cmd_run(a):
@@ -213,6 +213,7 @@ def cmd_run(a):
         n += 1
     con.commit()
     print(f"execution {eid}  exit={proc.returncode}  effects={n}  before={before[:10]} after={after[:10]}")
+    return eid
 
 
 def cmd_claim(a):
@@ -242,6 +243,7 @@ def cmd_claim(a):
     con.commit()
     print(f"claim {cid}  predicate={a.predicate}  check_exit={chk.returncode}  "
           f"{'SUPPORTED' if supported else 'UNSUPPORTED (check failed)'}")
+    return cid, bool(supported)
 
 
 def cmd_accept(a):
@@ -285,6 +287,23 @@ def cmd_accept(a):
     con.commit()
     print(f"ACCEPTED -> warrant {wid}\n  (signed, hash-addressed, cites the provenance as evidence "
           f"and the validation as a cmd@v1 check)")
+
+
+def cmd_do(a):
+    """One-shot: intent → run → validate → accept-if-pass. The ergonomic verb —
+    an agent action becomes a signed decision only if its validation check
+    passes, in a single command (SPEC §4)."""
+    from argparse import Namespace
+    i = cmd_intent(Namespace(description=a.intent, parent=None))
+    eid = cmd_run(Namespace(intent=i, command=a.command))
+    cid, supported = cmd_claim(Namespace(execution=eid, predicate=(a.predicate or a.intent),
+                                         check=a.check))
+    if supported:
+        cmd_accept(Namespace(claim=cid, actor=a.actor))
+    else:
+        print("NOT accepted — validation check failed "
+              "(execution success is not acceptance; no warrant filed)")
+        sys.exit(1)
 
 
 def cmd_log(_):
@@ -334,11 +353,15 @@ def main():
     pr = sub.add_parser("run"); pr.add_argument("--intent"); pr.add_argument("command", nargs=argparse.REMAINDER); pr.set_defaults(fn=cmd_run)
     pc = sub.add_parser("claim"); pc.add_argument("--execution", required=True); pc.add_argument("--predicate", required=True); pc.add_argument("--check", required=True); pc.set_defaults(fn=cmd_claim)
     pa = sub.add_parser("accept"); pa.add_argument("--claim", required=True); pa.add_argument("--actor", required=True); pa.set_defaults(fn=cmd_accept)
+    pd = sub.add_parser("do", help="one-shot: intent -> run -> validate -> accept-if-pass")
+    pd.add_argument("--intent", required=True); pd.add_argument("--check", required=True)
+    pd.add_argument("--predicate"); pd.add_argument("--actor", required=True)
+    pd.add_argument("command", nargs=argparse.REMAINDER); pd.set_defaults(fn=cmd_do)
     sub.add_parser("log").set_defaults(fn=cmd_log)
     sub.add_parser("verify").set_defaults(fn=cmd_verify)
     pf = sub.add_parser("conformance"); pf.add_argument("vectors", nargs="?", default="examples/vectors.json"); pf.set_defaults(fn=cmd_conformance)
     a = ap.parse_args()
-    if a.cmd == "run" and a.command and a.command[0] == "--":
+    if a.cmd in ("run", "do") and a.command and a.command[0] == "--":
         a.command = a.command[1:]
     a.fn(a)
 
