@@ -1,0 +1,23 @@
+name: oaip
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Canonicalization conformance (SPEC §1 — JCS records, byte-exact)
+        run: python3 impl/oaip.py conformance examples/vectors.json
+      # Warrant is the normative decision-layer dependency (SPEC §3). Pin it by
+      # commit so the end-to-end bridge is reproducible; refresh deliberately.
+      - name: End-to-end (intent → run → claim → accept → signed Warrant; incl. §4 refusal)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'cryptography>=42,<46'
+          git clone -q https://github.com/s0fractal/warrant /tmp/warrant
+          git -C /tmp/warrant checkout -q 707b2c9a5c5a3f7957839bb76ee3cb7d3796ae4e
+          export WARRANT_CLI="python3 /tmp/warrant/impl/warrant.py"
+          bash examples/auth-demo.sh | tee /dev/stderr \
+            | grep -q "correctly refused: execution success is not acceptance"

@@ -68,6 +68,15 @@ def sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def canon(obj) -> bytes:
+    """RFC 8785 (JCS) I-JSON, EXACTLY per Warrant SPEC §4 (SPEC §1): sorted keys,
+    compact separators, UTF-8, integers only, raw non-ASCII (ensure_ascii=False).
+    A record's identity is SHA-256 of these bytes; every OAIP implementation MUST
+    agree on them, so this must match Warrant's canonicalization byte-for-byte."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
 def put_artifact(data: bytes, kind: str) -> str:
     ART.mkdir(parents=True, exist_ok=True)
     h = sha256(data)
@@ -224,8 +233,7 @@ def cmd_claim(a):
                     con.execute("SELECT path,status,after_blob FROM effects WHERE execution_id=?",
                                 (a.execution,)).fetchall()],
     }
-    subject_hash = put_artifact(json.dumps(subject, sort_keys=True, separators=(",", ":")).encode(),
-                                "claim-subject")
+    subject_hash = put_artifact(canon(subject), "claim-subject")   # JCS, SPEC §1
     cid = kid()
     con.execute("""INSERT INTO claims(id,execution_id,predicate,check_cmd,check_exit,
                    transcript_hash,subject_hash,supported,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
@@ -301,6 +309,23 @@ def cmd_verify(_):
     sys.exit(r.returncode)
 
 
+def cmd_conformance(a):
+    """SPEC §1: every OAIP record MUST canonicalize (JCS, Warrant §4) to the pinned
+    bytes and identity. Recompute canon over each vector and compare byte-exact."""
+    doc = json.loads(Path(a.vectors).read_text(encoding="utf-8"))
+    ok = 0
+    total = 0
+    for v in doc["records"]:
+        total += 1
+        got = canon(v["record"])
+        good = got.hex() == v["canon_hex"] and sha256(got) == v["canon_sha256"]
+        print(("OK  " if good else "FAIL"), v["name"], "" if good else f"got {sha256(got)[:12]}")
+        ok += good
+    tag = "ALL PASS" if ok == total else "FAILURES"
+    print(f"\nOAIP-CONFORMANCE: {tag} ({ok}/{total})")
+    sys.exit(0 if ok == total else 1)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="oaip", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -311,6 +336,7 @@ def main():
     pa = sub.add_parser("accept"); pa.add_argument("--claim", required=True); pa.add_argument("--actor", required=True); pa.set_defaults(fn=cmd_accept)
     sub.add_parser("log").set_defaults(fn=cmd_log)
     sub.add_parser("verify").set_defaults(fn=cmd_verify)
+    pf = sub.add_parser("conformance"); pf.add_argument("vectors", nargs="?", default="examples/vectors.json"); pf.set_defaults(fn=cmd_conformance)
     a = ap.parse_args()
     if a.cmd == "run" and a.command and a.command[0] == "--":
         a.command = a.command[1:]
