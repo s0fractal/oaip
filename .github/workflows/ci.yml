@@ -7,29 +7,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      # SPEC §5 is a MUST: the projection must be rebuildable from the canonical
-      # layer. Until 2026-07-30 it was not, and no test could catch it because
-      # there was no rebuild path to attempt.
-      - name: Projection is disposable (SPEC §5 — delete, rebuild, identical graph)
-        run: python3 tests/projection_rebuild.py
-      - name: Canonicalization conformance (SPEC §1 — JCS records, byte-exact)
-        run: python3 impl/oaip.py conformance examples/vectors.json
-      # Warrant is the normative decision-layer dependency (SPEC §3). Pin it by
-      # commit so the end-to-end bridge is reproducible; refresh deliberately.
-      - name: End-to-end (intent → run → claim → accept → signed Warrant; incl. §4 refusal)
-        shell: bash
+
+      # Warrant is a normative dependency, not an optional extra: SPEC §3 makes
+      # the decision layer a real Warrant record and SPEC §1 defines this
+      # format's canonicalization as "exactly per Warrant SPEC §4". Pinned by
+      # commit so a run is reproducible; refresh deliberately.
+      - name: Warrant (normative dependency, pinned)
         run: |
           set -euo pipefail
           python3 -m pip install --quiet 'cryptography>=42,<46'
           git clone -q https://github.com/s0fractal/warrant /tmp/warrant
           git -C /tmp/warrant checkout -q 707b2c9a5c5a3f7957839bb76ee3cb7d3796ae4e
-          export WARRANT_CLI="python3 /tmp/warrant/impl/warrant.py"
-          bash examples/auth-demo.sh | tee /dev/stderr \
-            | grep -q "correctly refused: execution success is not acceptance"
-      - name: Graduation bridge (an unsigned decision → a signed Warrant)
-        shell: bash
-        run: |
-          set -euo pipefail
-          export WARRANT_CLI="python3 /tmp/warrant/impl/warrant.py"
-          bash examples/graduate-decision.sh | tee /dev/stderr \
-            | grep -q "graduated -> signed Warrant"
+
+      # ONE command. The previous workflow listed steps by hand, and that is how
+      # `tools/intoto.py selftest` came to exist while running nowhere: a commit
+      # claimed the wiring was fixed after wiring only one of two new tests. The
+      # membership of the suite now lives in tools/check.py, which also reports a
+      # check that COULD NOT RUN as UNRUN (exit 2) rather than as a pass.
+      #
+      # No `--allow-unrun` here: in CI every prerequisite is installed above, so
+      # an unrun check means the environment is wrong and the run must fail. A
+      # green build that quietly skipped something is the defect this repository
+      # keeps finding.
+      - name: Every claim in this repository, executed (tools/check.py)
+        env:
+          WARRANT_IMPL: /tmp/warrant/impl
+          WARRANT_CLI: python3 /tmp/warrant/impl/warrant.py
+        run: python3 tools/check.py

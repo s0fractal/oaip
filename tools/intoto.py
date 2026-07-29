@@ -60,6 +60,8 @@ USAGE
 """
 import argparse
 import json
+import os
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -196,11 +198,42 @@ def check(con, st):
     return errs
 
 
+def _throwaway_ledger():
+    """Build a real ledger in a temp git repo and chdir into it.
+
+    WHY: this selftest used to run against whatever ledger happened to be in the
+    working directory, and printed `SKIP ... ledger has no claims` when there was
+    none — exit 0, a pass earned by having nothing to check. In a clean checkout
+    (and therefore in CI) that is the only outcome it could ever have produced.
+    A selftest that depends on ambient state is not a selftest.
+
+    Returns the TemporaryDirectory, which the caller must keep alive.
+    """
+    import subprocess
+    import tempfile
+    td = tempfile.TemporaryDirectory()
+    work = Path(td.name) / "w"
+    work.mkdir()
+    shutil.copytree(Path(__file__).resolve().parents[1] / "impl", work / "impl")
+    subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit",
+                    "-q", "--allow-empty", "-m", "init"], cwd=work, check=True)
+    run = lambda *a: subprocess.run([sys.executable, "impl/oaip.py", *a], cwd=work,
+                                    capture_output=True, text=True)
+    run("init")
+    r = run("do", "--intent", "add a file", "--check", "test -f f.txt",
+            "--actor", "selftest@local", "--", "sh", "-c", "echo hi >> f.txt")
+    if "ACCEPTED" not in r.stdout:
+        raise SystemExit(f"selftest setup failed: {r.stdout}{r.stderr}")
+    os.chdir(work)
+    return td
+
+
 def selftest(con):
     row = con.execute("SELECT id FROM claims ORDER BY created_at LIMIT 1").fetchone()
     if not row:
-        print("SKIP  oaip in-toto bridge: ledger has no claims")
-        return 0
+        sys.exit("selftest needs a claim and the throwaway ledger produced none — "
+                 "this is a setup failure, not something to skip past")
     ok = True
 
     def case(name, cond):
@@ -242,6 +275,8 @@ def main():
     ap.add_argument("cmd", choices=["wrap", "check", "selftest"])
     ap.add_argument("arg", nargs="?")
     a = ap.parse_args()
+    # selftest builds its own ledger; wrap/check operate on the caller's.
+    keepalive = _throwaway_ledger() if a.cmd == "selftest" else None
     con = _db()
     if a.cmd == "wrap":
         if not a.arg:
@@ -257,7 +292,9 @@ def main():
         print("OAIP-INTOTO: " + ("BOUND — the Statement describes this claim"
                                  if not errs else f"{len(errs)} binding error(s)"))
         return 1 if errs else 0
-    return selftest(con)
+    rc = selftest(con)
+    del keepalive
+    return rc
 
 
 if __name__ == "__main__":

