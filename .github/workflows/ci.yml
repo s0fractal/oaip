@@ -10,14 +10,21 @@ jobs:
 
       # Warrant is a normative dependency, not an optional extra: SPEC §3 makes
       # the decision layer a real Warrant record and SPEC §1 defines this
-      # format's canonicalization as "exactly per Warrant SPEC §4". Pinned by
-      # commit so a run is reproducible; refresh deliberately.
+      # format's canonicalization as "exactly per Warrant SPEC §4".
+      #
+      # WHICH Warrant is therefore load-bearing, and a stale pin answers it
+      # wrongly. The previous pin (707b2c9a, 2026-07-18) predated Warrant's strict
+      # I-JSON layer almost entirely: measured against it, tests/ijson_parity.py
+      # reports DRIFT on 7 of 25 reject vectors — NaN, Infinity, -Infinity, three
+      # lone-surrogate cases and a leading BOM were all accepted there and are
+      # refused here. Refresh deliberately, and expect the parity test to say so
+      # when the pin drifts behind again.
       - name: Warrant (normative dependency, pinned)
         run: |
           set -euo pipefail
           python3 -m pip install --quiet 'cryptography>=42,<46'
           git clone -q https://github.com/s0fractal/warrant /tmp/warrant
-          git -C /tmp/warrant checkout -q 707b2c9a5c5a3f7957839bb76ee3cb7d3796ae4e
+          git -C /tmp/warrant checkout -q 1f4915404db9542fb78baca7d4058d0ec313754e
 
       # ONE command. The previous workflow listed steps by hand, and that is how
       # `tools/intoto.py selftest` came to exist while running nowhere: a commit

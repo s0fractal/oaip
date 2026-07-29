@@ -31,6 +31,7 @@ float look accepted. Checking the call instead of the result is the exact defect
 class this project keeps finding.)
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -38,7 +39,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "impl"))
 import oaip as O                                              # noqa: E402
 
-WARRANT_IMPL = Path.home() / "Projects/warrant/impl"
+# WARRANT_IMPL must be honoured, and its absence must be told apart from its being
+# unset. This file first hardcoded ~/Projects/warrant and ignored the environment
+# entirely, which meant: (a) a run intended to measure a pinned commit silently
+# measured whatever was checked out locally — caught while trying to predict a CI
+# failure, by getting SAME DOMAIN from a commit that could not have produced it;
+# and (b) in CI, where that path does not exist, it would have printed SKIP and
+# exited 0 while tools/check.py reported the check as `ok`. A parity check that
+# passes by not looking is the exact defect this repository keeps finding.
+_ENV_IMPL = os.environ.get("WARRANT_IMPL")
+WARRANT_IMPL = Path(_ENV_IMPL) if _ENV_IMPL else Path.home() / "Projects/warrant/impl"
 ok = True
 
 
@@ -59,9 +69,14 @@ def accepts(loader, raw):
 
 def main():
     if not (WARRANT_IMPL / "warrant.py").is_file():
+        if _ENV_IMPL:
+            # Pointed somewhere deliberately and it is not there: a configuration
+            # error, not an absence to skip past.
+            print(f"FAIL  WARRANT_IMPL={_ENV_IMPL} has no warrant.py")
+            return 1
         print(f"SKIP  I-JSON parity: no Warrant checkout at {WARRANT_IMPL}")
         print("      (Warrant is a normative dependency; parity cannot be "
-              "measured without it)")
+              "measured without it — set WARRANT_IMPL)")
         return 0
     sys.path.insert(0, str(WARRANT_IMPL))
     import warrant as W
