@@ -7,6 +7,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
+      # SPEC §5 is a MUST: the projection must be rebuildable from the canonical
+      # layer. Until 2026-07-30 it was not, and no test could catch it because
+      # there was no rebuild path to attempt.
+      - name: Projection is disposable (SPEC §5 — delete, rebuild, identical graph)
+        run: python3 tests/projection_rebuild.py
       - name: Canonicalization conformance (SPEC §1 — JCS records, byte-exact)
         run: python3 impl/oaip.py conformance examples/vectors.json
       # Warrant is the normative decision-layer dependency (SPEC §3). Pin it by
