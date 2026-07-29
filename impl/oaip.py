@@ -183,8 +183,20 @@ def cmd_init(_):
 def cmd_intent(a):
     i = kid()
     con = db()
+    ts = int(time.time())
+    # SPEC §5 is a MUST: the canonical layer is content-addressed artifacts plus the
+    # Warrant store, and the SQLite index is a PROJECTION that must be rebuildable
+    # from it. Records used to exist only as rows -- so deleting the projection
+    # destroyed the invocation, the exit code, the state snapshots, the environment
+    # fingerprint and the intent link, none of which appeared anywhere
+    # content-addressed. Demonstrated 2026-07-30 by deleting ledger.db. The
+    # projection was the source of truth, which is the one thing §5 forbids, and
+    # the opposite of the SPEC's own closing line.
+    put_artifact(canon({"oaip_record": "intent@v1", "id": i,
+                        "description": a.description, "parent": a.parent,
+                        "ts": ts}), "record:intent")
     con.execute("INSERT INTO intents(id, description, parent_id, created_at) VALUES (?,?,?,?)",
-                (i, a.description, a.parent, int(time.time())))
+                (i, a.description, a.parent, ts))
     con.commit()
     print(i)
     return i
@@ -198,12 +210,30 @@ def cmd_run(a):
     stdout_hash = put_artifact((proc.stdout + proc.stderr).encode(), "stdout")
     eid = kid()
     con = db()
+    ts = int(time.time())
+    effects = list(effects_between(before, after))
+    # One canonical artifact carrying the execution AND its effects and
+    # attributions, so the whole causal step survives the projection (§5).
+    put_artifact(canon({
+        "oaip_record": "execution@v1", "id": eid, "intent": a.intent,
+        "command": " ".join(a.command), "exit_code": proc.returncode,
+        "before_tree": before, "after_tree": after, "env_fp": env_fp,
+        "stdout": stdout_hash, "ts": ts,
+        "effects": [{"path": e["path"], "status": e["status"],
+                     "before": e["before_blob"], "after": e["after_blob"],
+                     # Attribution travels with the effect it explains: a causal
+                     # claim separated from what it explains is not recoverable.
+                     "attribution": {"cause": eid,
+                                     "method": "exclusive-command-window",
+                                     "confidence_ppm": 999000}}
+                    for e in effects],
+    }), "record:execution")
     con.execute("""INSERT INTO executions(id,intent_id,command,exit_code,before_tree,after_tree,
                    env_fp,stdout_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
                 (eid, a.intent, " ".join(a.command), proc.returncode, before, after,
-                 env_fp, stdout_hash, int(time.time())))
+                 env_fp, stdout_hash, ts))
     n = 0
-    for e in effects_between(before, after):
+    for e in effects:
         cur = con.execute("""INSERT INTO effects(execution_id,path,status,before_blob,after_blob)
                              VALUES (?,?,?,?,?)""",
                           (eid, e["path"], e["status"], e["before_blob"], e["after_blob"]))
@@ -236,6 +266,15 @@ def cmd_claim(a):
     }
     subject_hash = put_artifact(canon(subject), "claim-subject")   # JCS, SPEC §1
     cid = kid()
+    # The claim record itself, not only its subject: check command, exit code,
+    # verdict and transcript are the §4 evidence that execution success is not
+    # acceptance, and they were projection-only until now.
+    put_artifact(canon({"oaip_record": "claim@v1", "id": cid,
+                        "execution": a.execution, "predicate": a.predicate,
+                        "check": a.check, "check_exit": chk.returncode,
+                        "supported": bool(supported), "transcript": transcript_hash,
+                        "subject": subject_hash, "ts": int(time.time())}),
+                 "record:claim")
     con.execute("""INSERT INTO claims(id,execution_id,predicate,check_cmd,check_exit,
                    transcript_hash,subject_hash,supported,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
                 (cid, a.execution, a.predicate, a.check, chk.returncode,
@@ -322,6 +361,77 @@ def cmd_log(_):
                     print(f"      WARRANT {wr[0][:16]}…  (signed decision)")
 
 
+def cmd_rebuild(_):
+    """Reconstruct the SQLite projection from the canonical layer alone (§5).
+
+    The MUST this exists to make true: "Deleting the projection and rebuilding it
+    from artifacts + warrants MUST yield the same graph." Until 2026-07-30 there
+    was no way to attempt it, and the attempt would have failed -- the invocation,
+    exit code, state snapshots and environment fingerprint lived only in rows.
+
+    Reads ONLY .oaip/artifacts. If it needs the database to rebuild the database,
+    the claim is circular and the check is worthless.
+    """
+    if DB.exists():
+        DB.unlink()
+    con = db()
+    con.executescript(SCHEMA)       # one schema definition, not a copy of it
+    records = []
+    for path in sorted(ART.glob("*")):
+        try:
+            doc = json.loads(path.read_bytes())
+        except Exception:
+            continue                # a non-record artifact (transcript, blob)
+        if isinstance(doc, dict) and isinstance(doc.get("oaip_record"), str):
+            records.append(doc)
+    # Deterministic order: by timestamp then id, so a rebuild is reproducible and
+    # two rebuilds of the same artifacts give the same projection.
+    records.sort(key=lambda d: (d.get("ts", 0), d.get("id", "")))
+    counts = {"intent@v1": 0, "execution@v1": 0, "claim@v1": 0}
+    for d in records:
+        kind = d["oaip_record"]
+        if kind == "intent@v1":
+            con.execute("INSERT OR REPLACE INTO intents(id,description,parent_id,created_at)"
+                        " VALUES (?,?,?,?)", (d["id"], d.get("description"),
+                                              d.get("parent"), d.get("ts")))
+        elif kind == "execution@v1":
+            con.execute("""INSERT OR REPLACE INTO executions(id,intent_id,command,exit_code,
+                           before_tree,after_tree,env_fp,stdout_hash,created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (d["id"], d.get("intent"), d.get("command"), d.get("exit_code"),
+                         d.get("before_tree"), d.get("after_tree"), d.get("env_fp"),
+                         d.get("stdout"), d.get("ts")))
+            for e in d.get("effects", []):
+                cur = con.execute("""INSERT INTO effects(execution_id,path,status,
+                                     before_blob,after_blob) VALUES (?,?,?,?,?)""",
+                                  (d["id"], e.get("path"), e.get("status"),
+                                   e.get("before"), e.get("after")))
+                at = e.get("attribution") or {}
+                if at:
+                    con.execute("""INSERT INTO attributions(effect_id,cause,method,
+                                   confidence_ppm) VALUES (?,?,?,?)""",
+                                (cur.lastrowid, at.get("cause"), at.get("method"),
+                                 at.get("confidence_ppm")))
+        elif kind == "claim@v1":
+            con.execute("""INSERT OR REPLACE INTO claims(id,execution_id,predicate,check_cmd,
+                           check_exit,transcript_hash,subject_hash,supported,created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (d["id"], d.get("execution"), d.get("predicate"), d.get("check"),
+                         d.get("check_exit"), d.get("transcript"), d.get("subject"),
+                         1 if d.get("supported") else 0, d.get("ts")))
+        else:
+            continue
+        counts[kind] = counts.get(kind, 0) + 1
+    # Re-register the artifacts themselves, so the index over the canonical layer
+    # is complete rather than only covering what the records referenced.
+    for path in sorted(ART.glob("*")):
+        con.execute("INSERT OR IGNORE INTO artifacts(hash,kind,size) VALUES (?,?,?)",
+                    (path.name, "rebuilt", path.stat().st_size))
+    con.commit()
+    print("rebuilt projection from the canonical layer: "
+          + ", ".join(f"{k.split('@')[0]}={v}" for k, v in sorted(counts.items())))
+
+
 def cmd_verify(_):
     r = subprocess.run(WARRANT + ["--store", str(WSTORE), "verify"], capture_output=True, text=True)
     print(r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "(empty store)")
@@ -358,6 +468,8 @@ def main():
     pd.add_argument("--predicate"); pd.add_argument("--actor", required=True)
     pd.add_argument("command", nargs=argparse.REMAINDER); pd.set_defaults(fn=cmd_do)
     sub.add_parser("log").set_defaults(fn=cmd_log)
+    sub.add_parser("rebuild", help="reconstruct the projection from artifacts (SPEC s5)"
+                   ).set_defaults(fn=cmd_rebuild)
     sub.add_parser("verify").set_defaults(fn=cmd_verify)
     pf = sub.add_parser("conformance"); pf.add_argument("vectors", nargs="?", default="examples/vectors.json"); pf.set_defaults(fn=cmd_conformance)
     a = ap.parse_args()
