@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "oaip"
 # Tracks SPEC.md ("Specification v0.1"); the repo has no release tags yet.
-version = "0.1.0"
+version = "0.2.0"
 description = "Observed Action & Intent Protocol: a content-addressed causal graph of what humans, agents, and tools actually did — and on what observed basis you accepted the result."
 readme = "README.md"
 requires-python = ">=3.9"
