@@ -117,14 +117,19 @@ better evidence of good faith than finding them hidden.
   note fall back to subject-hash matching restricted to supported claims — two
   SUPPORTED claims with byte-identical subjects still cannot be told apart for
   those old records.
-- **The same review broke the snapshot's `.oaip` exclusion twice** (nested
-  ledgers leaked the signing key; cwd-relative pathspecs both leaked a
+- **The snapshot's `.oaip` exclusion has been broken three times by review**
+  (nested ledgers leaked the signing key; cwd-relative pathspecs both leaked a
   HEAD-tracked root ledger and silently narrowed the "full worktree" snapshot to
-  the cwd subtree). Fixed with repo-rooted, depth-agnostic pathspecs
-  (`:/`, `:(top,exclude,glob)**/.oaip/**`), regression-tested from root and
-  subdirectory. The earlier docstring claim that the exclusion "holds in every
-  repo regardless of user configuration" was refuted as written; what is claimed
-  now is exactly what `tests/key_custody.py` executes.
+  the cwd subtree; and the pathspec matched case-SENSITIVELY, so on the
+  case-INSENSITIVE filesystem this project is developed on the key leaked as
+  `.OAIP/dev.key` — and `tests/key_custody.py`'s own detector was
+  case-sensitive in the same way, so it could not see that). The pathspecs are
+  now repo-rooted, depth-agnostic and case-insensitive
+  (`:/`, `:(top,exclude,glob,icase)**/.oaip/**`). What is claimed is exactly
+  what `tests/key_custody.py` executes: root and nested ledgers, from root and
+  from a subdirectory, tracked and untracked, `.oaip` and `.OAIP`. It is not a
+  claim that no future arrangement of a git repository can defeat it — three
+  arrangements already did.
 
 ## Conformance vectors, including the negative half
 

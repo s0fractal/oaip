@@ -247,9 +247,9 @@ def workspace_snapshot() -> str:
     provenance. The exclusion is done here with a pathspec (not .gitignore) so
     it does not depend on user configuration.
 
-    The pathspecs are REPO-ROOTED and DEPTH-AGNOSTIC, and both properties are
-    load-bearing (2026-07-30 adversarial review, fresh-context Claude-family
-    reviewer — both holes reproduced):
+    The pathspecs are REPO-ROOTED, DEPTH-AGNOSTIC and CASE-INSENSITIVE, and all
+    three properties are load-bearing (2026-07-30 adversarial review, two rounds,
+    fresh-context Claude-family reviewer — every hole reproduced):
       * The first fix used `-- . ':(exclude).oaip'`. `:(exclude).oaip` anchors
         at the pathspec root, so a NESTED ledger (`sub/.oaip/dev.key`, from an
         `oaip init` run in a subdirectory) still landed in `.git/objects` —
@@ -262,22 +262,37 @@ def workspace_snapshot() -> str:
         `git rm --cached -- .oaip` referred to `sub/.oaip`, so a HEAD-tracked
         root `.oaip` survived into every tree written here. `:/` (add) and
         `:(top,…)` (both) resolve from the repository root regardless of cwd.
+      * `:(top,exclude,glob)` matched CASE-SENSITIVELY, and this repository's own
+        development platform (macOS/APFS) is case-INSENSITIVE. `OAIP.mkdir(
+        exist_ok=True)` therefore succeeds into a pre-existing `.OAIP`, every
+        later `.oaip/...` write lands there, and git reports the REAL on-disk
+        name — which `**/.oaip/**` does not match. Measured on macOS before this
+        fix: with `.OAIP/dev.key` HEAD-tracked, the snapshot tree listed
+        `.OAIP/dev.key` and the key's blob was in `.git/objects`; with an
+        untracked `.OAIP` and a DIRECTORY named `.gitignore` (so wall 2 only
+        warns), the tree gained `.OAIP/dev.key`, `.OAIP/ledger.db`,
+        `.OAIP/tmp.index` and `.OAIP/tmp.index.lock`. `icase` closes it; on a
+        case-SENSITIVE filesystem it costs only that a directory deliberately
+        named `.OAIP` is also treated as a ledger and left out — the safe
+        direction for a signing key.
     Verified against git 2.50: top-level and nested, from root and from a
-    subdirectory, with and without a HEAD-tracked `.oaip`."""
+    subdirectory, with and without a HEAD-tracked `.oaip`, and in both letter
+    cases on a case-insensitive filesystem."""
     tmp_index = OAIP / "tmp.index"
     env = dict(os.environ, GIT_INDEX_FILE=str(tmp_index.resolve()))
     # seed the throwaway index from HEAD if it exists, else empty, then add all
     subprocess.run(["git", "read-tree", "HEAD"], env=env, capture_output=True)
     subprocess.run(["git", "add", "-A", "--", ":/",
-                    ":(top,exclude,glob)**/.oaip/**",
-                    ":(top,exclude,glob)**/.oaip"],
+                    ":(top,exclude,glob,icase)**/.oaip/**",
+                    ":(top,exclude,glob,icase)**/.oaip"],
                    env=env, capture_output=True)
     # If HEAD itself tracks .oaip (a user committed it before init learned to
     # gitignore it), read-tree seeded those entries; drop them so no tree this
     # function writes ever contains the key or the store — at any depth, from
     # any cwd.
     subprocess.run(["git", "rm", "-r", "-q", "--cached", "--ignore-unmatch",
-                    "--", ":(top,glob)**/.oaip/**", ":(top,glob)**/.oaip"],
+                    "--", ":(top,glob,icase)**/.oaip/**",
+                    ":(top,glob,icase)**/.oaip"],
                    env=env, capture_output=True)
     tree = subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True).stdout.strip()
     tmp_index.unlink(missing_ok=True)

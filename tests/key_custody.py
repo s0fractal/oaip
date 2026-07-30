@@ -40,6 +40,17 @@ both reproduced by a fresh-context Claude-family reviewer:
 Cases 5–7 below pin all three properties: nested exclusion, repo-rooted
 removal from a subdirectory, and full-worktree reach from a subdirectory.
 
+AND IT WAS DEFECTIVE A THIRD TIME: THE LETTER CASE (second adversarial round)
+----------------------------------------------------------------------------
+`:(top,exclude,glob)` matches case-SENSITIVELY. This project is developed on
+macOS/APFS, which is case-INSENSITIVE: `Path(".oaip").mkdir(exist_ok=True)`
+succeeds into a pre-existing `.OAIP`, every `.oaip/...` write lands there, and
+git reports the real on-disk name — so the exclusion matched nothing and the
+key leaked as `.OAIP/dev.key`, tracked (4a) or untracked with a DIRECTORY named
+.gitignore removing wall 2 (4b). This FILE could not see it either: the
+detector was `".oaip" in p.split("/")`, case-sensitive in exactly the same way.
+Both are fixed; the detector is case-insensitive and cases 4a/4b are the repros.
+
 WHY THE NEGATIVE CONTROL IS IN THE FILE
 ---------------------------------------
 Case 1 re-runs the PRE-FIX snapshot procedure (read-tree, `git add -A` with no
@@ -68,12 +79,14 @@ def case(name, cond, detail=""):
 class Repo:
     """A throwaway git repo WITHOUT a .gitignore — the vulnerable configuration."""
 
-    def __init__(self, tmp):
+    def __init__(self, tmp, pre=None):
         self.dir = Path(tmp)
         self.dir.mkdir()
         self.git("init", "-q", ".")
         self.git("-c", "user.email=t@t", "-c", "user.name=t",
                  "commit", "-q", "--allow-empty", "-m", "init")
+        if pre:
+            pre(self)               # arrange the repo BEFORE `oaip init` runs
         self.run("init")
         # The property under test is about the KEY BYTES, not about Warrant:
         # if no Warrant CLI generated a key, plant a sentinel secret so the
@@ -115,9 +128,14 @@ class Repo:
                         tree).stdout.splitlines()
 
     def oaip_paths_in(self, tree):
-        # ANY path component named .oaip, at ANY depth — `startswith(".oaip")`
-        # was how this file failed to see the nested-ledger leak.
-        return [p for p in self.tree_paths(tree) if ".oaip" in p.split("/")]
+        # ANY path component named .oaip, at ANY depth, in ANY LETTER CASE.
+        # `startswith(".oaip")` was how this file failed to see the nested-ledger
+        # leak; `".oaip" in p.split("/")` was how it failed to see the leak as
+        # `.OAIP/dev.key` on the case-insensitive filesystem this project is
+        # developed on (2026-07-30, second adversarial round). A detector that
+        # cannot see the leak is not evidence about the leak.
+        return [p for p in self.tree_paths(tree)
+                if ".oaip" in [c.lower() for c in p.split("/")]]
 
 
 def main():
@@ -169,6 +187,56 @@ def main():
         case("HEAD tracks .oaip: the snapshot tree still refuses to carry it",
              L.oaip_paths_in(tree) == [],
              f"tree={tree} leaked={L.oaip_paths_in(tree)}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- 4a. THE LETTER CASE (second adversarial round, 2026-07-30).
+        # `:(top,exclude,glob)` matches case-SENSITIVELY. On the
+        # case-INSENSITIVE filesystem this project is developed on (macOS/APFS)
+        # `OAIP.mkdir(exist_ok=True)` resolves into an existing `.OAIP`, the key
+        # is written there, and git reports the real name — so `**/.oaip/**`
+        # excluded nothing. Measured on macOS before the fix, this exact case:
+        # tree listed `.OAIP/dev.key`, and `git cat-file -e` found the key blob.
+        #
+        # On a case-SENSITIVE filesystem the same arrangement is a user
+        # directory that merely LOOKS like a ledger; the assertion is the same
+        # either way, because a snapshot must not carry `.oaip` in any casing.
+        def plant_upper(L):
+            (L.dir / ".OAIP").mkdir()
+            (L.dir / ".OAIP" / "dev.key").write_text("3" * 63 + "1\n")
+            L.git("add", "-f", ".OAIP")
+            L.git("-c", "user.email=t@t", "-c", "user.name=t",
+                  "commit", "-q", "-m", "user committed .OAIP")
+
+        L = Repo(Path(tmp) / "case-tracked", pre=plant_upper)
+        (L.dir / ".gitignore").unlink(missing_ok=True)
+        tree = L.snapshot_tree()
+        case("HEAD-tracked .OAIP: snapshot carries no .oaip path in ANY case",
+             L.oaip_paths_in(tree) == [],
+             f"tree={tree} leaked={L.oaip_paths_in(tree)}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- 4b. the UNTRACKED half of the same finding, with wall 2 removed the
+        # way this branch's own directory-`.gitignore` fix removes it: a
+        # DIRECTORY named .gitignore makes `oaip init` warn and move on, so
+        # nothing is ignored and the pathspec is the only wall left. Measured on
+        # macOS before the fix: the tree gained `.OAIP/dev.key`,
+        # `.OAIP/ledger.db`, `.OAIP/tmp.index` and `.OAIP/tmp.index.lock`.
+        def plant_upper_untracked(L):
+            (L.dir / ".OAIP").mkdir()
+            (L.dir / ".gitignore").mkdir()      # wall 2 cannot be written
+
+        L = Repo(Path(tmp) / "case-untracked", pre=plant_upper_untracked)
+        # On a case-sensitive filesystem `oaip init` made its own `.oaip`; plant
+        # a sentinel in `.OAIP` too so the case there is a real leak candidate.
+        upper_key = L.dir / ".OAIP" / "dev.key"
+        if not upper_key.exists():
+            upper_key.write_text("4" * 63 + "1\n")
+        tree = L.snapshot_tree()
+        case("untracked .OAIP with no writable .gitignore: nothing .oaip-ish "
+             "in the tree", L.oaip_paths_in(tree) == [],
+             f"tree={tree} leaked={L.oaip_paths_in(tree)}")
+        case("the .OAIP signing key's bytes never entered .git/objects",
+             not L.key_in_odb(".OAIP/dev.key"))
 
     with tempfile.TemporaryDirectory() as tmp:
         # --- 5. a NESTED ledger: `oaip init` run in a subdirectory. The first
