@@ -40,6 +40,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ok = True
 
+# A ledger's signing key and keyring live in a TRUST ROOT outside the workspace
+# (2026-07-30, O4), defaulting under $XDG_CONFIG_HOME — so a throwaway ledger
+# would otherwise leave a real key in the operator's own ~/.config, named after
+# a temporary directory that no longer exists. Keep it throwaway too.
+import atexit as _atexit                                          # noqa: E402
+import os as _os                                                  # noqa: E402
+import shutil as _shutil                                          # noqa: E402
+import tempfile as _tempfile                                      # noqa: E402
+if "XDG_CONFIG_HOME" not in _os.environ:
+    _XDG = _tempfile.mkdtemp(prefix="oaip-selftest-xdg-")
+    _os.environ["XDG_CONFIG_HOME"] = _XDG
+    _atexit.register(lambda: _shutil.rmtree(_XDG, ignore_errors=True))
+
 
 def case(name, cond, detail=""):
     global ok

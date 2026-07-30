@@ -187,12 +187,121 @@ policy has authority.
 
 ## 7. Reference implementation
 
-`impl/oaip.py` — five verbs (`intent`, `run`, `claim`, `accept`) plus `log` /
-`verify`. Workspace snapshots via git plumbing (throwaway index), effects via
-`git diff-tree`, exclusive-window attribution, and the Warrant bridge (a real
-signed `accept`). `examples/auth-demo.sh` is a worked end-to-end case, including
-the §4 refusal: a command that exits 0 while breaking an invariant is not
-accepted. Stdlib only, plus the Warrant reference CLI for the bridge.
+`impl/oaip.py` — four recording verbs (`intent`, `run`, `claim`, `accept`) and
+the one-shot `do`, plus `log`, `verify`, `rebuild` (§5), `bind` (the keyring) and
+`trust-root` (where the key and keyring live — §8.4). Workspace snapshots via git
+plumbing (throwaway index), effects via `git diff-tree`, exclusive-window
+attribution, and the Warrant bridge (a real signed `accept`).
+`examples/auth-demo.sh` is a worked end-to-end case, including the §4 refusal: a
+command that exits 0 while breaking an invariant is not accepted. Stdlib only,
+plus the Warrant reference CLI for the bridge.
+
+## 8. Security considerations
+
+This section states what OAIP tries to make unforgeable, by which mechanism, and
+**against whom it fails**. It is written by capability, because "is OAIP secure"
+has no answer and "can a party who can write the workspace forge an acceptance"
+has one. Every mechanism named here is implemented in `impl/oaip.py` and executed
+by `tools/check.py`; where nothing stops an attacker, this section says so
+instead of describing a control that does not exist.
+
+### 8.1 What is being protected
+
+Exactly one fact: **that a particular claim was accepted, by a particular actor,
+under a policy** — the claim→warrant edge of §3/§4. Everything else OAIP records
+is an observation, and an observation that is wrong is a bad record, not a forged
+decision.
+
+OAIP does **not** protect: the truthfulness of the observed work (a validation
+check that tests the wrong thing passes); the availability of the ledger (anyone
+who can write the store can delete records, loudly); or the secrecy of anything
+(no field is confidential, and the ledger is not encrypted).
+
+Note the asymmetry that follows: every control below is designed so that an
+attacker's best outcome is a **refusal**. Refusals are recoverable and visible;
+a derived edge that nobody decided is neither.
+
+### 8.2 Attacker capability matrix
+
+| Capability | Can forge an acceptance? | What they CAN do | Mechanism that stops them |
+|---|---|---|---|
+| **(a) The observed agent** — write access to the workspace, i.e. everything under the repository including `.oaip/`, running as the observer's uid *if unconfined* | **Not by workspace write alone** (default deployment). **Yes** if it also runs unconfined as the observer's uid | Write/delete artifacts and store records; plant a keyring at `.oaip/trust.json`; rewrite `.oaip/store.json`; edit the file a validation check tests **before the check runs**; cause refusals at will | Trust root (key + keyring) outside the workspace (§8.4 profile B) — the planted keyring is never read; in-process Ed25519 verification over the WarrantID OAIP recomputes; keyring binding; the signed `oaip-claim:<id>` link. **Nothing stops the check-target rewrite** — see §8.5(1) |
+| **(b) A party with write access to the TRUST ROOT** | **Yes, completely** | Bind their own key to any actor, or read the key and sign directly | Nothing. This is the trust root's definition: whoever holds it decides. Mode bits (0600 key, 0600 keyring, 0700 directory, refused otherwise) exclude *other accounts on the host*, not this party |
+| **(c) A party who controls the environment or PATH** | **Yes** | Set `OAIP_TRUST_ROOT`/`XDG_CONFIG_HOME` to a keyring they wrote; replace `git` or `sh` and lie about the snapshot; replace `$WARRANT_CLI` | Nothing for the trust root or the toolchain. `$WARRANT_CLI` alone is closed: signature validity is decided in process, so a hostile CLI can make OAIP **refuse** but not believe. The environment is part of the TCB and OAIP says so rather than pretending otherwise |
+| **(d) A party with read-only access to the workspace** | **No** | Read every record, claim, transcript and the projection; correlate what an agent did | Nothing needs to: no OAIP record is secret. The signing key is not in the workspace (profile B) and is 0600 |
+| **(e) A remote party with no local access** | **No** | Nothing directly — OAIP opens no sockets and fetches nothing. Reach is indirect: through a ledger someone *imports*, or through the toolchain (Warrant, Python, git) | Address-matching on every artifact and store record; size/count caps (`MAX_STORE_RECORD_BYTES`, `SIG_DECIDE_CAP`, `SIG_NOTE_CAP`) so an imported record cannot exhaust the verifier; keyring binding, so a record signed by a key this ledger does not vouch for produces no edge |
+
+The matrix is executable: `tests/privilege_separation.py` is organised by these
+rows, and each row's negative control — the arrangement where the attack **does**
+work — is kept runnable in the same file.
+
+### 8.3 The mechanisms, and what each is worth
+
+1. **In-process Ed25519 verification** (`ed25519_verify`, RFC 8032, verify-only).
+   The signature that decides is checked by OAIP itself, over the WarrantID OAIP
+   recomputed from the record's own bytes. Removes the delegate — no program
+   named by `$WARRANT_CLI` can manufacture an acceptance. Warrant is still
+   consulted and may still veto.
+2. **Keyring binding** (`.../trust.json`, OAIP's own rule). An edge is derived
+   only from a signature by the actor the record NAMES, under a key this ledger
+   binds to that actor. Warrant SPEC §5 makes binding a report, never a failure,
+   so this rule is OAIP's.
+3. **Trust root outside the workspace** (§8.4). Makes (2) meaningful against the
+   observed agent: the keyring is not a file the observed command can write.
+4. **File-mode custody** (0600 key, 0600 keyring, 0700 directory; refused
+   otherwise, with the `chmod` in the message). Excludes other accounts on a
+   shared host and the accidental widening (umask, tarball restore, mode-less
+   filesystem). Says nothing about a same-uid process.
+5. **The signed claim link** (`subject.note` = `oaip-claim:<id>`, inside the
+   signed body). Which claim was accepted is read, not guessed; the subject blob
+   alone cannot distinguish two claims with opposite verdicts over one execution.
+6. **Untrusted-projection marker**. A rebuild that refuses leaves the bytes and
+   withdraws the authority: `log` and `verify` refuse the projection until a
+   rebuild succeeds. Without it a projection built once from a poisoned store
+   kept asserting a forged acceptance forever.
+7. **Size and count caps.** `sigs` lies outside the hashed body, so a record can
+   be padded or flooded without breaking its address; only entries that could
+   decide are verified, at most `SIG_DECIDE_CAP` per record, and a record over
+   `MAX_STORE_RECORD_BYTES` is refused before parsing.
+8. **Snapshot exclusion of the ledger and the trust root.** The observer must not
+   write its own key into the object database of the repository it observes.
+
+### 8.4 Deployment profiles
+
+| Profile | Where the key lives | Stops | Status |
+|---|---|---|---|
+| **A — in-workspace trust root** | `.oaip/dev.key`, `.oaip/trust.json` | Only a party with no workspace access | Supported for existing ledgers; warns on every accept/bind/rebuild/verify; `oaip trust-root --migrate` leaves it |
+| **B — relocated trust root** (default) | `$XDG_CONFIG_HOME/oaip/roots/<ledger>`, or `--trust-root` / `$OAIP_TRUST_ROOT` | An agent whose write access is confined to the workspace: a container mount, a CI checkout, a sandboxed tool. **Not** an unconfined same-uid process | **Implemented** |
+| **C — separate uid** | A trust root owned by an `oaip-observer` user, mode 0700, with `oaip accept` run under it (sudo rule, setuid wrapper, or a queue directory the agent may write and the observer drains) | An agent running as its own uid, unconfined | **Documented, not implemented.** OAIP has no privilege-dropping code and does not attempt any |
+| **D — observer daemon / signing service** | A long-running process holding the key, exposing "sign this WarrantID" over a socket, with its own policy on what it will sign | The same as C, plus it can apply a policy at signing time (rate limits, a human confirmation) | **Documented, not implemented.** Note it does not stop a same-uid agent from *asking* — it moves the question to what the daemon agrees to sign |
+| **E — verify-only** | No key in the observed environment at all: the agent's environment runs `oaip run`/`claim`; `accept` runs elsewhere, on a store copied out | Everything an agent can do locally, since there is nothing local to forge with | **Achievable today** with profile B plus not installing a key: `oaip verify` and `oaip rebuild` work with an empty keyring and simply derive no edges |
+
+Profiles C and D need an operating-system boundary OAIP cannot create from
+inside a single stdlib process; they are named here so a deployment can be
+described honestly rather than implied.
+
+### 8.5 What remains open
+
+1. **The validation check runs after the agent's command, against post-agent
+   workspace state, through the shell.** An agent that rewrites the test it will
+   be judged by passes honestly. This is the largest remaining hole in the §4
+   gate and no mechanism here addresses it: it needs the check to run from a
+   state the agent did not produce (a pinned revision, a separate checkout, a
+   container), which is a deployment decision, not a format one.
+2. **`claim@v1` artifacts are unsigned.** Anyone who can write
+   `.oaip/artifacts` can add a claim record; only the acceptance side is pinned
+   to a signed note.
+3. **No key rotation, no revocation, no expiry.** A bound key is bound until the
+   keyring is edited by hand.
+4. **Availability is not protected.** A party with store write access can delete
+   records or force refusals (including by rewriting the trust-root pointer);
+   every such loss is reported loudly and non-zero, which is the whole of the
+   defence.
+5. **The environment is trusted.** `git`, `sh`, the Python interpreter and
+   `$WARRANT_CLI`'s *availability* are inside the TCB; only `$WARRANT_CLI`'s
+   *verdict* has been removed from it.
+6. **`--actor` is unauthenticated free text.** The keyring binds a key to an
+   actor id; nothing binds an actor id to a person.
 
 ---
 *OAIP records what happened and on what observed basis. Warrant records the

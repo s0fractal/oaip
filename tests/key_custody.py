@@ -77,6 +77,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ok = True
 
+# THE TRUST ROOT IS NO LONGER IN THE WORKSPACE (O4, 2026-07-30), so every ledger
+# this file creates keeps its key and keyring under a THROWAWAY
+# XDG_CONFIG_HOME. Set in the environment rather than passed per-run, so that
+# every subprocess inherits it — including the ones that rebuild the environment
+# from scratch — and so no test run writes into the operator's own ~/.config.
+import atexit as _atexit                                          # noqa: E402
+import shutil as _shutil                                          # noqa: E402
+import tempfile as _tempfile                                      # noqa: E402
+_XDG = _tempfile.mkdtemp(prefix="oaip-test-xdg-")
+os.environ["XDG_CONFIG_HOME"] = _XDG
+_atexit.register(lambda: _shutil.rmtree(_XDG, ignore_errors=True))
+
+
+def trust_root(work):
+    """Where this ledger's key and keyring actually live — asked of the tool,
+    not recomputed here, so the test cannot disagree with the implementation
+    about the one path the whole property is about."""
+    r = subprocess.run([sys.executable, str(ROOT / "impl" / "oaip.py"),
+                        "trust-root", "--path"], cwd=work,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"cannot resolve the trust root in {work}: "
+                         f"{r.stdout}{r.stderr}")
+    return Path(r.stdout.strip())
+
 
 def case(name, cond, detail=""):
     global ok
@@ -471,9 +496,13 @@ def main():
         # OAIP consults before deriving any acceptance edge, so a keyring it
         # cannot update is a refusal that must be readable as one.
         L = Repo(Path(tmp) / "ro")
-        trust = L.dir / ".oaip" / "trust.json"
+        # The keyring lives in the TRUST ROOT, which since O4 is outside the
+        # workspace by default; the case is the same one — a directory OAIP
+        # cannot write — asked of the directory that now holds the keyring.
+        root = trust_root(L.dir)
+        trust = root / "trust.json"
         trust.unlink(missing_ok=True)
-        os.chmod(L.dir / ".oaip", 0o500)
+        os.chmod(root, 0o500)
         try:
             r = L.run("bind", "--actor", "someone@local")
             out = r.stdout + r.stderr
@@ -483,7 +512,7 @@ def main():
             case("the diagnosis says nothing was bound",
                  "Nothing was bound" in out, out[-250:])
         finally:
-            os.chmod(L.dir / ".oaip", 0o700)
+            os.chmod(root, 0o700)
 
     with tempfile.TemporaryDirectory() as tmp:
         # --- 9 (third adversarial round): `oaip bind` is the one command whose
@@ -495,11 +524,12 @@ def main():
         # legitimate act (a store filed by another ledger), but it is a different
         # act, and it now has to be said out loud.
         L = Repo(Path(tmp) / "bind")
-        pub = L.dir / ".oaip" / "dev.key.pub"
+        root = trust_root(L.dir)        # not the workspace, since O4
+        pub = root / "dev.key.pub"
         if not pub.is_file():           # no Warrant CLI: a sentinel own-key
             pub.write_text("b" * 63 + "1\n")
         own = pub.read_text().strip()
-        trust = L.dir / ".oaip" / "trust.json"
+        trust = root / "trust.json"
         foreign = "a" * 64
 
         r = L.run("bind", "--actor", "someone@else", "--key", foreign)

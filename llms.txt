@@ -84,6 +84,14 @@ this file described them as closed. So the entries below say what is **enforced*
 and by **whose** rule, separately from what is merely reported — and where a
 property is not enforced at all, that is written down rather than implied away.
 
+The threat model is written down now (SPEC §8) and is executable
+(`tests/privilege_separation.py`, organised by attacker capability rather than by
+code path). The change it records — the signing key and the keyring moved out of
+the observed workspace — was made by an agent, self-audited, and **no independent
+gate ran on it**; it is not adopted by any warrant. Its own limits are in the
+"where the keyring LIVES" entry below and are the ones to read first, because a
+relocation is easy to over-read as a separation.
+
 The fourth round attacked the hand-written Ed25519 verifier itself and could not
 break it; its findings were all in the code that FEEDS the verifier — how much
 work an attacker can make it do, how much of its output a human can still read,
@@ -224,8 +232,9 @@ that result are recorded below, the favourable one included.
     whole rebuild for the same reason and with the same trade-off.
   - *Binding* is enforced alongside it, and it is **OAIP's own rule, not
     Warrant's**: an acceptance edge is derived only if the signature is valid AND
-    names a key bound to the actor it claims in `.oaip/trust.json`, which only
-    `oaip accept` and `oaip bind` ever write. `oaip verify` reports an
+    names a key bound to the actor it claims in the trust root's `trust.json`,
+    which only `oaip accept` and `oaip bind` ever write — and which, since O4,
+    is NOT in the workspace the observed command runs in. `oaip verify` reports an
     unbound signer on an OAIP acceptance as an error. What OAIP cannot do:
     Warrant's `--trust-config` grade reports the same finding but by
     specification never fails on it, and its machine-readable report omits the
@@ -268,7 +277,8 @@ that result are recorded below, the favourable one included.
     store predates the convention", so one corrupt byte promoted a brand-new
     store to a legacy one and `--allow-legacy-links` ran the guess while
     printing that the store had no marker.
-  - *Binding a key that is not this ledger's own* (`.oaip/dev.key.pub`) requires
+  - *Binding a key that is not this ledger's own* (`dev.key.pub`, in the trust
+    root) requires
     `oaip bind --foreign-key` and prints a warning naming what OAIP cannot do
     with it (custody it, revoke it). `bind` used to accept any hex64 with no
     cross-check at all — the one command whose purpose is to say which key may
@@ -279,22 +289,58 @@ that result are recorded below, the favourable one included.
     depth, since `ed25519_verify` refuses every signature under such a key
     anyway, but a keyring entry that can decide nothing is a false statement
     about custody.
-  - **Still outside OAIP's control:** `.oaip/trust.json` lives beside
-    `.oaip/dev.key`, so **anyone who can write `.oaip/`** can write the keyring
-    *and* the signing key — the binding raises the bar from "can run `keygen`" to
-    "can write `.oaip/`", it does not make acceptance unforgeable. Until the
-    third review round the boundary was wider than that: it was "can write
-    `.oaip/`, **or can influence what `$WARRANT_CLI` resolves to**" — the
-    environment variable, or the unpinned sibling checkout at
-    `~/Projects/warrant/impl/warrant.py`, neither of which is inside `.oaip/`.
-    That half is closed: signature validity is decided in process now, so a
-    hostile `$WARRANT_CLI` can make OAIP refuse (by reporting errors, or by not
-    being a Warrant verifier at all) but cannot make it derive an edge. What it
-    can still hide is everything OAIP does *not* recompute — Warrant's schema,
-    blob-reference and DAG/policy findings — so a stub silently costs
-    corroboration on those. There is no out-of-band trust root, no key rotation,
-    and no revocation. Two SUPPORTED claims with byte-identical subjects still
-    cannot be told apart for legacy records.
+  - **Where the keyring LIVES is now the boundary, and it has moved** (O4,
+    2026-07-30). It used to be `.oaip/trust.json`, beside `.oaip/dev.key`, so
+    **anyone who can write `.oaip/`** could write the keyring *and* read the
+    signing key — and that party is the OBSERVED AGENT, since `oaip run` gives
+    the wrapped command the workspace as its cwd. Nothing about the five rounds
+    of checks was broken by it: an agent generated a key, filed a real `accept`
+    naming a real supported claim, appended the key to the keyring, and every
+    check passed honestly (still executable, as part B's negative control in
+    `tests/privilege_separation.py`).
+
+    The key and the keyring now live in a **trust root outside the workspace** —
+    `$XDG_CONFIG_HOME/oaip/roots/<sha256 of the ledger path>` by default, or
+    `--trust-root` / `$OAIP_TRUST_ROOT`. `oaip trust-root` prints where it is;
+    `oaip trust-root --migrate` moves an existing ledger's. Stated exactly:
+
+    - What the relocation stops: a party whose write access is confined to the
+      workspace. A keyring it plants at `.oaip/trust.json` is never read;
+      deleting `.oaip/store.json`, or rewriting the trust-root pointer in it,
+      cannot redirect the answer (the default location is COMPUTED from the
+      ledger's path, and a contradicted pointer is a refusal, not a choice).
+    - **What it does NOT stop, said plainly because this file has overstated
+      before: a process running as the observer's own uid.** `$XDG_CONFIG_HOME`
+      is as readable to it as `.oaip/` was. Relocation separates the key from the
+      WORKSPACE, not from the USER — decisive under a container mount, a CI
+      checkout or a sandboxed tool, worth nothing against an unconfined same-uid
+      agent. Separating those needs a second uid or a separate signing process:
+      SPEC §8.4 profiles C and D, **documented and not implemented**.
+    - Nor does it stop anyone who can write the trust root itself (that is what a
+      trust root is) or **control the environment** — `OAIP_TRUST_ROOT`,
+      `XDG_CONFIG_HOME`, `PATH` for `git`/`sh`. The environment is inside the
+      trusted base and SPEC §8.2 lists it as such.
+    - **File modes are enforced now and were not before** (this was a gap nobody
+      had written down): the key must be 0600, the keyring 0600, the directory
+      0700, or OAIP refuses to sign, to bind, and to rebuild, naming the `chmod`.
+      Measured before the check existed: `chmod 644 .oaip/dev.key` and `oaip
+      accept` printed `ACCEPTED -> warrant 68e9fdc1…` with no remark. Mode bits
+      exclude other ACCOUNTS on a shared host; they say nothing about a same-uid
+      process.
+    - Availability is untouched: an agent with workspace write can still delete
+      store records or force a refusal by rewriting the pointer. Every such loss
+      exits non-zero and names the lost edge — the same trade-off recorded for
+      the signature caps above.
+    - What a hostile `$WARRANT_CLI` can still hide is everything OAIP does *not*
+      recompute — Warrant's schema, blob-reference and DAG/policy findings — so a
+      stub silently costs corroboration on those. There is still **no key
+      rotation and no revocation**. Two SUPPORTED claims with byte-identical
+      subjects still cannot be told apart for legacy records.
+    - A cost of the default: the trust root is named after the ledger's PATH, so
+      moving or renaming a repository leaves the old root orphaned in the config
+      directory (with a real key in it) and the moved ledger looking at a new,
+      empty one — which fails closed, loudly, at the next rebuild, and is fixed
+      by `--trust-root <old path>`.
 - **The snapshot's `.oaip` exclusion has been broken four times by review**, and
   every break was a different way of giving the ledger a name the exclusion did
   not match:
@@ -437,10 +483,14 @@ that way, and the observed failure text is in the commit that fixed it.
 ## The specification
 
 [SPEC.md](SPEC.md) — §1 canonicalization and identity, §2 record types, §3 the
-Warrant bridge, §4 the cardinal rule, §5 canonical layer vs projection.
+Warrant bridge, §4 the cardinal rule, §5 canonical layer vs projection, §8
+security considerations (an attacker-capability matrix, the mechanisms, the
+deployment profiles, and what is still open).
 
 Read §4 and §5 before anything else. They are the two places where a plausible
-misreading leads to a wrong conclusion about the whole design.
+misreading leads to a wrong conclusion about the whole design. Then read §8.2:
+it is the only place that says who can forge an acceptance here, and it answers
+that with a table rather than an adjective.
 
 ## Reporting a defect
 

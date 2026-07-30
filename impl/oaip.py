@@ -53,9 +53,20 @@ OAIP = Path(".oaip")
 DB = OAIP / "ledger.db"
 ART = OAIP / "artifacts"        # content-addressed artifact blobs
 WSTORE = OAIP / "warrants"      # the Warrant store (canonical decision layer)
-WKEY = OAIP / "dev.key"
-PUBKEY = OAIP / "dev.key.pub"    # the public half, recorded by `init` from keygen
-TRUST = OAIP / "trust.json"      # OAIP's keyring, in Warrant's trust-config shape
+# THE TRUST ROOT: the signing key and the keyring that says which key may sign
+# as which actor. Everything else in `.oaip/` is content-addressed or signed and
+# survives being written by a hostile hand; these two do not. They are held
+# together so there is ONE directory whose custody has to be reasoned about —
+# and, since 2026-07-30 (O4), that directory is NOT the observed workspace by
+# default. `resolve_trust_root()` decides where it is; `main()` applies it before
+# any subcommand runs. These module-level values are the pre-resolution defaults
+# and are what an importer of this module sees until it calls `init_trust_root`.
+TRUST_ROOT = OAIP
+TRUST_ROOT_SOURCE = "not resolved"
+WKEY = TRUST_ROOT / "dev.key"
+PUBKEY = TRUST_ROOT / "dev.key.pub"  # the public half, recorded by `init` from keygen
+TRUST = TRUST_ROOT / "trust.json"    # OAIP's keyring, in Warrant's trust-config shape
+TRUST_ROOT_ENV = "OAIP_TRUST_ROOT"
 # Warrant is a normative dependency (the decision layer). Point WARRANT_CLI at
 # your `warrant.py` (or an installed `warrant`); defaults to a sibling checkout.
 _wcli = os.environ.get("WARRANT_CLI")
@@ -430,11 +441,309 @@ def ensure_oaip_dir_readable():
         ensure_oaip_dir()               # refuses, naming what is in the way
 
 
+# ---------- privilege separation: WHERE the trust root lives (O4, 2026-07-30)
+# THE BOUNDARY THIS MOVES
+# -----------------------
+# Five adversarial rounds ended at one sentence in llms.txt: "anyone who can
+# write `.oaip/` can write the keyring AND the signing key". That party is not
+# hypothetical — it is the OBSERVED AGENT. `oaip run` executes the wrapped
+# command with the workspace as its cwd, and `.oaip/dev.key` (the key every
+# acceptance is signed with) and `.oaip/trust.json` (the file saying which key
+# may sign as which actor) were both under it. Nothing in the five rounds was
+# broken by that; each check was satisfied HONESTLY, with a key the agent held.
+#
+# So the fix is not another check. It is moving the two files the agent must not
+# hold out of the directory the agent is given, and refusing to be pointed back
+# at them by anything the agent can write.
+#
+# WHERE IT LOOKS, IN ORDER, AND WHY THAT ORDER
+#   1. `--trust-root PATH`      — the operator, per invocation.
+#   2. `$OAIP_TRUST_ROOT`       — the operator, per environment.
+#   3. the DEFAULT location for this workspace, if it exists:
+#      `$XDG_CONFIG_HOME/oaip/roots/<sha256 of the ledger's real path>`.
+#      Load-bearing property: this path is COMPUTED from where the ledger is,
+#      not read out of any file — so deleting or rewriting workspace state
+#      cannot make OAIP forget about it (see `store_trust_pointer`).
+#   4. the pointer `oaip init` recorded in `.oaip/store.json`, for a deployment
+#      whose root is somewhere else. That file IS agent-writable, so it may only
+#      ever cause a REFUSAL: if the default location also exists and disagrees,
+#      OAIP refuses rather than choosing; if the pointer names a root that is not
+#      there, OAIP refuses rather than falling back to the workspace.
+#   5. the workspace itself — only for a ledger that predates all of this and
+#      still has `.oaip/trust.json`. It keeps working, and says what it costs.
+#
+# WHAT THIS BUYS AND WHAT IT DOES NOT, stated here because the previous rounds
+# repeatedly caught this file overstating: relocation separates the key from the
+# WORKSPACE, not from the USER. A process running as the same uid can read
+# `$XDG_CONFIG_HOME` as easily as `.oaip/`. It is decisive exactly where the
+# agent's write access is confined to the workspace — a container mount, a CI
+# checkout, a sandboxed tool with the repo as its writable root — and it is worth
+# nothing against an unconfined process with the observer's own uid. That case
+# needs a second uid or a separate signing process: SPEC §8.4 profiles C and D,
+# documented and NOT implemented.
+def xdg_config_home() -> Path:
+    raw = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
+    if raw and os.path.isabs(raw):
+        return Path(raw)
+    return Path.home() / ".config"
+
+
+def ledger_id() -> str:
+    """A stable name for THIS ledger's location.
+
+    The trust root is per-ledger, not per-user: the keyring says which key may
+    sign as `tester@local` HERE, and sharing one file across workspaces would let
+    a key bound in one repository decide acceptances in another. Derived from the
+    ledger's real path so it can be recomputed with nothing but the cwd."""
+    return sha256(os.path.realpath(OAIP).encode())[:16]
+
+
+def default_trust_root() -> Path:
+    return xdg_config_home() / "oaip" / "roots" / ledger_id()
+
+
+def same_path(a, b) -> bool:
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
+def in_workspace(p) -> bool:
+    """Is `p` inside the directory the observed command runs in?"""
+    here = os.path.realpath(".")
+    real = os.path.realpath(p)
+    return real == here or real.startswith(here + os.sep)
+
+
+def store_trust_pointer():
+    """(mode, path, error) — where `.oaip/store.json` SAYS the trust root is.
+
+    A hint, never an authority. The file lives in the observed workspace, so the
+    party this protocol gates can rewrite it; every caller therefore treats a
+    disagreement as a reason to refuse and never as a redirection."""
+    if not STOREMETA.is_file():
+        return None, None, None
+    try:
+        meta = loads_ijson(STOREMETA.read_bytes())
+    except (ValueError, OSError) as e:
+        return None, None, f"{STOREMETA} is unreadable ({e})"
+    tr = (meta or {}).get("trust_root") if isinstance(meta, dict) else None
+    if tr is None:
+        return None, None, None
+    if not isinstance(tr, dict) or tr.get("mode") not in ("external", "workspace"):
+        return None, None, (f"{STOREMETA} carries a `trust_root` field that is "
+                            "not a trust-root record")
+    if tr["mode"] == "workspace":
+        return "workspace", OAIP, None
+    p = tr.get("path")
+    if not (isinstance(p, str) and p):
+        return None, None, (f"{STOREMETA} says the trust root is external and "
+                            "does not say where")
+    return "external", Path(p), None
+
+
+def resolve_trust_root(explicit=None):
+    """(path, source) — see the ordered list above. Refuses; never guesses."""
+    if explicit:
+        return Path(explicit), "--trust-root"
+    env = (os.environ.get(TRUST_ROOT_ENV) or "").strip()
+    if env:
+        return Path(env), f"${TRUST_ROOT_ENV}"
+    default = default_trust_root()
+    mode, ptr, err = store_trust_pointer()
+    if err:
+        sys.exit(f"refusing to guess where this ledger's trust root is: {err}. "
+                 "The trust root holds the signing key and the keyring that "
+                 "decides which key may accept anything here, so a pointer that "
+                 "cannot be read is not a pointer to fall back from. Name it: "
+                 "`oaip --trust-root <path> …`.")
+    if default.is_dir():
+        if ptr is not None and not same_path(ptr, default):
+            sys.exit("two trust roots claim this ledger: "
+                     f"{default.resolve()} exists, and "
+                     f"{STOREMETA} points at {ptr}. OAIP will not choose between "
+                     "them — the wrong choice is a keyring an attacker supplied. "
+                     "Say which one is yours: `oaip --trust-root <path> …`.")
+        return default, "the default location for this workspace"
+    if mode == "external":
+        if not Path(ptr).is_dir():
+            sys.exit(f"this ledger's trust root is recorded as {ptr} and there "
+                     "is no directory there. Refusing to fall back to a keyring "
+                     "inside the observed workspace: that is the arrangement the "
+                     "relocation exists to prevent, and a missing trust root is "
+                     "as likely to mean 'someone moved it' as 'you moved it'. "
+                     "Restore it, or name where it is now with `oaip "
+                     "--trust-root <path> …`.")
+        return Path(ptr), str(STOREMETA)
+    if mode == "workspace" or TRUST.is_file() or WKEY.is_file():
+        return OAIP, ("this workspace (a ledger from before the trust root "
+                      "could be relocated)")
+    return default, "the default location for this workspace"
+
+
+def apply_trust_root(path):
+    """Point the module's key/keyring paths at `path`."""
+    global TRUST_ROOT, WKEY, PUBKEY, TRUST
+    TRUST_ROOT = Path(path)
+    WKEY = TRUST_ROOT / "dev.key"
+    PUBKEY = TRUST_ROOT / "dev.key.pub"
+    TRUST = TRUST_ROOT / "trust.json"
+
+
+def init_trust_root(explicit=None):
+    global TRUST_ROOT_SOURCE
+    path, source = resolve_trust_root(explicit)
+    apply_trust_root(path)
+    TRUST_ROOT_SOURCE = source
+
+
+_WARNED_WORKSPACE_TRUST = []
+
+
+def warn_workspace_trust_root():
+    """Say, once, when the keyring being consulted is one the observed agent can
+    write. Legacy ledgers keep working; they do not keep quiet."""
+    if trust_root_mode() != "workspace" or _WARNED_WORKSPACE_TRUST:
+        return
+    _WARNED_WORKSPACE_TRUST.append(True)
+    print(f"warning: this ledger's trust root is {TRUST_ROOT}, INSIDE the "
+          "workspace the observed command runs in — so whatever OAIP observes "
+          "can also rewrite the keyring that decides whose acceptances count, "
+          "and read the key they are signed with. Move it out with `oaip "
+          "trust-root --migrate` (one command; existing acceptance edges "
+          "survive).", file=sys.stderr)
+
+
+def trust_root_mode():
+    return "workspace" if in_workspace(TRUST_ROOT) else "external"
+
+
+def ensure_trust_root_dir():
+    """The trust root, created 0700 if it is not there.
+
+    Keyed on whether the trust root IS the ledger directory, not on whether it
+    lies inside the workspace: `--trust-root ./keys` is inside the workspace and
+    still has to be created, and routing it to `ensure_oaip_dir` left `init`
+    reporting ENOENT on a directory nothing had made."""
+    if same_path(TRUST_ROOT, OAIP):
+        ensure_oaip_dir()       # keeps the "a FILE at .oaip" diagnosis intact
+        return
+    try:
+        existed = TRUST_ROOT.is_dir()
+        TRUST_ROOT.mkdir(parents=True, exist_ok=True)
+        # 0700 ONLY on creation. Re-asserting it on every run would undo an
+        # operator's deliberate mode — `chmod 500` on a trust root is how a
+        # single-uid deployment stops a wandering process from binding a new key,
+        # and a tool that quietly widens permissions it did not set is doing the
+        # opposite of what this whole change is for.
+        if not existed and os.name == "posix":
+            os.chmod(TRUST_ROOT, 0o700)
+    except OSError as e:
+        sys.exit(f"cannot create the trust root {TRUST_ROOT}: {e}. This is "
+                 "where this ledger's signing key and keyring live; without it "
+                 "OAIP can neither sign nor say whose signature counts.")
+
+
+# ---------- custody: who else on this host can read the key or write the keyring
+# THE GAP THIS CLOSES (O4, 2026-07-30). Five rounds of review hardened WHAT OAIP
+# believes — the signature, the binding, the claim link — and nothing at all
+# checked WHO ELSE CAN SUPPLY those inputs from the same filesystem. A signing
+# key at mode 0644 is a key every account on the host can sign with, and a
+# keyring at 0666 is a keyring every account can vouch with; OAIP would have used
+# both without a word. The check is cheap, it is the baseline every ssh client
+# has enforced for thirty years, and its absence was not written down anywhere.
+#
+# Deliberately narrow, and NOT a claim about privilege separation: mode bits say
+# nothing about a process running as the same uid, which is the case that matters
+# most for an observed agent (see the deployment profiles in SPEC §8). What they
+# do rule out is the accidental widening — an umask of 0002, a `cp -p` off a
+# FAT/exFAT volume, a tarball unpacked as 0644, a shared group on a build host.
+KEY_MODE_FORBIDDEN = 0o077      # a secret: NO group/other access of any kind
+WRITE_MODE_FORBIDDEN = 0o022    # a decision input: no group/other WRITE
+
+
+def _perm(path):
+    """The permission bits of `path`, or None if they cannot be read / do not
+    mean anything here (Windows reports a mode POSIX bits cannot be read from)."""
+    if os.name != "posix":
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_mode & 0o777
+
+
+def trust_perm_errors():
+    """Custody refusals about the trust root, as a list of sentences.
+
+    Returned rather than raised because the read paths (`verify`, `rebuild`) must
+    REPORT this alongside their other findings, while the write paths (`init`,
+    `accept`, `bind`) must refuse outright — see `require_trust_custody`."""
+    errs = []
+    m = _perm(WKEY)
+    if m is not None and m & KEY_MODE_FORBIDDEN:
+        errs.append(
+            f"{WKEY}: the signing key is mode {m:04o} — accessible to group or "
+            "other. Every acceptance this ledger files is that key, so an "
+            "account that can read it can sign as this actor and OAIP will "
+            f"derive the edge. Refusing to use it: `chmod 600 {WKEY}` (and "
+            "rotate it if the host is shared — the exposure is not undone by "
+            "narrowing the mode).")
+    m = _perm(TRUST)
+    if m is not None and m & WRITE_MODE_FORBIDDEN:
+        errs.append(
+            f"{TRUST}: the keyring is mode {m:04o} — writable by group or "
+            "other. An acceptance edge is derived only from a signer this file "
+            "vouches for, so whoever can write it can vouch for their own key. "
+            f"`chmod 600 {TRUST}`.")
+    m = _perm(TRUST_ROOT)
+    if m is not None and m & WRITE_MODE_FORBIDDEN:
+        errs.append(
+            f"{TRUST_ROOT}: the directory holding the signing key and the "
+            f"keyring is mode {m:04o} — writable by group or other, so both "
+            "files can be REPLACED whatever their own modes say. "
+            f"`chmod 700 {TRUST_ROOT}`.")
+    return errs
+
+
+def require_trust_custody():
+    """The write paths' half of the same check: a refusal, in words.
+
+    Called before anything SIGNS or VOUCHES. Signing with a key others can read,
+    or binding into a keyring others can rewrite, records a custody that does not
+    exist — and a false statement about custody is the one thing this project's
+    decision layer cannot survive."""
+    errs = trust_perm_errors()
+    if errs:
+        sys.exit("refusing to use this ledger's key material:\n  "
+                 + "\n  ".join(errs))
+
+
+def harden_trust_perms():
+    """Make the trust root's own files what the check above demands.
+
+    `warrant keygen` already chmods 0600, and this repeats it deliberately: OAIP
+    must not depend on a delegate's umask discipline for the custody it then
+    asserts. Failures are ignored on purpose — a filesystem with no POSIX modes
+    (Windows, some network mounts) is a place where `trust_perm_errors` reports
+    nothing either, and refusing to run there would be a claim about custody
+    rather than a check of it.
+
+    The DIRECTORY is deliberately not touched here: `ensure_trust_root_dir`
+    creates it 0700 and nothing afterwards re-asserts that, so an operator who
+    narrows it further keeps what they set."""
+    for p, mode in ((WKEY, 0o600), (TRUST, 0o600)):
+        try:
+            if os.name == "posix" and os.path.exists(p):
+                os.chmod(p, mode)
+        except OSError:
+            pass
+
+
 def ensure_trust():
     """OAIP's keyring must exist before anything verifies: a missing trust config
     makes Warrant's settlement preflight fail closed, and an empty one is the
     honest starting point (no actor is bound until OAIP binds it)."""
-    ensure_oaip_dir()
+    ensure_trust_root_dir()
     if not TRUST.is_file():
         write_keyring({})
 
@@ -445,6 +754,7 @@ def write_keyring(actors):
     could not write and why that matters (2026-07-30, third review round)."""
     try:
         TRUST.write_text(json.dumps({"actors": actors}, sort_keys=True) + "\n")
+        harden_trust_perms()
     except OSError as e:
         sys.exit(f"cannot write the keyring {TRUST}: {e}. Nothing was bound — "
                  "OAIP derives an acceptance edge only from a signer this file "
@@ -457,7 +767,15 @@ def read_trust():
 
     Deliberately in Warrant's trust-config shape (`{"actors": {...}}`, the closed
     schema its `--trust-config` validates) so the SAME file can be handed to
-    Warrant's settlement grade; OAIP does not invent a second format."""
+    Warrant's settlement grade; OAIP does not invent a second format.
+
+    A keyring whose CUSTODY is broken is reported here as unreadable, not as
+    empty: every caller treats an error as a refusal to derive edges, and
+    treating "anyone on this host may rewrite this file" as an ordinary keyring
+    would be the same mistake as reading a filename for an address."""
+    custody = trust_perm_errors()
+    if custody:
+        return None, "; ".join(custody)
     if not TRUST.is_file():
         return {}, None
     try:
@@ -1087,14 +1405,36 @@ def workspace_snapshot() -> str:
     # real path too, so saying so is not the only protection.
     target = symlinked_ledger_target()
     extra_add, extra_rm = [], []
+    # A RELOCATED TRUST ROOT CAN BE RELOCATED THE WRONG WAY. `--trust-root
+    # ./keys` puts the signing key back inside the observed repository under a
+    # name no exclusion here mentions — the same shape as the symlinked-ledger
+    # leak (F6), reached by an operator's flag instead of an `ln -s`. Exclude it
+    # by its own path and say so; the exclusion is by NAME either way, so the
+    # warning is not decoration.
+    if trust_root_mode() == "workspace" and not same_path(TRUST_ROOT, OAIP):
+        try:
+            rel = os.path.relpath(os.path.realpath(TRUST_ROOT),
+                                  git("rev-parse", "--show-toplevel"))
+        except (RuntimeError, OSError, ValueError):
+            rel = None
+        if rel and not rel.startswith(".."):
+            print(f"warning: this ledger's trust root is {TRUST_ROOT}, inside "
+                  "the observed repository. The signing key is therefore a file "
+                  "in the workspace being snapshotted; it is excluded from this "
+                  "snapshot by path, but nothing keeps it out of the operator's "
+                  "own commits. Move it out: `oaip trust-root --migrate`.",
+                  file=sys.stderr)
+            extra_add += [f":(top,exclude,glob,icase){rel}/**",
+                          f":(top,exclude,glob,icase){rel}"]
+            extra_rm += [f":(top,glob,icase){rel}/**", f":(top,glob,icase){rel}"]
     if target:
         print(f"warning: {OAIP} is a SYMLINK to {target}; the ledger and its "
               "signing key live outside the path this snapshot excludes by name. "
               f"Excluding {target} as well — but move the ledger back inside "
               f"{OAIP} rather than relying on this.", file=sys.stderr)
-        extra_add = [f":(top,exclude,glob,icase){target}/**",
-                     f":(top,exclude,glob,icase){target}"]
-        extra_rm = [f":(top,glob,icase){target}/**", f":(top,glob,icase){target}"]
+        extra_add += [f":(top,exclude,glob,icase){target}/**",
+                      f":(top,exclude,glob,icase){target}"]
+        extra_rm += [f":(top,glob,icase){target}/**", f":(top,glob,icase){target}"]
     # seed the throwaway index from HEAD if it exists, else empty, then add all
     subprocess.run(["git", "read-tree", "HEAD"], env=env, capture_output=True)
     subprocess.run(["git", "add", "-A", "--", ":/",
@@ -1287,9 +1627,19 @@ def cmd_init(_):
                  "in .git/objects) under the target's name instead. Remove the "
                  f"symlink and let `oaip init` create a real {OAIP} directory.")
     ensure_oaip_dir()
+    ensure_trust_root_dir()
     db(create=True).executescript(SCHEMA)
     wrun("--store", str(WSTORE), "init")
     if not WKEY.exists():
+        # CREATE THE FILE BEFORE THE SECRET GOES INTO IT. `warrant keygen` writes
+        # the seed and then chmods 0600, which leaves a window in which the key
+        # exists at the umask's mode; on a host with umask 0022 that window is a
+        # world-readable signing key. `O_EXCL` also refuses to follow a symlink
+        # planted at that path, which is the same window used the other way.
+        try:
+            os.close(os.open(WKEY, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except OSError as e:
+            sys.exit(f"cannot create the signing key {WKEY}: {e}")
         r = wrun("keygen", "--out", str(WKEY))
         # Record the PUBLIC half. OAIP is stdlib-only and cannot derive an Ed25519
         # public key from a seed, so the one moment the pubkey is knowable is the
@@ -1298,13 +1648,25 @@ def cmd_init(_):
         m = re.search(r"\bpubkey\s+([0-9a-f]{64})\b", r.stdout or "")
         if m:
             PUBKEY.write_text(m.group(1) + "\n")
+        elif WKEY.stat().st_size == 0:
+            # No Warrant CLI generated anything: leave no empty file behind, or
+            # the next `init` would take it for a key it already custodies.
+            WKEY.unlink(missing_ok=True)
     ensure_trust()
+    harden_trust_perms()
+    require_trust_custody()
     # Stamp the store format ONCE, and never restamp: this marker is what tells
     # `rebuild` that every accept in this store had the chance to carry an
     # explicit claim link, so a missing one is a defect and not history (F8).
     if not STOREMETA.is_file():
+        # The trust-root POINTER is written here too, and it is a hint for a
+        # human and for a deployment whose root is not in the default place — it
+        # is never authoritative, because this file is inside the workspace the
+        # observed agent writes (see `store_trust_pointer`).
         STOREMETA.write_text(json.dumps(
-            {"oaip_store": STORE_FORMAT, "note_convention_since": int(time.time())},
+            {"oaip_store": STORE_FORMAT, "note_convention_since": int(time.time()),
+             "trust_root": {"mode": trust_root_mode(),
+                            "path": str(TRUST_ROOT.resolve())}},
             sort_keys=True) + "\n")
     # Keep the signing key and the store out of the USER's own commits too.
     # workspace_snapshot() excludes .oaip by pathspec, but a plain `git add -A`
@@ -1326,7 +1688,122 @@ def cmd_init(_):
                 if lines and not gitignore.read_text().endswith("\n"):
                     f.write("\n")
                 f.write(".oaip/\n")
-    print(f"initialized .oaip (ledger + warrant store + dev key)")
+    if trust_root_mode() == "external":
+        print(f"initialized {OAIP} (ledger + warrant store)\n"
+              f"  trust root: {TRUST_ROOT.resolve()}\n"
+              "  The signing key and the keyring live THERE, not in this "
+              "workspace: what `oaip run` observes must not be able to rewrite "
+              "who may accept its work. `oaip trust-root` explains what that "
+              "does and does not stop.")
+    else:
+        print(f"initialized {OAIP} (ledger + warrant store + dev key)")
+        warn_workspace_trust_root()
+
+
+def cmd_trust_root(a):
+    """Report — or move — the directory holding the key and the keyring.
+
+    This command exists because the answer to "who can forge an acceptance here?"
+    is now a property of the DEPLOYMENT, not of the code, and a property nobody
+    can read off is one nobody checks."""
+    if a.path:
+        print(TRUST_ROOT.resolve())
+        return
+    if a.migrate:
+        return migrate_trust_root(a)
+    mode = trust_root_mode()
+    print(f"trust root:  {TRUST_ROOT.resolve()}")
+    print(f"  found by:  {TRUST_ROOT_SOURCE}")
+    print(f"  position:  " + (
+        "IN THE OBSERVED WORKSPACE — the observed command can read the signing "
+        "key and rewrite the keyring" if mode == "workspace" else
+        "outside the observed workspace"))
+    for label, p, want in (("key      ", WKEY, 0o600), ("keyring  ", TRUST, 0o600),
+                           ("directory", TRUST_ROOT, 0o700)):
+        m = _perm(p)
+        print(f"  {label}: {p}"
+              + (" (absent)" if not os.path.exists(p) else "")
+              + (f"  mode {m:04o}" + ("" if m is not None and not (
+                  m & (KEY_MODE_FORBIDDEN if p == WKEY else WRITE_MODE_FORBIDDEN))
+                  else "  <-- REFUSED") if m is not None else ""))
+    actors, err = read_trust()
+    print(f"  keyring  : {err}" if err else
+          f"  vouches for: {sum(len(v) for v in actors.values())} key(s) across "
+          f"{len(actors)} actor(s)")
+    print("\nWhat relocation stops: a party whose write access is confined to "
+          "the workspace — the observed agent under a container mount, a CI "
+          "checkout, a sandboxed tool — cannot read this key or vouch for its "
+          "own.\nWhat it does NOT stop: a process running as this uid, which can "
+          "read the trust root wherever it is. That needs a separate uid or a "
+          "separate signing process (SPEC §8.4, profiles C and D — documented, "
+          "not implemented).")
+    if mode == "workspace":
+        print("\nThis ledger is in the arrangement relocation exists to prevent. "
+              "`oaip trust-root --migrate` moves the key and the keyring out; "
+              "acceptance edges filed before the move survive it.")
+
+
+def migrate_trust_root(a):
+    """Move an in-workspace trust root out, once, in one command.
+
+    Fails closed in both directions: it refuses to move a root that is already
+    outside the workspace (there is nothing to fix and moving a live keyring is
+    not free), and it refuses to move ONTO an existing key (that would silently
+    give this ledger a second custody, or destroy another ledger's)."""
+    src = TRUST_ROOT
+    if trust_root_mode() != "workspace":
+        sys.exit(f"nothing to migrate: this ledger's trust root is {src.resolve()},"
+                 " already outside the observed workspace. (`oaip trust-root` "
+                 "reports where it is and what that stops.)")
+    dst = Path(a.to) if a.to else default_trust_root()
+    if in_workspace(dst):
+        sys.exit(f"refusing to migrate into {dst}: it is inside the workspace "
+                 "the observed command runs in, which is the arrangement this "
+                 "command exists to leave.")
+    moving = [p for p in (WKEY, PUBKEY, TRUST) if p.exists()]
+    if not moving:
+        sys.exit(f"nothing to migrate: no key and no keyring in {src}.")
+    for p in moving:
+        if (dst / p.name).exists():
+            sys.exit(f"refusing to migrate: {dst / p.name} already exists. A "
+                     "trust root is per-ledger; writing this ledger's key over "
+                     "another's would leave two ledgers unable to say which key "
+                     "is whose. Pick an empty directory with --to.")
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(dst, 0o700)
+        for p in moving:
+            shutil.move(str(p), str(dst / p.name))
+    except OSError as e:
+        sys.exit(f"migration failed after moving {[p.name for p in moving]}: {e}. "
+                 f"Check {src} and {dst} by hand before running anything else — "
+                 "the key may be in either.")
+    apply_trust_root(dst)
+    harden_trust_perms()
+    # Record the new location for a human and for a deployment that does not pin
+    # it in the environment. Not authoritative (this file is agent-writable);
+    # the default location is found without it.
+    if STOREMETA.is_file():
+        try:
+            meta, why = loads_ijson(STOREMETA.read_bytes()), None
+        except (ValueError, OSError) as e:
+            meta, why = None, e
+        if not isinstance(meta, dict):
+            print(f"warning: {STOREMETA} is unreadable ({why or 'not an object'});"
+                  " the key moved, but this ledger now records nothing about "
+                  "where. Pass --trust-root, or fix the marker.", file=sys.stderr)
+        else:
+            meta["trust_root"] = {"mode": "external", "path": str(dst.resolve())}
+            STOREMETA.write_text(json.dumps(meta, sort_keys=True) + "\n")
+    print(f"moved {', '.join(p.name for p in moving)} from {src} to {dst}\n"
+          "  The observed workspace no longer holds this ledger's signing key or "
+          "its keyring.\n  Run `oaip rebuild` to confirm every acceptance edge "
+          "still derives (it reads the keyring in its new place).")
+    if not same_path(dst, default_trust_root()):
+        print(f"  {dst} is not the default location for this workspace "
+              f"({default_trust_root()}), so pass `--trust-root {dst}` — or set "
+              f"{TRUST_ROOT_ENV} — where the recorded pointer is not enough.")
 
 
 def cmd_intent(a):
@@ -1444,6 +1921,10 @@ def cmd_accept(a):
 
 
 def _accept(a):
+    # Before the key is used at all: a signature made with a key other accounts
+    # can read is not evidence that THIS actor decided anything (O4).
+    require_trust_custody()
+    warn_workspace_trust_root()
     con = db()
     c = con.execute("""SELECT predicate,check_cmd,check_exit,transcript_hash,subject_hash,supported
                        FROM claims WHERE id=?""", (a.claim,)).fetchone()
@@ -1552,6 +2033,8 @@ def cmd_bind(a):
     legitimate case (a store filed by another ledger's key), but it is a
     different act from vouching for one's own, and it now has to be said out
     loud: --foreign-key."""
+    require_trust_custody()
+    warn_workspace_trust_root()
     key = a.key
     own = PUBKEY.read_text().strip() if PUBKEY.is_file() else None
     if key is None:
@@ -1857,6 +2340,12 @@ def _rebuild(a):
     # `.oaip/store.json` promote a brand-new store to "legacy" (C3-F1).
     cutoff, cutoff_err = note_convention_since()
     meta_bad = [cutoff_err] if cutoff_err else []
+    # Custody, checked here and not only inside `read_trust`, because that
+    # function is reached only when there is a store to report on: a ledger whose
+    # keyring anyone on the host may rewrite must refuse to project acceptance
+    # edges even before the first accept is filed (O4).
+    custody_bad = trust_perm_errors()
+    warn_workspace_trust_root()
 
     # What the CURRENT projection asserts, read before it is replaced. A rebuild
     # that drops the protocol's central edge must not report success (C2-F1b):
@@ -1873,8 +2362,8 @@ def _rebuild(a):
         except sqlite3.Error:
             prev_edges = set()          # unreadable: nothing to compare against
 
-    if art_bad or store_bad or meta_bad:
-        for e in art_bad + store_bad + meta_bad:
+    if art_bad or store_bad or meta_bad or custody_bad:
+        for e in art_bad + store_bad + meta_bad + custody_bad:
             print("ERR ", e, file=sys.stderr)
         # Each layer is COUNTED AND NAMED SEPARATELY, including this ledger's own
         # metadata: a diagnosis that sends the reader to the wrong directory is
@@ -1885,8 +2374,10 @@ def _rebuild(a):
                         f"{len(store_bad)} fault(s) in the decision layer "
                         f"({WSTORE})" if store_bad else "",
                         f"{len(meta_bad)} fault(s) in this ledger's own "
-                        f"metadata ({STOREMETA})" if meta_bad else "") if p)
-        mark_untrusted(art_bad + store_bad + meta_bad)
+                        f"metadata ({STOREMETA})" if meta_bad else "",
+                        f"{len(custody_bad)} custody fault(s) in the trust root "
+                        f"({TRUST_ROOT})" if custody_bad else "") if p)
+        mark_untrusted(art_bad + store_bad + meta_bad + custody_bad)
         sys.exit(f"refusing to rebuild: {where} — the projection would assert "
                  "facts the canonical layer does not support. The existing "
                  f"projection is left on disk but MARKED UNTRUSTED ({UNTRUSTED}): "
@@ -2219,6 +2710,20 @@ def cmd_verify(_):
     print(f"canonical layer: {len(errs)} error(s)" if errs
           else "canonical layer: every artifact matches its address")
 
+    # CUSTODY IS A LAYER OF ITS OWN, and it is the one this tool never reported.
+    # Every other line here is about bytes that are already written; this one is
+    # about who can write the next ones (O4).
+    custody = trust_perm_errors()
+    for e in custody:
+        print("ERR ", e)
+    where = ("IN THE OBSERVED WORKSPACE — whatever this ledger observes can "
+             "rewrite the keyring and read the key"
+             if trust_root_mode() == "workspace"
+             else "outside the observed workspace")
+    print(f"key custody:     {len(custody)} error(s); trust root {TRUST_ROOT}"
+          if custody else
+          f"key custody:     trust root {TRUST_ROOT.resolve()}, {where}")
+
     # The projection is a THIRD thing, named as itself: a fault here is neither
     # the canonical layer's nor the decision layer's, and this file has already
     # been wrong once by reporting one layer's health as another's.
@@ -2285,7 +2790,7 @@ def cmd_verify(_):
               + ("" if report["errors"] == 0 else "  [Warrant]"))
     elif not wrec_files:
         print("decision layer:  (empty store)")
-    sys.exit(1 if (errs or dec_errs or proj_errs
+    sys.exit(1 if (errs or dec_errs or proj_errs or custody
                    or (report and report["errors"])) else 0)
 
 
@@ -2324,6 +2829,13 @@ def cmd_conformance(a):
 
 def main():
     ap = argparse.ArgumentParser(prog="oaip", description=__doc__.splitlines()[0])
+    # GLOBAL, and before the subcommand, because it decides WHERE this ledger's
+    # key and keyring are for every verb: `oaip --trust-root ~/keys/proj init`.
+    ap.add_argument("--trust-root", metavar="PATH",
+                    help="directory holding the signing key and the keyring "
+                         "(default: $XDG_CONFIG_HOME/oaip/roots/<this ledger>, "
+                         f"outside the observed workspace; ${TRUST_ROOT_ENV} "
+                         "sets it for a whole environment)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init").set_defaults(fn=cmd_init)
     pi = sub.add_parser("intent"); pi.add_argument("description"); pi.add_argument("--parent"); pi.set_defaults(fn=cmd_intent)
@@ -2356,8 +2868,23 @@ def main():
                           "signer never accepted")
     prb.set_defaults(fn=cmd_rebuild)
     sub.add_parser("verify").set_defaults(fn=cmd_verify)
+    pt = sub.add_parser("trust-root",
+                        help="where this ledger's signing key and keyring live, "
+                             "and what that arrangement stops")
+    pt.add_argument("--path", action="store_true",
+                    help="print only the resolved path")
+    pt.add_argument("--migrate", action="store_true",
+                    help="move an in-workspace key and keyring out of the "
+                         "observed workspace (existing acceptance edges survive)")
+    pt.add_argument("--to", metavar="PATH",
+                    help="migrate to PATH instead of the default location")
+    pt.set_defaults(fn=cmd_trust_root)
     pf = sub.add_parser("conformance"); pf.add_argument("vectors", nargs="?", default="examples/vectors.json"); pf.set_defaults(fn=cmd_conformance)
     a = ap.parse_args()
+    # BEFORE any subcommand: every path that signs, vouches, or believes a
+    # signature reads these globals, and resolution can REFUSE (an unreadable or
+    # contradicted trust root is not a thing to proceed past).
+    init_trust_root(a.trust_root)
     if a.cmd in ("run", "do") and a.command and a.command[0] == "--":
         a.command = a.command[1:]
     a.fn(a)

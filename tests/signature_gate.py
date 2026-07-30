@@ -70,6 +70,31 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "impl"))
 import oaip as O                                              # noqa: E402
 
+# THE TRUST ROOT IS NO LONGER IN THE WORKSPACE (O4, 2026-07-30), so every ledger
+# this file creates keeps its key and keyring under a THROWAWAY
+# XDG_CONFIG_HOME. Set in the environment rather than passed per-run, so that
+# every subprocess inherits it — including the ones that rebuild the environment
+# from scratch — and so no test run writes into the operator's own ~/.config.
+import atexit as _atexit                                          # noqa: E402
+import shutil as _shutil                                          # noqa: E402
+import tempfile as _tempfile                                      # noqa: E402
+_XDG = _tempfile.mkdtemp(prefix="oaip-test-xdg-")
+os.environ["XDG_CONFIG_HOME"] = _XDG
+_atexit.register(lambda: _shutil.rmtree(_XDG, ignore_errors=True))
+
+
+def trust_root(work):
+    """Where this ledger's key and keyring actually live — asked of the tool,
+    not recomputed here, so the test cannot disagree with the implementation
+    about the one path the whole property is about."""
+    r = subprocess.run([sys.executable, str(ROOT / "impl" / "oaip.py"),
+                        "trust-root", "--path"], cwd=work,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"cannot resolve the trust root in {work}: "
+                         f"{r.stdout}{r.stderr}")
+    return Path(r.stdout.strip())
+
 ok = True
 
 STUB = ("import json\n"
@@ -238,7 +263,7 @@ def part_b():
             case("setup(B): the one-shot flow accepted", False, r.stdout + r.stderr)
             return
         honest = edges(work)
-        pub = (work / ".oaip" / "dev.key.pub").read_text().strip()
+        pub = (trust_root(work) / "dev.key.pub").read_text().strip()
         fwid = forge(work, pub)
 
         # The negative control, both halves. The forgery satisfies EVERY gate
@@ -247,7 +272,7 @@ def part_b():
         case("negative control: the forgery satisfies address-matching",
              (work / ".oaip" / "warrants" / "records"
               / f"{fwid}.json").is_file())
-        trust = json.loads((work / ".oaip" / "trust.json").read_text())
+        trust = json.loads((trust_root(work) / "trust.json").read_text())
         case("negative control: the forgery NAMES a bound key of the real actor",
              pub in trust["actors"].get("tester@local", []), trust)
 
@@ -675,7 +700,7 @@ def part_g():
     only place that did not ask whether it could."""
     with tempfile.TemporaryDirectory() as tmp:
         work, run = make_repo(tmp, "bindweak")
-        trust = work / ".oaip" / "trust.json"
+        trust = trust_root(work) / "trust.json"
         before = trust.read_text() if trust.is_file() else ""
         for name, key in (("small-order (the identity point)", "01" + "00" * 31),
                           # y = p itself, little-endian: a legal 32-byte string
