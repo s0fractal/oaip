@@ -183,6 +183,17 @@ def part_a():
          not O.signature_verifies("aa" * 32, {"key": "zz", "sig": "zz"})
          and not O.signature_verifies("aa" * 32, "not an object")
          and not O.signature_verifies("aa" * 32, {"key": "aa" * 32}))
+    # F4: total in EVERY argument. `HEX64.match(None)` used to raise TypeError —
+    # unreachable today, and a predicate that answers an exception for one input
+    # shape is a trap for the caller that eventually passes it.
+    try:
+        totals = (O.signature_verifies(None, {"key": "aa" * 32, "sig": "bb" * 64})
+                  is False
+                  and O.signature_verifies(17, {"key": "aa" * 32}) is False)
+    except Exception as e:                                      # noqa: BLE001
+        totals = f"raised {type(e).__name__}: {e}"
+    case("`signature_verifies` is total: a non-string WarrantID is False, not "
+         "an exception", totals is True, totals)
 
     # A REAL Warrant signature, produced by the reference CLI (which uses
     # `cryptography`), must verify here. Parity in the accepting direction is
@@ -651,6 +662,45 @@ def part_f():
              fwid[:12] in vout and "WARN" in vout, vout[-600:])
 
 
+def part_g():
+    """F5 (2026-07-30, FOURTH round): `oaip bind` vouched for a key that can
+    never sign.
+
+    `cmd_bind` accepted any HEX64 behind --foreign-key and never applied this
+    project's own key-validity rule (`weak_ed25519_pubkey`, Warrant SPEC §5).
+    Measured before the fix: `oaip bind --actor who@local --foreign-key --key
+    0100…00` exited 0 and wrote the small-order key into `.oaip/trust.json`.
+    Defence in depth — `ed25519_verify` refuses every signature under such a key
+    — but the one command whose whole job is to say "this key may sign" was the
+    only place that did not ask whether it could."""
+    with tempfile.TemporaryDirectory() as tmp:
+        work, run = make_repo(tmp, "bindweak")
+        trust = work / ".oaip" / "trust.json"
+        before = trust.read_text() if trust.is_file() else ""
+        for name, key in (("small-order (the identity point)", "01" + "00" * 31),
+                          # y = p itself, little-endian: a legal 32-byte string
+                          # that is not a legal point encoding.
+                          ("non-canonical y (>= p)", "ed" + "ff" * 30 + "7f"),
+                          ("all zeroes", "00" * 32)):
+            r = run("bind", "--actor", "who@local", "--key", key, "--foreign-key")
+            out = r.stdout + r.stderr
+            case(f"`oaip bind` refuses a {name} key", r.returncode != 0,
+                 out[-300:])
+            case(f"and says why for the {name} key",
+                 "not a usable Ed25519 public key" in out, out[-300:])
+        after = trust.read_text() if trust.is_file() else ""
+        case("no unusable key reached the keyring", after == before,
+             f"{before!r} -> {after!r}")
+        # The control: a real key still binds, or this would be a check that
+        # simply refuses everything.
+        pub, _ = ed25519_sign(bytes.fromhex("44" * 32), b"x")
+        r = run("bind", "--actor", "who@local", "--key", pub.hex(),
+                "--foreign-key")
+        case("a real Ed25519 public key still binds", r.returncode == 0,
+             (r.stdout + r.stderr)[-300:])
+        case("and it is in the keyring", pub.hex() in trust.read_text())
+
+
 def main():
     part_a()
     part_b()
@@ -658,6 +708,7 @@ def main():
     part_d()
     part_e()
     part_f()
+    part_g()
     print("\nSIGNATURE-GATE: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1
 

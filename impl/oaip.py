@@ -264,7 +264,13 @@ def signature_verifies(wid: str, s) -> bool:
     if not isinstance(s, dict):
         return False
     key, sig = s.get("key"), s.get("sig")
-    if not (isinstance(key, str) and isinstance(sig, str) and HEX64.match(wid)):
+    # `isinstance(wid, str)` because this function is total about EVERY other
+    # input and was not about this one: `HEX64.match(None)` raised TypeError
+    # (F4). No caller passes None today; a predicate that answers "does this
+    # verify?" with an exception for one input shape is a trap for the one that
+    # will (2026-07-30, fourth round).
+    if not (isinstance(key, str) and isinstance(sig, str)
+            and isinstance(wid, str) and HEX64.match(wid)):
         return False
     try:
         pub, raw = bytes.fromhex(key), bytes.fromhex(sig)
@@ -1557,6 +1563,19 @@ def cmd_bind(a):
         key = own
     if not (isinstance(key, str) and HEX64.match(key)):
         sys.exit("--key must be a 64-hex-character Ed25519 public key")
+    # AND IT MUST BE A KEY THAT COULD EVER SIGN (F5, 2026-07-30, fourth round).
+    # `bind` took any hex64: `oaip bind --actor a --foreign-key --key 0100…00`
+    # succeeded and wrote the small-order key into the keyring. Harmless in the
+    # sense that `ed25519_verify` refuses every signature under such a key — but
+    # the one command whose whole job is to say "this key may sign as this actor"
+    # was the only place that did not apply this project's own key-validity rule,
+    # and a keyring entry that can never decide anything is a lie about custody.
+    if weak_ed25519_pubkey(bytes.fromhex(key)):
+        sys.exit(f"refusing to bind {key[:12]}: it is not a usable Ed25519 "
+                 "public key — small-order or non-canonically encoded, which "
+                 "Warrant SPEC §5 requires every conforming verifier to reject. "
+                 "OAIP's own verifier refuses every signature under it, so this "
+                 "binding could only ever vouch for a key that decides nothing.")
     if own and key != own and not getattr(a, "foreign_key", False):
         sys.exit(f"refusing to bind {key[:12]}: this ledger's own key is "
                  f"{own[:12]} ({PUBKEY}), so this binding vouches for a key OAIP "
