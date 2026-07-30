@@ -23,6 +23,18 @@ therefore meaningless without a Warrant checkout — and the honest report for t
 is UNRUN, not a silent skip. Point `WARRANT_CLI` at your `warrant.py`, or keep a
 checkout at ~/Projects/warrant.
 
+AND WHICH WARRANT: v0.4 / package >= 0.6.0, pinned in CI at 8508a4a.
+--------------------------------------------------------------------
+This is a HARD floor, not a recommendation. Warrant SPEC v0.4 replaced the §5
+signed message with `"warrant-sig-v1:" || WarrantID_raw`, OAIP verifies Ed25519
+in process and therefore carries its own copy of that construction, and the two
+constructions are disjoint by design — there is no dual-accept window. Against a
+pre-0.6.0 CLI, every check below that files a real acceptance fails, loudly, at
+the signature; that is the intended behaviour and not a broken suite.
+`tests/signature_gate.py` part A measures the installed CLI's construction
+directly, so "the pin moved but the implementation did not" (or the reverse)
+fails here rather than in someone's store.
+
 USAGE
     python3 tools/check.py                 # everything; UNRUN is a failure
     python3 tools/check.py --allow-unrun   # tolerate a missing Warrant checkout
@@ -77,7 +89,8 @@ CHECKS = [
     # ACCEPTANCE EDGE survives the record-format change, and without a Warrant
     # CLI there is no acceptance to survive — an UNRUN here is honest; a
     # half-run that still printed its ALL PASS line would not be.
-    ("pre-0.1 stores still read (§6.4 legacy mode, against the previous release)",
+    ("pre-0.1 stores still read, pre-v1 SIGNATURES do not (§6.4 + §8.6, against "
+     "the previous release)",
      ["python3", "tests/legacy_store.py"], "warrant-cli",
      "LEGACY-STORE: ALL PASS"),
     # No `needs`: the custody property is about git objects, not about Warrant —
@@ -145,7 +158,10 @@ NEEDS = {
     "warrant-cli": (_warrant_cli_ok,
                     "no runnable Warrant CLI  ->  set WARRANT_CLI='python3 "
                     "/path/to/warrant/impl/warrant.py'. The decision layer is a "
-                    "normative dependency (SPEC §3)."),
+                    "normative dependency (SPEC §3), and it must be Warrant "
+                    "SPEC v0.4 / package >= 0.6.0 (CI pins 8508a4a): an older "
+                    "one signs a different message and OAIP will refuse every "
+                    "acceptance it files."),
 }
 
 

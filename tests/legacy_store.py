@@ -31,6 +31,32 @@ first case compares the two byte for byte.
 
 A store built by hand in the old SHAPE would not have tested this: the point is
 that the actual previous release wrote it, including its real signed warrant.
+
+AND THE SIGNATURE IT WROTE IS PRE-v1 (2026-07-31, Warrant SPEC v0.4)
+--------------------------------------------------------------------
+Warrant SPEC v0.4 / package 0.6.0 replaced the signed message with
+`"warrant-sig-v1:" || WarrantID_raw`. The pinned fixture verifies the BARE
+WarrantID and cannot be edited (that is what pinning it is for), so against a
+current Warrant CLI it refuses its own acceptance and can build no store at all.
+The conclusion is forced and is not a testing artefact: **every store the
+previous release could have written carries a pre-v1 signature.** So the store
+here is built through `tests/fixtures/legacy_signer.py`, which is the real
+Warrant CLI with the pre-0.6.0 signature construction put back — the honest
+reconstruction of a ledger from before the flag day, which is precisely what an
+existing user has.
+
+That splits this file's subject in two, and the split is the finding:
+
+  * the RECORD SHAPES still migrate (cases 1, 2, 4, 5). §6.4 legacy-read is a
+    syntactic question — the same facts, differently spelled — and it is
+    unaffected.
+  * the ACCEPTANCE EDGE does NOT survive (case 3, inverted from what it used to
+    assert). That is a cryptographic question, not a syntactic one, and the two
+    constructions are disjoint by design with no dual-accept window. A pre-v1
+    signature gets a diagnosis naming the construction and the remedy, and NO
+    edge — then `warrant resign` restores it. Routing this through §6.4's
+    legacy-read framing would have handed an operator a flag that widens what
+    counts as a valid signature, which is the one thing SPEC §8.6 forbids.
 """
 import hashlib
 import json
@@ -43,7 +69,11 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "impl"))
+import oaip as O                                              # noqa: E402
+
 FIXTURE = ROOT / "tests" / "fixtures" / "oaip_prechange.py"
+LEGACY_SIGNER = ROOT / "tests" / "fixtures" / "legacy_signer.py"
 PRECHANGE_COMMIT = "85298f0"
 PRECHANGE_SHA256 = ("ad6e54b9131c52a7bf51e477fde182b5cb1401faf919852e7053a19b"
                     "da4b4da6")
@@ -111,11 +141,20 @@ def main():
         old = work / "prechange.py"
         shutil.copy(FIXTURE, old)
         env = dict(os.environ)
-        env.setdefault("WARRANT_CLI", " ".join(warrant_argv()))
+        real_cli = env.get("WARRANT_CLI") or " ".join(warrant_argv())
+        env["WARRANT_CLI"] = real_cli
+
+        # The previous release only ever ran against a pre-0.6.0 Warrant, so
+        # that is what it is given here — the real CLI with the pre-v1 signature
+        # construction put back (see tests/fixtures/legacy_signer.py). Only
+        # `run_old` gets it; the CURRENT implementation, which is what is under
+        # test, always talks to the real CLI.
+        old_env = dict(env, LEGACY_WARRANT_REAL_CLI=real_cli,
+                       WARRANT_CLI=f"{sys.executable} {LEGACY_SIGNER}")
 
         def run_old(*a):
             return subprocess.run([sys.executable, str(old), *a], cwd=work,
-                                  capture_output=True, text=True, env=env)
+                                  capture_output=True, text=True, env=old_env)
 
         def run_new(*a):
             return subprocess.run(
@@ -148,6 +187,17 @@ def main():
         case("setup: its canonical layer really is in the pre-0.1 shape",
              sorted(legacy_tags) == ["claim@v1", "execution@v1", "intent@v1"],
              legacy_tags)
+        wrecs = sorted((work / ".oaip" / "warrants" / "records").glob("*.json"))
+        accept = next((p for p in wrecs
+                       if json.loads(p.read_text())["body"].get("decision")
+                       == "accept"), None)
+        acc_env = json.loads(accept.read_text()) if accept else {"sigs": []}
+        case("setup: and its acceptance really is signed under the PRE-v1 "
+             "construction — the only one that release could produce",
+             any(O.legacy_signature(accept.stem, s) for s in acc_env["sigs"])
+             and not any(O.signature_verifies(accept.stem, s)
+                         for s in acc_env["sigs"]),
+             acc_env["sigs"])
 
         # --- 1. the old PROJECTION under the new code: a sentence, not a
         # traceback, and it says what to do.
@@ -159,8 +209,44 @@ def main():
              "the fix",
              "oaip rebuild" in out and "DISPOSABLE" in out, out[-400:])
 
+        # --- 1b. THE SIGNATURE COMES FIRST, AND IT IS A DIFFERENT QUESTION FROM
+        # THE RECORD SHAPE (Warrant SPEC v0.4, OAIP SPEC §8.6). Before any of the
+        # §6.4 shape migration can be measured, this store has to get past the
+        # signature gate — and it does not, because its acceptance was signed
+        # over the bare WarrantID. The refusal must name the construction and the
+        # remedy; it must NOT offer to read the record "in legacy mode".
+        rb0 = run_new("rebuild")
+        out0 = rb0.stdout + rb0.stderr
+        case("a pre-v1 signature refuses the rebuild before any shape question "
+             "is reached", rb0.returncode != 0, out0[-400:])
+        case("...and the refusal names the construction and the remedy",
+             O.LEGACY_SIG_MESSAGE in out0, out0[-800:])
+        case("...and does NOT offer --allow-legacy-links: a pre-v1 SIGNATURE is "
+             "not a pre-0.1 RECORD (SPEC §8.6)",
+             "allow-legacy-links" not in out0 and "8.6" in out0, out0[-800:])
+        case("...and derived no acceptance edge from it",
+             not (work / ".oaip" / "ledger.db").is_file()
+             or (work / ".oaip" / "projection.untrusted").is_file())
+
+        # THE REMEDY, run exactly as the diagnosis prints it. This is what an
+        # existing user does, once, before the record-shape migration below is
+        # even a question.
+        rs = subprocess.run(warrant_argv() + ["--store", ".oaip/warrants",
+                                              "resign", "--key",
+                                              ".oaip/dev.key"],
+                            cwd=work, capture_output=True, text=True)
+        case("`warrant resign --key .oaip/dev.key` migrates the store's "
+             "signatures", rs.returncode == 0, (rs.stdout + rs.stderr)[-400:])
+        after = json.loads(accept.read_text())
+        case("...and the WarrantID did not move: the record is still at its own "
+             "address (only `sigs` changed, and `sigs` is not hashed)",
+             after["body"] == acc_env["body"]
+             and any(O.signature_verifies(accept.stem, s)
+                     for s in after["sigs"]))
+
         # --- 2. rebuild reads the legacy canonical layer rather than emptying
-        # the ledger.
+        # the ledger. THIS is the §6.4 question, and it is untouched by the
+        # signature change: the same facts, differently spelled.
         rb = run_new("rebuild")
         rout = rb.stdout + rb.stderr
         case("rebuild of a pre-0.1 store succeeds", rb.returncode == 0,
