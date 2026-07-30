@@ -129,7 +129,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "the canonical shape of §2 execution"
     },
@@ -336,7 +337,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "shell@v1 carries exactly one element: the script"
     },
@@ -361,7 +363,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "failed",
         "exit_code": null,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "the invocation never became a process; there is no code to report"
     },
@@ -386,7 +389,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "killed",
         "exit_code": null,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "killed by a signal: exit_code is null, not 137 and not 0"
     },
@@ -411,7 +415,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "an execution with no declared intent is legal and says so explicitly"
     },
@@ -601,6 +606,32 @@
         "size": 0
       },
       "why": "an unregistered artifact kind is PERMITTED — §7.4 keeps this set open on purpose, and a vector pins that so a future reader cannot quietly close it"
+    },
+    {
+      "name": "execution-no-output",
+      "type": "execution",
+      "version": "0.1",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000,
+        "output": null
+      },
+      "why": "a runtime that captured nothing records null, and that is a fact rather than an omission"
     }
   ],
   "reject": [
@@ -677,7 +708,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "no prefix matching: 1.0 is not 'a kind of 0.1'"
     },
@@ -807,7 +839,8 @@
         ],
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "execution without status is not a execution"
     },
@@ -828,7 +861,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "execution without executor is not a execution"
     },
@@ -950,7 +984,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "no runtime means no rule for interpreting `invocation`"
     },
@@ -1019,7 +1054,8 @@
         "status": "exited",
         "exit_code": 0,
         "ts": 1784000000,
-        "command": "bash change.sh"
+        "command": "bash change.sh",
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "the field the reference implementation used to write, refused by name"
     },
@@ -1086,7 +1122,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "nested objects are closed too"
     },
@@ -1211,7 +1248,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "THE format decision, pinned: a joined string cannot reconstruct argv, so the string form is not an invocation"
     },
@@ -1233,7 +1271,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "an execution with no invocation observed nothing"
     },
@@ -1258,7 +1297,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "argv elements are strings"
     },
@@ -1507,7 +1547,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": null,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "a process that exited returned a code"
     },
@@ -1532,7 +1573,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "killed",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "a killed process never returned 0; recording one is the lie §2.4 exists to prevent"
     },
@@ -1557,7 +1599,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 256,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "an exit status is 0..255"
     },
@@ -1582,7 +1625,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "unregistered means invalid, so a forward-dated runtime cannot mean valid here and invalid elsewhere (§7)"
     },
@@ -1608,7 +1652,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "shell@v1 is one script element; the argv form is exec@v1"
     },
@@ -1633,7 +1678,8 @@
         "environment": "0000000000000000000000000000000000000000000000000000000000000000",
         "status": "exited",
         "exit_code": 0,
-        "ts": 1784000000
+        "ts": 1784000000,
+        "output": "0000000000000000000000000000000000000000000000000000000000000000"
       },
       "why": "a git tree id in a StateID position is the pre-0.1 confusion, and it is exactly 40 characters of it"
     },
@@ -2094,6 +2140,57 @@
       "outcome": "invalid",
       "bytes_hex": "7b226174747269627574696f6e223a22302e31222c226964223a2261222c226566666563745f6964223a2265222c226361757365223a2263222c226d6574686f64223a226578636c75736976652d636f6d6d616e642d77696e646f77222c22636f6e666964656e63655f70706d223a302e3939392c22737570706f7274223a5b5d7d",
       "why": "confidence as a float is outside the §1 domain before it is outside §2.6's range — both refusals are correct and the ingestion one comes first"
+    },
+    {
+      "name": "missing-execution-output",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "an execution that captured nothing says so with null, never by dropping the member"
+    },
+    {
+      "name": "wrong-type-execution-output",
+      "class": "wrong-type",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000,
+        "output": "not-a-hash"
+      },
+      "why": "output cites an artifact by address"
     }
   ]
 }

@@ -326,7 +326,8 @@ available to every reader is `unreproducible`.
   "executor": { "actor": "<string>", "runtime": "<string>" },
   "input_state": "<StateID>", "output_state": "<StateID>",
   "invocation": ["<string>", "..."], "environment": "<hex64>",
-  "status": "exited | failed | killed", "exit_code": <int | null>, "ts": <int> }
+  "status": "exited | failed | killed", "exit_code": <int | null>,
+  "output": "<hex64 | null>", "ts": <int> }
 ```
 
 | Member | Type | Req | Rule |
@@ -341,6 +342,7 @@ available to every reader is `unreproducible`.
 | `environment` | string | MUST | `hex64`; MUST equal the `env_fingerprint` of `input_state`'s State |
 | `status` | string | MUST | `exited` \| `failed` \| `killed` |
 | `exit_code` | integer \| null | MUST | integer 0–255 when `status` is `exited`; **`null`** when `failed` or `killed` |
+| `output` | string \| null | MUST | `hex64` — the Artifact holding what the runtime captured, or `null` where nothing was captured |
 | `ts` | integer | MUST | Unix seconds |
 
 `status` values, exhaustively:
@@ -351,6 +353,15 @@ available to every reader is `unreproducible`.
   was absent, not executable, or the runtime refused to start it.
 
 `status`/`exit_code` describe **execution**, not acceptance (§4).
+
+`output` closes a gap this document had: §2.1 offers `Artifact` for "stdout,
+stderr, a diff, a test report", and nothing in §2.4 could cite one, so an
+execution's own captured output was reachable only through whatever claim
+happened to name it later. What the member points at is decided by the runtime
+(§7.2), and for both registered runtimes it is a **merged** stdout/stderr stream:
+the interleaving is preserved and the split is not. That is a real loss, and it
+is written here rather than left for a reader to discover — a second
+implementation must merge the same way or the hashes will not agree.
 
 **`invocation` is an array, not a string** (a change from this document's first
 draft, made because the string form is not faithful): an argv vector cannot be
@@ -660,6 +671,11 @@ the only thing that makes an Execution reproducible.
 | --- | --- | --- | --- |
 | `exec@v1` | `execution` `0.1` | current | an argv vector passed directly to the platform's process-creation call: **no shell**, no word splitting, no glob expansion, no variable substitution. Element 0 is the executable, resolved through `PATH` |
 | `shell@v1` | `execution` `0.1` | current | **exactly one** element: a script for a POSIX shell, executed as `sh -c <script>`. More or fewer than one element makes the record invalid |
+
+Both registered runtimes capture `output` (§2.4) as the process's standard output
+and standard error **merged into one stream in arrival order**, and neither
+records which bytes came from which. A registration that captures them
+separately, or not at all, is a different tag.
 
 An MCP call, an API edit, a merge and a rollback are each candidates for their own
 runtime tag; none is registered, because none is implemented.

