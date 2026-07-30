@@ -461,7 +461,7 @@ lie.
 ```json
 { "claim": "0.1", "id": "<id>", "subject": "<hex64>", "predicate": "<string>",
   "evidence": ["<hex64>", "..."],
-  "validation": { "runtime": "cmd@v1", "check": "<hex64>",
+  "validation": { "runtime": "oaip-host-shell@v1", "check": "<hex64>",
                   "verdict": "pass | fail", "transcript": "<hex64>" },
   "proposed_by": "<string>", "ts": <int> }
 ```
@@ -486,6 +486,40 @@ for a Warrant subject; it is never itself an accepted fact. `check` is a hash
 because the check is evidence: a reader must be able to fetch and re-run exactly
 the bytes that were run, and a command echoed into a record is a *description* of
 a check rather than the check.
+
+**`validation.runtime` MUST name the profile the check actually ran under**, and
+a filer MUST NOT record a runtime whose registered definition its execution did
+not satisfy. This is stated as a MUST because it was violated: until 2026-07-31
+this implementation ran the check through the host shell and recorded `cmd@v1`,
+a tag Warrant SPEC §3 defines as execution in an isolated container, and passed
+it into a signed decision (§3). A record that names an execution profile which
+did not happen is a false record even when every hash in it is correct. §7.3
+registers `oaip-host-shell@v1` for what actually happens.
+
+**The check's own effects MUST be observed (MUST).** The Execution's
+`output_state` (§2.4) is snapshotted when the observed command returns, which is
+*before* the check runs — so anything the check writes lands after the last
+observation, and a `ClaimSubject` (§2.8) built from that Execution lists effects
+that were already stale when the decision was signed. A filer therefore MUST
+snapshot the workspace immediately before and immediately after the check, and
+where the two differ it MUST do one of exactly two things:
+
+- **refuse** to file the claim, or
+- file it and **cite the check's own effects as evidence**: a `check-effects`
+  artifact (§7.4) whose bytes list them, with its hash in the claim's `evidence`.
+
+Filing without either is what this rule forbids. A reader of a claim over a
+mutating check MUST NOT be able to reach "the workspace was as the subject says"
+from a record that omits the mutation. The window is the check's own — before to
+after — and not the Execution's after-state, because the workspace may have
+changed between the two commands for reasons the check did not cause, and
+attributing those to the check would answer one false attribution with another.
+
+This is **observation, not confinement**: the mutation has already happened when
+it is seen, and §8.5 SA-13 says what that does and does not buy. (Found by
+external audit — Codex, 2026-07-31 — with a working reproduction: a check of
+`touch check-escaped-container` created that file in the observed workspace
+while the signed decision recorded `effects=0`.)
 
 ### 2.8 `ClaimSubject` — what the decision is *about*
 
@@ -525,10 +559,35 @@ An **accepted** claim MUST be represented as a Warrant `accept` record, where:
   accept that omits this names no claim at all, and a reader MUST NOT guess one
   from the subject). Readers MUST match the prefix **case-insensitively**, so
   that its spelling cannot select a weaker code path;
-- `because` = `[ {kind:"prose", text: predicate}, {kind:"check", runtime, check,
-  verdict, transcript} ]` per Warrant §3 — the validation is the check reason;
-- `evidence` = the claim's `evidence` artifact hashes;
+- `because` begins with `{kind:"prose", text: predicate}`. How the **validation**
+  enters depends on the claim's `validation.runtime`, and the rule is a MUST
+  because getting it wrong puts a false statement inside a signature:
+  - if that runtime is registered in **Warrant's** reason-runtime registry
+    (Warrant SPEC §13.1) *and* the filer actually provided that runtime's
+    profile, the validation is filed as `{kind:"check", runtime, check, verdict,
+    transcript}` with all four members passed through unchanged;
+  - **otherwise the filer MUST NOT substitute a Warrant runtime tag.** OAIP's
+    own runtime registry (§7.3) is not Warrant's, an unregistered `runtime`
+    makes the Warrant record invalid by Warrant §3's MUST, and a *registered*
+    one whose profile did not happen is the defect this rule exists to stop. The
+    validation is instead filed as a **prose** reason naming the runtime and the
+    verdict, and `validation.check` and `validation.transcript` MUST be added to
+    the accept's `evidence` so those bytes still resolve in the store and remain
+    citable by hash;
+- `evidence` = the claim's `evidence` artifact hashes, plus the check blob and
+  transcript in the second case above;
 - `under` = the decision policy in force.
+
+**The reference implementation is always in the second case**, and will be until
+either OAIP grows a validation runtime that genuinely satisfies a Warrant tag or
+`oaip-host-shell@v1` is registered in Warrant §13.1 — a pull request against the
+Warrant repository, since that registry has no operator (Warrant SPEC §13). What
+the second case costs, stated rather than implied: the warrant carries no
+machine-readable `because[].check`, so it contributes no check outcome
+fingerprint to Warrant's §7(b) novelty test and a tool that looks for a check
+reason finds none. The trade is deliberate — a decision that cites its check as
+evidence and says in words how it ran is weaker than one whose check reason is
+machine-readable, and stronger than one whose check reason is untrue.
 
 Reject / revise / supersede use Warrant's native `prior` chain
 (`propose → reject → accept`). OAIP does **not** re-specify decision semantics —
@@ -723,8 +782,32 @@ re-run the check and get the same verdict, including the budget it may spend.
 
 | Tag | Versions | Status | Definition |
 | --- | --- | --- | --- |
-| `cmd@v1` | `claim` `0.1` | current | the check blob is executed as a command; exit 0 = `pass`, non-zero = `fail`. The same tag as Warrant §3 `cmd@v1`, so the bridge (§3) passes it through unchanged |
+| `oaip-host-shell@v1` | `claim` `0.1` | current | the check blob is executed by the host's POSIX shell — `sh -c <blob>` — **in the observed workspace**, as the process that ran the claim, with that process's full ambient authority: **no container and no isolation of the filesystem, the network, the user or the environment**. Exit 0 = `pass`, non-zero = `fail`. Re-running it reproduces the verdict only on a host configured like the filer's, and re-running a stranger's is running a stranger's shell script |
+| `cmd@v1` | `claim` `0.1` | current — **readable, never written by this implementation** | Warrant §3's tag [R3]: the check blob is executed as a command **in an isolated container**; exit 0 = `pass`, non-zero = `fail` |
 | `ski@v1` | — | **reserved; MUST be rejected in `claim` `0.1`** | Σ-GLYPH Book I [R7] SKI term evaluation under an ATP budget |
+
+**Why `cmd@v1` is registered and not written.** Until 2026-07-31 this
+implementation ran every check with `subprocess.run(check, shell=True)` on the
+observer's own host and recorded `cmd@v1`, and §3 passed that tag into a signed
+Warrant record — where Warrant §3 defines it as execution in an isolated
+container. The signed decision therefore promised an execution profile that
+never existed. Found by external audit (Codex, 2026-07-31) with a working
+reproduction, reproduced here before it was changed. `cmd@v1` stays **readable**
+because every claim written before that date carries it and §6 forbids making a
+record invalid that an earlier reading called valid; nothing in this
+specification, and nothing an implementation may do, makes it writable again
+without an execution that actually provides a container.
+
+**Why the honest tag stops at OAIP's own records.** `oaip-host-shell@v1` is
+registered *here*, in OAIP's registry. Warrant's reason-runtime registry (Warrant
+SPEC §13.1) is a different registry with the same policy (Specification
+Required), **no registry operator**, and registration by pull request against the
+Warrant repository; an unregistered `runtime` in a Warrant record makes that
+record invalid by MUST. So an OAIP-namespaced runtime is *not* currently
+legitimate in a Warrant record, and §3 forbids putting it there — the bridge
+files the validation as prose plus evidence instead. Making it legitimate is
+cross-repository coordination, not an OAIP edit; this specification does not
+presume the outcome.
 
 `ski@v1` is reserved rather than admitted because Σ-GLYPH is an *optional*
 dependency of this specification: a v0.1 verifier without a Book I oracle cannot
@@ -732,6 +815,11 @@ evaluate the check, and a runtime that some conforming verifiers can evaluate an
 others cannot is a runtime about which conforming verifiers disagree. Admitting
 it is a `claim` `0.2` change — exactly as Warrant admitted it in body version
 `0.2` and keeps it rejected in `0.1` [R3].
+
+A container runtime, an MCP call and a hosted CI job are each candidates for
+their own validation tag. None is registered, because none is implemented — and
+registering a tag for a profile no code provides is precisely the defect above,
+written down in advance.
 
 ### 7.4 Effect kinds — closed; artifact kinds — open
 
@@ -756,6 +844,7 @@ any other string is permitted and MUST NOT make a record invalid.
 | `stdout` | the merged standard output/error of an execution |
 | `check` | the bytes of a validation check, as run |
 | `check-transcript` | the captured output of a validation check |
+| `check-effects` | the per-file mutations a validation check made to the observed workspace, between a snapshot taken immediately before it and one immediately after (§2.7). The bytes are canonical per §1 and carry the two `worktree_tree` ids and an array of `{target, kind, before, after}` elements as in §2.5, sorted by `(target, kind)`. **This artifact MUST NOT be shaped like a record**: it carries no member whose value is a version string, so §1.1 classifies it `not-a-record`. A record-shaped one would classify as `unknown-type`, and §6.2's fail-closed rule would then make every claim citing it unreadable — the citation is the whole point of writing it |
 | `claim-subject` | the canonical bytes of a `ClaimSubject` (§2.8) |
 | `environment-probe` | the canonical bytes of an `EnvironmentProbe` (§2.2.1) |
 | `toolchain-probe` | the canonical bytes of a `ToolchainProbe` (§2.2.2) |
@@ -843,7 +932,7 @@ a derived edge that nobody decided is neither.
 
 | Capability | Can forge an acceptance? | What they CAN do | Mechanism that stops them |
 |---|---|---|---|
-| **(a) The observed agent** — write access to the workspace, i.e. everything under the repository including `.oaip/`, running as the observer's uid *if unconfined* | **Not by workspace write alone** (default deployment). **Yes** if it also runs unconfined as the observer's uid | Write/delete artifacts and store records; plant a keyring at `.oaip/trust.json`; rewrite `.oaip/store.json`; edit the file a validation check tests **before the check runs**; cause refusals at will | Trust root (key + keyring) outside the workspace (§8.4 profile B) — the planted keyring is never read; in-process Ed25519 verification over `"warrant-sig-v1:" \|\| WarrantID`, the WarrantID being one OAIP recomputes; keyring binding; the signed `oaip-claim:<id>` link (§3). **Nothing stops the check-target rewrite** — see §8.5 SA-1 |
+| **(a) The observed agent** — write access to the workspace, i.e. everything under the repository including `.oaip/`, running as the observer's uid *if unconfined* | **Not by workspace write alone** (default deployment). **Yes** if it also runs unconfined as the observer's uid | Write/delete artifacts and store records; plant a keyring at `.oaip/trust.json`; rewrite `.oaip/store.json`; edit the file a validation check tests **before the check runs**; where the check invokes a script that lives in the workspace, mutate the workspace **from inside the check**, after the Execution was snapshotted; cause refusals at will | Trust root (key + keyring) outside the workspace (§8.4 profile B) — the planted keyring is never read; in-process Ed25519 verification over `"warrant-sig-v1:" \|\| WarrantID`, the WarrantID being one OAIP recomputes; keyring binding; the signed `oaip-claim:<id>` link (§3); a mutation made from inside the check is observed and the claim is refused or made to cite it (§2.7). **Nothing stops the check-target rewrite, and nothing prevents the mutation — it is seen, not blocked** — see §8.5 SA-1 and SA-13 |
 | **(b) A party with write access to the TRUST ROOT** | **Yes, completely** | Bind their own key to any actor, or read the key and sign directly | Nothing. This is the trust root's definition: whoever holds it decides. Mode bits (§8.3(4)) exclude *other accounts on the host*, not this party |
 | **(c) A party who controls the environment or PATH** | **Yes** | Set `OAIP_TRUST_ROOT`/`XDG_CONFIG_HOME` to a keyring they wrote; replace `git` or `sh` and lie about the snapshot; replace `$WARRANT_CLI` | Nothing for the trust root or the toolchain. `$WARRANT_CLI` alone is closed: signature validity is decided in process, so a hostile CLI can make OAIP **refuse** but not believe. The `posix-base@v1` probes (§2.2.1) record `PATH` but neither `OAIP_TRUST_ROOT` nor `XDG_CONFIG_HOME`, and they are a discriminator, not a barrier. The environment is part of the TCB and OAIP says so rather than pretending otherwise |
 | **(d) A party with read-only access to the workspace** | **No** | Read every record, claim, transcript and the projection; correlate what an agent did | Nothing needs to: no OAIP record is secret. The signing key is not in the workspace (profile B) and is not readable by anyone else on the host (§8.3(4)) |
@@ -940,7 +1029,8 @@ and re-run exactly the bytes that ran — that makes the check auditable, not
 un-rewritable. This is the largest remaining hole in the §4 gate and no mechanism
 in §8.3 addresses it: closing it needs the check to run from a state the agent
 did not produce (a pinned revision, a separate checkout, a container), which is a
-deployment decision, not a format one.
+deployment decision, not a format one. Since 2026-07-31 the *record* says so: the
+runtime tag is `oaip-host-shell@v1` (§7.3, SA-12), not a tag that means container.
 
 **SA-2. The environment is assumed to be trusted.** `git`, `sh`, the Python
 interpreter and `$WARRANT_CLI`'s *availability* are inside the TCB; only
@@ -1044,6 +1134,62 @@ payload digest — and `tools/intoto.py` puts one exactly one hop from this ledg
 — from a Σ-GLYPH NodeHash, or from a git object id. No `SA-n` said so. It is
 recorded here in its narrowed form rather than quietly dropped, because the
 residue is the part that is still true.
+
+**SA-12. The validation check is assumed to run unconfined, and the record is
+assumed to say so.** OAIP provides no isolation for the check: `sh -c` on the
+host, as the observer's own user, in the observed workspace, with the network
+and the environment the observer has (§7.3, `oaip-host-shell@v1`). A check can
+therefore read the operator's files, reach the network, and — since the trust
+root is outside the *workspace* but not outside the *user* (SA-5) — read the
+signing key. Nothing in §8.3 stops any of that, and nothing here claims to.
+
+What changed on 2026-07-31 is not the confinement but the honesty of the record.
+Before it, the claim and the signed Warrant both said `cmd@v1` — Warrant §3's
+tag for execution in an isolated container — so a reader who applied the only
+published definition of that tag would conclude the check ran confined. **The
+assumption above was true the whole time and the record contradicted it.** That
+is the defect class this section exists to catch: not "a control is missing" but
+"a signed record describes a control that was never there". Found by external
+audit (Codex, 2026-07-31) with a working reproduction.
+
+The residue, stated plainly: a reader of an OAIP claim can now tell that the
+check was unconfined, and a reader of the Warrant record can read it in prose
+(§3). Neither can tell **what** an unconfined check did, beyond the workspace
+mutations SA-13 requires to be observed.
+
+**SA-13. The check's side effects are assumed to be visible in the workspace
+tree, and only there.** §2.7 requires the filer to snapshot the workspace
+immediately before and after the check and either refuse the claim or cite a
+`check-effects` artifact. That closes exactly one hole — the reproduction where
+a check of `touch check-escaped-container` created a file in the observed
+workspace and the signed decision recorded `effects=0` — and it closes it by
+**observing**, never by preventing. The check runs unconfined (SA-12); by the
+time the second snapshot is taken, whatever it did it has already done.
+
+**What this does NOT catch, in the order an attacker would try them:**
+
+- **Anything outside the worktree.** Writes to `$HOME`, `/tmp`, another
+  repository, the git object database, the network, or an installed package are
+  not in the snapshot and are not effects here. Reading a secret is invisible by
+  construction: reads are not mutations.
+- **A mutation the check reverts before it exits.** The window compares two
+  trees, not a trace of syscalls. `touch x && rm x` is indistinguishable from
+  doing nothing, as is a file written and restored byte-for-byte.
+- **Anything the snapshot already excludes.** `.oaip/` at any depth and any
+  letter case is outside every snapshot (SA-10), so a check that writes there
+  produces no observed effect. The same exclusion that keeps the signing key
+  out of the tree keeps the ledger directory out of this observation.
+- **Metadata the tree does not carry.** Mode bits beyond git's
+  executable/symlink distinction, timestamps, xattrs and ownership.
+- **The check rewriting what it tests before testing it** — SA-1, unchanged and
+  still the largest hole in the §4 gate. Observing that the check changed a file
+  does not make the verdict it then reported trustworthy.
+
+What it *does* buy is narrower and worth stating exactly: **a claim whose check
+mutated the tracked workspace is either refused or carries a list of those
+mutations that a reader can fetch by hash** — the record can no longer be silent
+about them. It is not a statement that the check was confined, that its verdict
+is sound, or that nothing else happened.
 
 #### Explicit non-goals
 

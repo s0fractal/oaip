@@ -110,6 +110,14 @@ CHECKS = [
     ("signature gate (OAIP verifies Ed25519 itself; a stub CLI cannot forge)",
      ["python3", "tests/signature_gate.py"], "warrant-cli",
      "SIGNATURE-GATE: ALL PASS"),
+    # `needs` the CLI: the point of the check is what crosses the BRIDGE — that
+    # a signed Warrant record never carries a runtime tag whose meaning Warrant
+    # defines differently. Without a Warrant CLI there is no record to look at,
+    # and a half-run that still printed ALL PASS would be the pattern this
+    # repository keeps finding.
+    ("validation runtime attribution (the record names the profile that ran)",
+     ["python3", "tests/validation_runtime.py"], "warrant-cli",
+     "VALIDATION-RUNTIME: ALL PASS"),
     ("I-JSON domain parity with Warrant (§1 'exactly per Warrant §4')",
      ["python3", "tests/ijson_parity.py"], "warrant-lib",
      "IJSON-PARITY: SAME DOMAIN"),

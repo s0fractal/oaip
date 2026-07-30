@@ -9,9 +9,12 @@ A minimal, RUNNABLE slice of the provenance stack we sketched:
   Ledger    → a SQLite PROJECTION over content-addressed truth. Deletable and
               rebuildable; it stores hashes + typed relations, not canon.
   Bridge    → an accepted CLAIM becomes a real, signed Warrant record — the
-              decision layer, with the provenance cited as evidence and a
-              validation command as a cmd@v1 check. Warrant is a normative
-              dependency, not reimplemented here.
+              decision layer, with the provenance, the check blob and its
+              transcript cited as evidence. Warrant is a normative dependency,
+              not reimplemented here — and the validation is NOT filed as a
+              Warrant `cmd@v1` check reason, because Warrant SPEC §3 defines
+              that tag as execution in an isolated container and this
+              implementation runs the check on the host (SPEC §7.3).
 
 Deliberately NOT decided here (later layers): whether the action was correct,
 whether the intent was met, which policy has authority, what reaction to run.
@@ -1298,8 +1301,27 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 # record invalid (§7): unknown-means-invalid is what stops a forward-dated value
 # from meaning "valid" here and "invalid" in a second implementation.
 EXECUTOR_RUNTIMES = {"exec@v1", "shell@v1"}
-VALIDATION_RUNTIMES = {"cmd@v1"}        # ski@v1 is RESERVED in claim 0.1 (§7.3)
+# §7.3. `oaip-host-shell@v1` is what this implementation ACTUALLY does; `cmd@v1`
+# stays readable because every claim written before 2026-07-31 carries it and §6
+# forbids making a record invalid that an earlier reading called valid — but this
+# implementation never writes it again. It cannot: `cmd@v1` is Warrant's tag and
+# Warrant SPEC §3 defines it as execution in an ISOLATED CONTAINER, which is not
+# what `subprocess.run(check, shell=True)` on the observer's own host is. Found
+# by external audit (Codex, 2026-07-31) with a working reproduction.
+HOST_SHELL_RUNTIME = "oaip-host-shell@v1"
+VALIDATION_RUNTIMES = {"cmd@v1", HOST_SHELL_RUNTIME}
 VALIDATION_RESERVED = {"ski@v1"}
+# Which validation runtimes may be filed into a Warrant record as a
+# `because[].check` reason. Warrant SPEC §13.1 registers exactly `cmd@v1`
+# (isolated container) and `ski@v1` (a Σ-GLYPH Book I oracle under an ATP
+# budget); an unregistered value makes the Warrant record INVALID by MUST, and
+# `warrant accept --runtime` will not even accept another string. OAIP can
+# provide neither profile, so the set is EMPTY and the bridge files the
+# validation as prose plus evidence instead (§3). It is a set rather than a
+# `False` so that a future OAIP runtime which genuinely satisfies a Warrant tag
+# has one place to be added — and so that this comment sits next to the reason
+# it is empty.
+WARRANT_CHECK_RUNTIMES = frozenset()
 EFFECT_KINDS = {"file.create", "file.modify", "file.delete", "file.typechange"}
 ENV_PROFILES = {"posix-base@v1"}
 TOOLCHAIN_PROFILES = {"posix-base@v1"}
@@ -2786,8 +2808,61 @@ def cmd_claim(a):
     # be echoed into the record as text, which describes a check without being
     # one: a reader could not fetch the bytes that ran and re-run them.
     check_hash = put_artifact(a.check.encode(), "check")
-    # validation check — SEPARATE from execution success (exit_code=0 earns nothing)
+    # validation check — SEPARATE from execution success (exit_code=0 earns
+    # nothing). It runs THROUGH THE HOST SHELL, as this process's user, in the
+    # observed workspace, with no isolation of the filesystem, the network or
+    # the environment — which is why the record says `oaip-host-shell@v1` and
+    # not `cmd@v1` (§7.3). Nothing here confines the check; the tag stops the
+    # record from claiming otherwise.
+    #
+    # OBSERVE THE CHECK'S OWN WINDOW (§2.7). The Execution's output state was
+    # snapshotted when `oaip run` returned — before this command existed — so
+    # anything the check writes lands AFTER the last observation. Measured on
+    # the unfixed tree: a check of `touch check-escaped-container` created that
+    # file in the observed workspace and the signed decision still recorded
+    # `effects=0` (external audit by Codex, 2026-07-31, reproduced locally).
+    #
+    # The window is taken here rather than from the Execution's after-state on
+    # purpose: between `oaip run` and `oaip claim` a human may have edited the
+    # workspace, and attributing THAT to the check would be a second false
+    # attribution answering the first.
+    before_check = workspace_snapshot()
     chk = subprocess.run(a.check, shell=True, capture_output=True, text=True)
+    after_check = workspace_snapshot()
+    check_effects = sorted(effects_between(before_check, after_check),
+                           key=lambda e: (e["target"], e["kind"]))
+    check_effects_hash = None
+    if check_effects:
+        # Stored whichever way this ends, so the observation survives the
+        # refusal: a refusal that leaves no evidence of what it saw teaches the
+        # operator to re-run with the flag and nothing else.
+        #
+        # DELIBERATELY NOT SHAPED LIKE A RECORD. §1.1 classifies any object with
+        # a `<tagname>: "<version>"` member as a record type, and §6.2 fails
+        # closed when a record CITES an artifact this reader cannot read — so a
+        # `{"check_effects": "0.1", ...}` artifact would classify as
+        # `unknown-type` and every claim citing it would refuse to rebuild. No
+        # member here can ever hold a version-shaped string (§7.4).
+        doc = {"check_effects": check_effects, "before_tree": before_check,
+               "after_tree": after_check}
+        check_effects_hash = put_artifact(canon(doc), "check-effects")
+        changed = ", ".join(f"{e['kind']} {e['target']}"
+                            for e in check_effects[:10])
+        if not getattr(a, "allow_check_effects", False):
+            sys.exit(
+                "refusing to file this claim: the validation check MUTATED the "
+                f"observed workspace ({len(check_effects)}): {changed}"
+                + (", …" if len(check_effects) > 10 else "")
+                + f"\n  observed effects recorded as artifact "
+                  f"{check_effects_hash[:12]}; no claim was written.\n"
+                  "  The Execution's output state was snapshotted before this "
+                  "check ran, so filing the claim would have produced a signed "
+                  "decision whose effect list omits every change above (SPEC "
+                  "§2.7).\n"
+                  "  Either make the check read-only, or re-run with "
+                  "`--allow-check-effects` to file a claim that CITES these "
+                  "effects as evidence. The mutation itself already happened: "
+                  "this observes, it does not confine (SPEC §8.5 SA-13).")
     transcript_hash = put_artifact((chk.stdout + chk.stderr).encode(),
                                    "check-transcript")
     verdict = "pass" if chk.returncode == 0 else "fail"
@@ -2810,19 +2885,25 @@ def cmd_claim(a):
     subject_hash = put_artifact(canon(subject),
                                 artifact_kind("claim_subject"))  # JCS, §1
     cid = kid()
-    evidence = sorted({h for h in (ex[0],) if isinstance(h, str)})
+    # The check's own effects ride in `evidence` (§2.7): the array is open, so
+    # this needs no format change, and it means no record of a mutating check
+    # can be read as though nothing changed. `sorted` over a set is the §2.7
+    # rule (ascending, no duplicates), not tidiness.
+    evidence = sorted({h for h in (ex[0], check_effects_hash)
+                       if isinstance(h, str)})
     ts = int(time.time())
     proposed_by = getattr(a, "actor", None) or default_actor()
     store_record({"claim": "0.1", "id": cid, "subject": subject_hash,
                   "predicate": a.predicate, "evidence": evidence,
-                  "validation": {"runtime": "cmd@v1", "check": check_hash,
+                  "validation": {"runtime": HOST_SHELL_RUNTIME,
+                                 "check": check_hash,
                                  "verdict": verdict,
                                  "transcript": transcript_hash},
                   "proposed_by": proposed_by, "ts": ts})
     con.execute("""INSERT INTO claims(id,execution_id,predicate,runtime,check_hash,
                    verdict,transcript_hash,subject_hash,evidence,proposed_by,
                    created_at,format) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (cid, a.execution, a.predicate, "cmd@v1", check_hash, verdict,
+                (cid, a.execution, a.predicate, HOST_SHELL_RUNTIME, check_hash, verdict,
                  transcript_hash, subject_hash, canon(evidence).decode(),
                  proposed_by, ts, "0.1"))
     con.commit()
@@ -2869,8 +2950,8 @@ def _accept(a):
     pol = w("blob", "add", str(policy)).stdout.strip()
     # The check blob is materialized from the ARTIFACT, byte for byte, rather
     # than re-rendered from a command string in a table: the whole reason §2.7
-    # cites it by hash is that the warrant's `because[].check` and the claim's
-    # `validation.check` must be the same bytes.
+    # cites it by hash is that the bytes a reader fetches from the Warrant store
+    # and the bytes the claim's `validation.check` names must be the same bytes.
     checkfile = OAIP / "check.tmp"
     checkfile.write_bytes((ART / check_hash).read_bytes())
     transcript_file = OAIP / "transcript.tmp"
@@ -2887,6 +2968,50 @@ def _accept(a):
                 ev_args += ["--evidence", str(p)]
     except ValueError:
         pass
+    # HOW THE VALIDATION ENTERS THE WARRANT, AND WHY NOT AS A CHECK REASON.
+    # It used to go in as `{kind:"check", runtime:"cmd@v1", …}`, passed through
+    # from the claim unchanged. Warrant SPEC §3 defines `cmd@v1` as "the check
+    # blob is executed as a command in an isolated container"; OAIP executes it
+    # with `subprocess.run(check, shell=True)` on the observer's own host. The
+    # signed record therefore named an execution profile that never happened —
+    # a provenance defect, not an injection one (external audit by Codex,
+    # 2026-07-31, reproduced locally).
+    #
+    # The honest tag (`oaip-host-shell@v1`, §7.3) CANNOT be substituted here:
+    # Warrant's registry (Warrant SPEC §13.1) admits `cmd@v1` and `ski@v1` only,
+    # an unregistered runtime makes the Warrant record invalid by MUST, and
+    # `warrant accept --runtime` is a closed choice list. Registering an
+    # OAIP-namespaced runtime there is a pull request against Warrant, i.e.
+    # cross-repository coordination this implementation must not presume.
+    #
+    # So until that registration exists (or OAIP grows a runtime that really
+    # satisfies a Warrant tag), the validation is filed as PROSE naming the
+    # runtime and the verdict, with the check blob and the transcript carried as
+    # EVIDENCE so the bytes still resolve in the store and are still citable by
+    # hash. What is lost is stated rather than hidden: the warrant no longer
+    # carries a machine-readable `because[].check`, so it contributes no §7(b)
+    # outcome fingerprint and a tool looking for a check reason will find none.
+    # That is a smaller loss than a signed claim of containment that did not
+    # happen.
+    if runtime in WARRANT_CHECK_RUNTIMES:
+        check_args = ["--check", str(checkfile), "--verdict", "pass",
+                      "--runtime", runtime, "--transcript",
+                      str(transcript_file)]
+        validation_prose = []
+    else:
+        check_args = []
+        where = (" — the check ran through the host shell in the observed "
+                 "workspace, NOT in an isolated container"
+                 if runtime == HOST_SHELL_RUNTIME else
+                 " — OAIP did not itself establish this runtime's execution "
+                 "profile")
+        validation_prose = ["--reason", (
+            f"validation: runtime={runtime} verdict={verdict}{where}, so it is "
+            f"not filed as a Warrant check reason (Warrant SPEC §3/§13.1). The "
+            f"check blob {check_hash} and its transcript {transcript_hash} are "
+            f"cited as evidence.")]
+        ev_args += ["--evidence", str(checkfile),
+                    "--evidence", str(transcript_file)]
     # The subject blob is the claim's SUBJECT, and two claims can share one:
     # {predicate, execution, effects} excludes the check command and verdict, so
     # `--check true` and `--check false` over the same execution collide. A
@@ -2897,10 +3022,9 @@ def _accept(a):
     # follows it instead of guessing by subject hash. Legacy records without the
     # note fall back to subject-hash matching restricted to supported claims.
     r = w("accept", "--subject", subj, "--under", pol,
-          "--check", str(checkfile), "--verdict", "pass",
-          "--runtime", runtime or "cmd@v1",
-          "--transcript", str(transcript_file),
+          *check_args,
           "--reason", f"claim: {predicate}",
+          *validation_prose,
           "--note", f"oaip-claim:{a.claim}",
           *ev_args,
           "--actor", a.actor, "--key", str(WKEY))
@@ -2963,8 +3087,9 @@ def _accept(a):
     con.execute("INSERT OR IGNORE INTO warrants(claim_id,warrant_id,created_at)"
                 " VALUES (?,?,?)", (a.claim, wid, wts))
     con.commit()
-    print(f"ACCEPTED -> warrant {wid}\n  (signed, hash-addressed, cites the provenance as evidence "
-          f"and the validation as a cmd@v1 check)")
+    print(f"ACCEPTED -> warrant {wid}\n  (signed, hash-addressed, cites the "
+          f"provenance, the check blob and its transcript as evidence; the "
+          f"validation ran under {runtime} and is recorded as such)")
 
 
 def cmd_bind(a):
@@ -3040,9 +3165,10 @@ def cmd_do(a):
     i = cmd_intent(Namespace(description=a.intent, parent=None, actor=a.actor,
                              constraint=None, acceptance_ref=None))
     eid = cmd_run(Namespace(intent=i, command=a.command, actor=a.actor))
-    cid, supported = cmd_claim(Namespace(execution=eid, actor=a.actor,
-                                         predicate=(a.predicate or a.intent),
-                                         check=a.check))
+    cid, supported = cmd_claim(Namespace(
+        execution=eid, actor=a.actor, predicate=(a.predicate or a.intent),
+        check=a.check,
+        allow_check_effects=getattr(a, "allow_check_effects", False)))
     if supported:
         cmd_accept(Namespace(claim=cid, actor=a.actor))
     else:
@@ -4218,6 +4344,8 @@ def main():
     pc = sub.add_parser("claim"); pc.add_argument("--execution", required=True); pc.add_argument("--predicate", required=True); pc.add_argument("--check", required=True)
     pc.add_argument("--actor", help="who proposes the claim (§2.7 proposed_by; "
                     "UNAUTHENTICATED per §8). Default: this OS user@host")
+    pc.add_argument("--allow-check-effects", action="store_true",
+                    help="file the claim even though the validation check MUTATED the observed workspace, CITING what it changed as evidence (§2.7). Without it such a claim is refused: the Execution's output state was snapshotted before the check ran, so the decision would omit those changes. It observes; it does not confine")
     pc.set_defaults(fn=cmd_claim)
     pa = sub.add_parser("accept"); pa.add_argument("--claim", required=True); pa.add_argument("--actor", required=True); pa.set_defaults(fn=cmd_accept)
     pb = sub.add_parser("bind", help="vouch that a key may sign as an actor "
@@ -4233,6 +4361,8 @@ def main():
     pd = sub.add_parser("do", help="one-shot: intent -> run -> validate -> accept-if-pass")
     pd.add_argument("--intent", required=True); pd.add_argument("--check", required=True)
     pd.add_argument("--predicate"); pd.add_argument("--actor", required=True)
+    pd.add_argument("--allow-check-effects", action="store_true",
+                    help="file the claim even though the validation check MUTATED the observed workspace, CITING what it changed as evidence (§2.7). Without it such a claim is refused: the Execution's output state was snapshotted before the check ran, so the decision would omit those changes. It observes; it does not confine")
     pd.add_argument("command", nargs=argparse.REMAINDER); pd.set_defaults(fn=cmd_do)
     sub.add_parser("log").set_defaults(fn=cmd_log)
     prb = sub.add_parser("rebuild",

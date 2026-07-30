@@ -544,6 +544,29 @@
       "why": "evidence may be empty; it may not be unsorted or repeated"
     },
     {
+      "name": "claim-host-shell-runtime",
+      "type": "claim",
+      "version": "0.1",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "oaip-host-shell@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "the runtime this implementation actually provides (§7.3): the check ran through the host shell, unconfined. The `claim` vector above keeps cmd@v1 valid because records written before 2026-07-31 carry it (§6) — both must read, only one is written"
+    },
+    {
       "name": "claim-subject-empty-effects",
       "type": "claim_subject",
       "version": "0.1",

@@ -76,11 +76,16 @@ link was drawn).
 ## Where the honest gaps are
 
 **The boundaries of the threat model are stated formally in SPEC §8.5, "Security
-assumptions and non-goals"** — ten scoped assumptions (`SA-1` … `SA-10`) and four
-security non-goals (`NG-1` … `NG-4`), each with its reasoning, bounding the
+assumptions and non-goals"** — thirteen scoped assumptions (`SA-1` … `SA-13`) and
+four security non-goals (`NG-1` … `NG-4`), each with its reasoning, bounding the
 attacker-capability matrix in §8.2. That section is where they live. They are not
 restated here, so the same item is not maintained in two places and cannot drift
 between them.
+
+(This sentence said "ten … `SA-1` … `SA-10`" while §8.5 held eleven, and would
+have said it while §8.5 held thirteen. A count in prose that no tool recomputes
+drifts silently and always downward — `grep -c '^\*\*SA-[0-9]*\.' SPEC.md` is the
+number, and disagreement with it is a defect in this file, not a rounding.)
 
 What remains in this section is the other thing: **the defect history and the
 release state** — what was broken, by which review round, and what the fix
@@ -580,8 +585,34 @@ facts: **a test whose detector shares the bug's blind spot.**
   the same blind spot as the pathspec it was testing — so it could not see the key
   leaking as `.OAIP/dev.key` on the very filesystem this project is developed on.
 
-A third class, which the fourth round is entirely about: **a check that is
-correct and unbounded.** Every signature entry on a record was verified before
+A third class, found from outside by **Codex (cross-family audit, 2026-07-31)**
+and reproduced here before anything was changed: **a signed record that
+describes an execution profile which did not happen.** `oaip claim` ran the
+validation check with `subprocess.run(check, shell=True)` on this host and
+recorded `validation.runtime = "cmd@v1"` — a tag *Warrant* SPEC §3 defines as
+execution in an isolated container — and the bridge passed it into the signature
+unchanged. Two things follow, and only the first was obvious:
+
+- The tag is now `oaip-host-shell@v1` (SPEC §7.3), and it deliberately does not
+  cross into Warrant: Warrant's own registry (§13.1) admits no OAIP-namespaced
+  runtime, so the bridge files the validation as prose plus evidence rather than
+  minting a check reason Warrant would define differently. Restoring a
+  machine-readable check reason needs either a real container runtime or a
+  registration in Warrant — cross-repository coordination, not an OAIP edit.
+- The same audit's second half was the sharper one: **the check's own side
+  effects escaped observation entirely.** The execution's after-state is
+  snapshotted before the check runs, so `--check "touch check-escaped-container"`
+  created that file in the observed workspace while the signed decision recorded
+  `effects=0`. A claim is now refused when its check mutates the workspace,
+  unless `oaip claim --allow-check-effects` files it with those mutations cited
+  as evidence. It **observes**; it does not confine — the exact limits are
+  SA-13, and they are longer than the fix.
+
+Neither was shell injection: the check is user-supplied and running it is the
+point. Both were the record lying about what happened.
+
+A fourth class, which the fourth review round is entirely about: **a check that
+is correct and unbounded.** Every signature entry on a record was verified before
 anything was decided, and `sigs` is outside the hashed body — so the correct
 check ran as many times as an attacker chose (5,000 appended entries: `oaip
 rebuild` 8.61 s against 0.15 s, `warrant verify` 0.28 s over the same file), and
