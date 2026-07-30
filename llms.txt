@@ -239,7 +239,17 @@ property is not enforced at all, that is written down rather than implied away.
   The pathspecs are now repo-rooted, depth-agnostic and case-insensitive
   (`:/`, `:(top,exclude,glob,icase)**/.oaip/**`); `init` refuses a symlinked
   ledger, and the snapshot excludes a symlink's target as well and says so
-  loudly. What is claimed is exactly what `tests/key_custody.py` executes: root
+  loudly.
+
+  **What `icase` costs, stated because it is an observation hole and not only a
+  protection:** the exclusion drops **any** path whose component case-folds to
+  `.oaip` — at any depth, on any filesystem, whoever created it. A user's own
+  `src/.Oaip/config.yml` is therefore never in a snapshot and no effect over it
+  is ever attributed. That was silent until the third review round; the snapshot
+  now NAMES every excluded path that is not a ledger (compared by inode, so
+  `.OAIP/dev.key` on a case-insensitive filesystem is correctly recognised as
+  this ledger, and a nested `sub/.oaip/` as another one). The exclusion itself
+  stays: leaving things out is the safe direction for a signing key. What is claimed is exactly what `tests/key_custody.py` executes: root
   and nested ledgers, from root and from a subdirectory, tracked and untracked,
   `.oaip` and `.OAIP`, real directory and symlink. **It is not a claim that no
   arrangement of a git repository can defeat it — four arrangements already did,

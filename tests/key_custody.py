@@ -386,6 +386,43 @@ def main():
              and "warning" in r.stderr, f"rc={r.returncode} {r.stderr[:200]}")
 
     with tempfile.TemporaryDirectory() as tmp:
+        # --- 4e (C1-F1, third adversarial round): `icase` is key-safe and it is
+        # an UNANNOUNCED OBSERVATION HOLE. The exclusion drops any path whose
+        # component case-folds to `.oaip`, at any depth, on any filesystem — so
+        # `src/.Oaip/config.yml`, a user's own file with nothing to do with this
+        # ledger, vanished from every snapshot with no warning, in the tool whose
+        # entire job is to observe. The exclusion stays (leaving things out is
+        # the safe direction for a signing key); the silence does not.
+        L = Repo(Path(tmp) / "icase")
+        (L.dir / "src" / ".Oaip").mkdir(parents=True)
+        (L.dir / "src" / ".Oaip" / "config.yml").write_text("x: 1\n")
+        (L.dir / "src" / "kept.txt").write_text("observed\n")
+        r = L.run("run", "--intent", "x", "--", "sh", "-c", "echo hi > f.txt")
+        tree = next((t.split("=", 1)[1] for t in r.stdout.split()
+                     if t.startswith("after=")), "")
+        paths = L.tree_paths(tree)
+        case("a user path that merely case-folds to .oaip is still excluded",
+             "src/.Oaip/config.yml" not in paths, paths)
+        case("the negative control: its sibling IS observed",
+             "src/kept.txt" in paths, paths)
+        case("the exclusion no longer does it silently: the path is NAMED",
+             "src/.Oaip/config.yml" in r.stderr, r.stderr[-400:])
+        case("...and the warning says what it costs",
+             "UNOBSERVED" in r.stderr, r.stderr[-400:])
+        # A NESTED ledger is not this ledger and is still a ledger: reporting
+        # `sub/.oaip/dev.key` as a lost user file would be false, and "rename it
+        # if it should be observed" is bad advice about a signing key.
+        (L.dir / "sub").mkdir()
+        L.run("init", sub="sub")
+        subkey = L.dir / "sub" / ".oaip" / "dev.key"
+        if not subkey.exists():
+            subkey.parent.mkdir(parents=True, exist_ok=True)
+            subkey.write_text("7" * 63 + "1\n")
+        r = L.run("run", "--intent", "x", "--", "sh", "-c", "echo hi > g.txt")
+        case("a NESTED ledger is not announced as a lost user file",
+             "sub/.oaip" not in r.stderr, r.stderr[-400:])
+
+    with tempfile.TemporaryDirectory() as tmp:
         # --- 4d (C1-F2, third adversarial round): a plain FILE at the ledger
         # path. The DIRECTORY case (a real `.oaip`) and the SYMLINK case were
         # both handled; the file case was missed, so `OAIP.mkdir(exist_ok=True)`

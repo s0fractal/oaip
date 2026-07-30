@@ -831,6 +831,81 @@ def symlinked_ledger_target():
         return None
 
 
+_LEDGER_PATHSPEC = (":(top,glob,icase)**/.oaip/**", ":(top,glob,icase)**/.oaip")
+_WARNED_EXCLUDED = set()
+
+
+def excluded_non_ledger():
+    """Worktree paths the ledger exclusion drops that are NOT this ledger.
+
+    Enumerated with `git ls-files`, which writes NOTHING to the object database —
+    the whole point of the exclusion is that `git add` would have written the
+    signing key there, so the detector must not do the thing it is detecting.
+
+    Membership of the ledger is decided by INODE (`os.path.samestat`), not by
+    spelling: on a case-insensitive filesystem `.OAIP/dev.key` really is this
+    ledger's key and must not be reported as a lost user file, while
+    `src/.Oaip/config.yml` is a user file and must be. A NESTED ledger (`oaip
+    init` run in a subdirectory) is not this ledger and is still a ledger, so it
+    is recognised by its contents rather than announced as a lost file.
+
+    `--exclude-standard` is deliberately NOT passed. `oaip init` writes `.oaip/`
+    into the repo's .gitignore, and git matches gitignore case-insensitively on a
+    case-insensitive filesystem — so the very paths this warning exists for would
+    be filtered out of the enumeration by this tool's own doing, on the platform
+    where the case-folding hole is easiest to hit."""
+    try:
+        top = Path(git("rev-parse", "--show-toplevel")).resolve()
+        listed = git("-C", str(top), "ls-files", "-c", "-o", "--full-name",
+                     "--", *_LEDGER_PATHSPEC)
+    except (RuntimeError, OSError):
+        return []                       # not a repo / git unavailable: not ours
+    try:
+        store = os.stat(OAIP)           # follows a symlinked ledger, on purpose
+    except OSError:
+        store = None
+    # What a ledger directory contains. `init` creates all of these; any one is
+    # enough to say "this is somebody's ledger, not a user file that happens to
+    # be spelled .oaip".
+    LEDGERISH = {"dev.key", "dev.key.pub", "ledger.db", "trust.json",
+                 "store.json", "warrants", "artifacts"}
+
+    def a_ledger(rel):
+        parts = rel.split("/")
+        for i, comp in enumerate(parts):
+            if comp.lower() != ".oaip":
+                continue
+            d = top.joinpath(*parts[:i + 1])
+            try:
+                if store and os.path.samestat(os.stat(d), store):
+                    return True         # this ledger
+                if any((d / n).exists() for n in LEDGERISH):
+                    return True         # another ledger (e.g. a nested one)
+            except OSError:
+                pass
+        return False
+
+    return sorted({p for p in listed.splitlines() if p and not a_ledger(p)})
+
+
+def warn_excluded_non_ledger():
+    """Say which non-ledger paths this snapshot will not contain, once each."""
+    lost = [p for p in excluded_non_ledger() if p not in _WARNED_EXCLUDED]
+    if not lost:
+        return
+    _WARNED_EXCLUDED.update(lost)
+    shown = ", ".join(lost[:5]) + (f" (+{len(lost) - 5} more)"
+                                   if len(lost) > 5 else "")
+    print(f"warning: {len(lost)} path(s) are left out of this snapshot but are "
+          f"NOT this ledger: {shown}. The ledger exclusion matches any path "
+          "component that case-folds to `.oaip`, at any depth, on any "
+          "filesystem — it must, because on a case-insensitive filesystem this "
+          "ledger's own directory can be spelled `.OAIP`. Those paths are "
+          "therefore UNOBSERVED: no snapshot records them and no effect over "
+          "them is attributed. Rename them if they should be observed.",
+          file=sys.stderr)
+
+
 def workspace_snapshot() -> str:
     """Content-addressed tree of the FULL worktree (tracked + staged + untracked),
     built in a throwaway index so `git log` is never touched. This is the honest
@@ -873,15 +948,26 @@ def workspace_snapshot() -> str:
         `.OAIP/dev.key` and the key's blob was in `.git/objects`; with an
         untracked `.OAIP` and a DIRECTORY named `.gitignore` (so wall 2 only
         warns), the tree gained `.OAIP/dev.key`, `.OAIP/ledger.db`,
-        `.OAIP/tmp.index` and `.OAIP/tmp.index.lock`. `icase` closes it; on a
-        case-SENSITIVE filesystem it costs only that a directory deliberately
-        named `.OAIP` is also treated as a ledger and left out — the safe
-        direction for a signing key.
+        `.OAIP/tmp.index` and `.OAIP/tmp.index.lock`. `icase` closes it.
     Verified against git 2.50: top-level and nested, from root and from a
     subdirectory, with and without a HEAD-tracked `.oaip`, and in both letter
-    cases on a case-insensitive filesystem."""
+    cases on a case-insensitive filesystem.
+
+    WHAT `icase` COSTS, SAID PLAINLY (C1-F1, third adversarial round). The
+    docstring used to claim the cost applied "on a case-SENSITIVE filesystem" to
+    "a directory deliberately named `.OAIP`". That was wrong in every part: the
+    exclusion drops ANY path whose component case-folds to `.oaip`, at ANY depth,
+    on ANY filesystem, whoever named it and whyever. `src/.Oaip/config.yml` — a
+    user's own file, nothing to do with this ledger — vanished from every
+    snapshot with no warning at all: an unannounced hole in the observation, in
+    the tool whose entire job is to observe. The exclusion stays (the safe
+    direction for a signing key is to leave things out), but it no longer stays
+    QUIET: `excluded_non_ledger()` names every excluded path that is not this
+    ledger's own directory, compared by inode so `.OAIP/dev.key` on a
+    case-insensitive filesystem is correctly recognised as the ledger itself."""
     tmp_index = OAIP / "tmp.index"
     env = dict(os.environ, GIT_INDEX_FILE=str(tmp_index.resolve()))
+    warn_excluded_non_ledger()
     # A SYMLINKED ledger has a second name, and the exclusion is by name (F6).
     # Say so loudly — the arrangement is very likely a mistake — and exclude the
     # real path too, so saying so is not the only protection.
@@ -906,8 +992,7 @@ def workspace_snapshot() -> str:
     # function writes ever contains the key or the store — at any depth, from
     # any cwd.
     subprocess.run(["git", "rm", "-r", "-q", "--cached", "--ignore-unmatch",
-                    "--", ":(top,glob,icase)**/.oaip/**",
-                    ":(top,glob,icase)**/.oaip", *extra_rm],
+                    "--", *_LEDGER_PATHSPEC, *extra_rm],
                    env=env, capture_output=True)
     tree = subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True).stdout.strip()
     tmp_index.unlink(missing_ok=True)
