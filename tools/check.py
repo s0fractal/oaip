@@ -55,6 +55,18 @@ CHECKS = [
     ("projection is disposable (§5 MUST: delete, rebuild, identical graph)",
      ["python3", "tests/projection_rebuild.py"], None,
      "PROJECTION-REBUILD: ALL PASS"),
+    # No `needs`: the custody property is about git objects, not about Warrant —
+    # the test plants a sentinel key when no Warrant CLI generated a real one.
+    ("key custody (the snapshot must not embed .oaip / the signing key)",
+     ["python3", "tests/key_custody.py"], None,
+     "KEY-CUSTODY: ALL PASS"),
+    # `needs` the CLI: the end-to-end half files real signed records. The
+    # verifier's own vectors would run anywhere, but a half-run check that still
+    # printed its ALL PASS line would be the "passes by not looking" pattern this
+    # repository keeps finding.
+    ("signature gate (OAIP verifies Ed25519 itself; a stub CLI cannot forge)",
+     ["python3", "tests/signature_gate.py"], "warrant-cli",
+     "SIGNATURE-GATE: ALL PASS"),
     ("I-JSON domain parity with Warrant (§1 'exactly per Warrant §4')",
      ["python3", "tests/ijson_parity.py"], "warrant-lib",
      "IJSON-PARITY: SAME DOMAIN"),

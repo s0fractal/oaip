@@ -76,6 +76,20 @@ link was drawn).
 Listed because a reviewer will find them anyway, and finding them listed is
 better evidence of good faith than finding them hidden.
 
+Four rounds of fresh-context adversarial review (a Claude-family reviewer — **not
+an independent gate, and nothing here is adopted by any warrant**) have now
+broken this repository's defences repeatedly, and the second round's central
+finding was that the first round's *fixes* had only narrowed the defects while
+this file described them as closed. So the entries below say what is **enforced**
+and by **whose** rule, separately from what is merely reported — and where a
+property is not enforced at all, that is written down rather than implied away.
+
+The fourth round attacked the hand-written Ed25519 verifier itself and could not
+break it; its findings were all in the code that FEEDS the verifier — how much
+work an attacker can make it do, how much of its output a human can still read,
+and what happens to a refusal that raises instead of returning. Both halves of
+that result are recorded below, the favourable one included.
+
 - **SPEC §2.4 and the reference implementation disagree on field names.** §2.4
   declares Execution fields `invocation`, `status`, `input_state`, `output_state`,
   `environment`; `impl/oaip.py` stores `command`, `exit_code`, `before_tree`,
@@ -96,10 +110,245 @@ better evidence of good faith than finding them hidden.
   specified, not implemented.
 - **No signing of OAIP records themselves.** Integrity comes from
   content-addressing plus the Warrant record at the decision layer; the artifacts
-  are not individually signed.
-- **§5 rebuild covers the projection, not the Warrant store.** `oaip rebuild`
-  reconstructs the SQLite index from `.oaip/artifacts`; it does not re-derive the
-  decision layer, which is Warrant's own artifact.
+  are not individually signed. In particular a `claim@v1` record is unsigned, so
+  "which claim exists" is a property of the artifact directory, not of anyone's
+  key — which is why the acceptance link is pinned inside the *signed* warrant
+  body rather than inferred from the claim side.
+- **Concurrency is serialised, not concurrent.** `oaip accept` and `oaip rebuild`
+  take an advisory `flock` on `.oaip/lock`, rebuild builds under a temporary name
+  and `os.replace`s it into place, and the acceptance edge is
+  `UNIQUE(claim_id, warrant_id)`. Before that, four concurrent rebuilds wrote
+  four identical edges for one store record and a concurrent accept + rebuild
+  raised an uncaught `sqlite3.OperationalError` and lost the insert. On a
+  platform without `fcntl` the lock degrades to nothing; the constraint and the
+  atomic rename still hold. No attempt is made to be safe against a process that
+  crashes mid-`accept`.
+- **§5 rebuild reconstructs the projection, never the Warrant store.** `oaip
+  rebuild` reads both halves of the canonical layer — `.oaip/artifacts` plus the
+  Warrant store — and re-derives the claim→warrant acceptance edge from the
+  store's `accept` records (it did not until 2026-07-30: the `warrants` table was
+  never repopulated, so `oaip log` lost its WARRANT line at the first rebuild).
+  The store itself is canonical, signed, and is not — cannot be — rebuilt.
+- **What actually gates an acceptance edge, and what does not.** Two rounds of
+  fresh-context adversarial review (a Claude-family reviewer — not an independent
+  gate, and not adopted by any warrant) broke the edge derivation four times.
+  Stated per layer, because the earlier summary here ("rebuild now has the
+  Warrant CLI verify the store before deriving any edge, and fails closed")
+  claimed a closure it did not have:
+  - *Address-matching* (`sha256(canon(body)) == filename`) is satisfied by
+    construction by anyone who can write a file. It establishes nothing about who
+    decided; a hand-written `accept` with junk signatures passed it.
+  - *`warrant verify` exiting 0* is also not enough, twice over.
+    `WARRANT_CLI=/usr/bin/true` exits 0 having verified nothing, so OAIP requires
+    a parseable `warrant.verify-report@v0` and bounds every call in time.
+    And a **cryptographically valid signature by a key nobody vouches for still
+    exits 0** — Warrant SPEC §5 puts key↔actor binding out of scope and §5.1
+    makes bound/unbound "a report". `warrant keygen` + one `accept` therefore
+    forged an acceptance for a claim nobody accepted, under any actor id.
+  - *A shape check on that report is NOT an identity check*, and a commit on this
+    branch wrongly called it one. The third review round wrote a four-line stub
+    that prints a clean `warrant.verify-report@v0` and, with a forged accept
+    naming this ledger's real public key and `"sig": "abab…"` (no secret needed),
+    got `oaip rebuild` to exit 0, derive the edge, and `oaip log` to print
+    "(signed decision)" — via `$WARRANT_CLI` **and** by planting the stub at the
+    unpinned default path `~/Projects/warrant/impl/warrant.py`.
+  - *Ed25519 verification is now OAIP's own, in process* (`ed25519_verify`, RFC
+    8032, stdlib integer arithmetic, verify-only — no secret is ever handled).
+    The signature that decides must verify against the WarrantID **OAIP
+    recomputed from the record's own bytes** before any edge is derived. That is
+    why no program named by `$WARRANT_CLI` can manufacture an acceptance any
+    more; Warrant is still consulted and its errors still refuse a rebuild — a
+    delegate may veto, it may not vouch. `oaip accept` verifies the record it
+    just asked the CLI to sign, before recording anything: OAIP holds no signer,
+    so it cannot avoid delegating the SIGNING, but it does not take the result on
+    trust either.
+
+    **That hand-written verifier has been differentially verified against two
+    independent implementations, and it held.** A fourth fresh-context
+    adversarial round (a Claude-family reviewer — still not an independent gate,
+    still not adopted) set out to break the arithmetic and reported instead:
+    **270,347 differential cases** across three implementations — this one,
+    OpenSSL via `cryptography`, and Warrant's separate from-scratch Rust verifier
+    — with **0 disagreements**; RFC 8032 §7.1 test vectors 5/5, with 35/35
+    negative mutations rejected; the acceptance criteria identical to Warrant's
+    in all 12 compared rows (the small-order blocklist byte-identical, the same
+    cofactorless verification equation, `S < L` enforced, non-canonical `y` and
+    non-canonical `R` refused); and independently constructed
+    cofactor-discriminating vectors rejected by all three. Positive agreement
+    alone would prove little — an implementation that accepts everything agrees
+    with everyone — which is why the negatives and the criteria table are the
+    load-bearing half. **What this does not establish:** it is agreement, not
+    proof; the three implementations were compared on inputs, not verified
+    against the specification line by line; and side-channel resistance is not
+    claimed or needed (verification handles no secret).
+
+    **What it costs: this verifier is ~65x slower than OpenSSL** (measured here,
+    2.76 ms vs 0.043 ms per signature). Standing alone with no dependency is
+    worth that, but the asymmetry is real, and it was an availability defect
+    before it was a cost: `sigs` sits OUTSIDE the hashed body, so anyone who can
+    write the store could append unlimited entries to an HONEST record without
+    breaking its address, and every one of them was verified on every rebuild
+    and every verify (5,000 appended entries: 8.61 s vs 0.15 s, and 10,000 NOTE
+    lines burying the diagnosis). Now only an entry that names the record's actor
+    AND a key already bound to that actor is verified at all — both string
+    comparisons — so an honest record costs ONE verification however much is
+    appended after it; the remaining per-signature gap is unchanged and simply
+    paid at most a bounded number of times per record (`SIG_DECIDE_CAP = 32`,
+    `SIG_NOTE_CAP = 8` collapsing the notes to a count, `MAX_STORE_RECORD_BYTES
+    = 4 MiB` refusing a padded record before parsing it).
+
+    **What the caps cost, stated because a bound is also a limit.** APPENDING
+    cannot un-decide anything — the honest signature is reached first, which is
+    the property Warrant SPEC §5 requires and `tests/signature_gate.py` asserts
+    under a 5,000-entry flood. But someone who REWRITES a record can reorder it,
+    and more than 32 entries naming the record's actor with a bound key, none of
+    them valid, ahead of the real one is a refusal: measured, `oaip rebuild`
+    then exits 1 with "more than 32 signature entries name actor 'tester@local'
+    … refusing to keep verifying" and reports the lost edge loudly. That is
+    fail-closed and it is a real griefing surface — bounded by the same store
+    write access that already allows deleting the record outright, which is
+    equally loud and equally destructive. A record padded past 4 MiB refuses the
+    whole rebuild for the same reason and with the same trade-off.
+  - *Binding* is enforced alongside it, and it is **OAIP's own rule, not
+    Warrant's**: an acceptance edge is derived only if the signature is valid AND
+    names a key bound to the actor it claims in `.oaip/trust.json`, which only
+    `oaip accept` and `oaip bind` ever write. `oaip verify` reports an
+    unbound signer on an OAIP acceptance as an error. What OAIP cannot do:
+    Warrant's `--trust-config` grade reports the same finding but by
+    specification never fails on it, and its machine-readable report omits the
+    finding entirely in quiet mode — so it is used as corroboration only.
+  - *The signature that must be valid and bound is the one by the actor the
+    record NAMES* (`body.actor.id`) — not every signature on it. Demanding all of
+    them handed a deletion primitive to anyone with store write access: Warrant
+    SPEC §5 permits appending a co-signature and will not let a junk one
+    invalidate a good record, so one appended, cryptographically VALID co-sig by
+    a second endorser left `warrant verify` at 0 errors and made `oaip rebuild`
+    print `warrant=0` **and exit 0**, deleting the acceptance edge and the
+    WARRANT line in `oaip log`. Extra signatures are now reported as `NOTE`s;
+    they endorse, they do not decide, and they cannot un-decide.
+  - *A rebuild that drops an edge the previous projection asserted exits
+    non-zero* and names each lost edge with the reason it was refused. §5's
+    promise is "the same graph"; when a rebuild cannot keep it, the exit status
+    must not say otherwise.
+  - *A refused rebuild withdraws the projection's authority.* The refusal leaves
+    the projection's bytes alone (fail-closed must not mean destroy-first), but
+    writes `.oaip/projection.untrusted`, and `oaip log` / `oaip verify` then
+    refuse it until a rebuild succeeds. Before that, a projection built once from
+    a poisoned store kept printing "(signed decision)" forever, because every
+    later honest rebuild refused and changed nothing.
+  - *Which claim* was accepted is read from the signed `subject.note`
+    (`oaip-claim:<id>`), not guessed from the subject hash: the subject
+    `{predicate, execution, effects}` excludes the check command and verdict, so
+    `--check true` and `--check false` over one execution collide, and hash
+    matching projected one signed acceptance onto a claim whose check FAILED.
+    The note is now **mandatory**, and the prefix is matched case-insensitively.
+    The earlier "legacy records fall back to subject-hash matching" was
+    attacker-selectable — omitting the note, or spelling it `OAIP-CLAIM:`, chose
+    the weaker path on demand in a brand-new store. The fallback now requires
+    **both** `oaip rebuild --allow-legacy-links` (an operator opt-in that prints
+    what the guess can get wrong) **and** a record older than the moment this
+    store began requiring the note, stamped by `oaip init` in
+    `.oaip/store.json` — a criterion the filer of a record cannot choose. In a
+    store created by a current `oaip init` there are no eligible records at all.
+    A `.oaip/store.json` that is present but UNREADABLE (truncated, wrong type,
+    missing field, not a file) is now a refusal: it used to be read as "this
+    store predates the convention", so one corrupt byte promoted a brand-new
+    store to a legacy one and `--allow-legacy-links` ran the guess while
+    printing that the store had no marker.
+  - *Binding a key that is not this ledger's own* (`.oaip/dev.key.pub`) requires
+    `oaip bind --foreign-key` and prints a warning naming what OAIP cannot do
+    with it (custody it, revoke it). `bind` used to accept any hex64 with no
+    cross-check at all — the one command whose purpose is to say which key may
+    sign was the least careful about which key that was. It also used to accept a
+    key that could never sign: `oaip bind --key 0100…00 --foreign-key` wrote a
+    small-order key into the keyring at rc=0. It now applies this project's own
+    key-validity rule (`weak_ed25519_pubkey`, Warrant SPEC §5) — defence in
+    depth, since `ed25519_verify` refuses every signature under such a key
+    anyway, but a keyring entry that can decide nothing is a false statement
+    about custody.
+  - **Still outside OAIP's control:** `.oaip/trust.json` lives beside
+    `.oaip/dev.key`, so **anyone who can write `.oaip/`** can write the keyring
+    *and* the signing key — the binding raises the bar from "can run `keygen`" to
+    "can write `.oaip/`", it does not make acceptance unforgeable. Until the
+    third review round the boundary was wider than that: it was "can write
+    `.oaip/`, **or can influence what `$WARRANT_CLI` resolves to**" — the
+    environment variable, or the unpinned sibling checkout at
+    `~/Projects/warrant/impl/warrant.py`, neither of which is inside `.oaip/`.
+    That half is closed: signature validity is decided in process now, so a
+    hostile `$WARRANT_CLI` can make OAIP refuse (by reporting errors, or by not
+    being a Warrant verifier at all) but cannot make it derive an edge. What it
+    can still hide is everything OAIP does *not* recompute — Warrant's schema,
+    blob-reference and DAG/policy findings — so a stub silently costs
+    corroboration on those. There is no out-of-band trust root, no key rotation,
+    and no revocation. Two SUPPORTED claims with byte-identical subjects still
+    cannot be told apart for legacy records.
+- **The snapshot's `.oaip` exclusion has been broken four times by review**, and
+  every break was a different way of giving the ledger a name the exclusion did
+  not match:
+  1. a NESTED ledger (`sub/.oaip/dev.key`, from `oaip init` in a subdirectory)
+     was added like any other file;
+  2. the pathspecs were cwd-RELATIVE, which both leaked a HEAD-tracked root
+     ledger when run from a subdirectory and silently narrowed the "full
+     worktree" snapshot to the cwd subtree;
+  3. the pathspec matched case-SENSITIVELY, so on the case-INSENSITIVE filesystem
+     this project is developed on the key leaked as `.OAIP/dev.key` — and
+     `tests/key_custody.py`'s own detector was case-sensitive in exactly the same
+     way, so it could not see that;
+  4. a SYMLINKED ledger (`ln -s ledgerstore .oaip`) put the key back in
+     `.git/objects` under the target's name, and `oaip init` followed the symlink
+     silently.
+
+  The pathspecs are now repo-rooted, depth-agnostic and case-insensitive
+  (`:/`, `:(top,exclude,glob,icase)**/.oaip/**`); `init` refuses a symlinked
+  ledger, and the snapshot excludes a symlink's target as well and says so
+  loudly.
+
+  **What `icase` costs, stated because it is an observation hole and not only a
+  protection:** the exclusion drops **any** path whose component case-folds to
+  `.oaip` — at any depth, on any filesystem, whoever created it. A user's own
+  `src/.Oaip/config.yml` is therefore never in a snapshot and no effect over it
+  is ever attributed. That was silent until the third review round; the snapshot
+  now NAMES every excluded path that is not a ledger (compared by inode, so
+  `.OAIP/dev.key` on a case-insensitive filesystem is correctly recognised as
+  this ledger, and a nested `sub/.oaip/` as another one). The exclusion itself
+  stays: leaving things out is the safe direction for a signing key. What is claimed is exactly what `tests/key_custody.py` executes: root
+  and nested ledgers, from root and from a subdirectory, tracked and untracked,
+  `.oaip` and `.OAIP`, real directory and symlink. **It is not a claim that no
+  arrangement of a git repository can defeat it — four arrangements already did,
+  and the exclusion is still fundamentally by name.** A hardlinked file, a
+  `core.excludesFile` interaction, or a ledger reached through a symlinked
+  *parent* directory have not been tested.
+- **Migration: a store created before this keyring existed will lose its
+  acceptance edges at the next rebuild**, because nothing vouches for the key
+  that signed its accepts. That is fail-closed on purpose, and the recovery is
+  one explicit command: `oaip bind --actor <id> --key <hex64>` (the `key` field
+  of a signature in `.oaip/warrants/records/`). Naming the key is the operator's
+  assertion, not OAIP's discovery, which is why it is not done automatically.
+- **What the second review round did NOT close.** Beyond the binding gap above:
+  a `claim@v1` artifact is unsigned and unauthenticated, so anyone who can write
+  `.oaip/artifacts` can add a claim record — the acceptance side is now pinned to
+  a signed note, but the claim side is not. And the check `.oaip/store.json` uses
+  to separate "legacy" from "should have carried a link" rests on a signed `ts`,
+  which someone holding the ledger's key could choose.
+- **`verify` and `rebuild` now audit the same accepts** — which they did not
+  until the fourth round. `rebuild` assessed the signer of EVERY accept;
+  `verify` assessed only those carrying an `oaip-claim:` note, so a note-less
+  accept with a broken signature made `rebuild` print a WARN and `verify` print
+  nothing at all, while `--allow-legacy-links` could derive an edge from exactly
+  that class of record. The set is the same now; only the severity depends on the
+  note (an accept naming an OAIP claim, or carrying a claim's subject hash, is an
+  ERROR when its signer cannot be established; another ledger's decision sharing
+  the store is a WARN, as `rebuild` reports it, and not an accusation).
+- **A deeply nested document used to produce a traceback instead of a refusal,
+  and left the projection trusted.** ~1,000 levels of nesting in a ~2 KB
+  envelope raised `RecursionError` out of `json.loads` and the I-JSON walkers;
+  no caller caught it, so `oaip rebuild` crashed BEFORE it could mark the
+  projection untrusted and `oaip log` kept printing "(signed decision)" from a
+  stale projection with no marker. Pre-existing on main, not introduced by the
+  review branch, and the fourth instance of the same class ("a refusal is a
+  decision, a traceback is an accident"). Depth is now part of the declared
+  domain: `loads_ijson` converts it to the same `ValueError` every reader already
+  handles.
 
 ## Conformance vectors, including the negative half
 
@@ -142,6 +391,32 @@ The recurring class is **checking something adjacent to the evidence**:
   tampered cases — which is why `tests/canonical_layer.py` tampers in every case,
   and why its own fix was verified by reverting it (17 of 20 cases fail against
   the pre-fix implementation).
+
+And the more specific class, which has now cost this repository three separate
+facts: **a test whose detector shares the bug's blind spot.**
+
+- `TABLES` in `tests/projection_rebuild.py` omitted `warrants`, so the projection
+  could lose the claim→warrant acceptance edge on rebuild and the comparison
+  reported "identical". Fixed — and then `TABLES` still omitted `artifacts`, so
+  rebuild could rewrite every artifact's `kind` to `"rebuilt"` on a clean honest
+  store and the comparison reported "identical" again. The tuple is now checked
+  against `sqlite_master`, so the next table cannot be added and forgotten.
+- `oaip_paths_in()` in `tests/key_custody.py` matched `".oaip"` case-sensitively —
+  the same blind spot as the pathspec it was testing — so it could not see the key
+  leaking as `.OAIP/dev.key` on the very filesystem this project is developed on.
+
+A third class, which the fourth round is entirely about: **a check that is
+correct and unbounded.** Every signature entry on a record was verified before
+anything was decided, and `sigs` is outside the hashed body — so the correct
+check ran as many times as an attacker chose (5,000 appended entries: `oaip
+rebuild` 8.61 s against 0.15 s, `warrant verify` 0.28 s over the same file), and
+printed 10,000 notes that buried the one line a human needed. Correctness says
+nothing about how often, and a security check nobody can afford to run — or
+whose output nobody can read — is not a check that is being made.
+
+The lesson that generalises: after fixing a leak, revert the fix and check that
+the test fails. Every case added in the two review rounds above was confirmed RED
+that way, and the observed failure text is in the commit that fixed it.
 - A commit message claimed the CI wiring was fixed; it had wired one of two new
   tests, because the workflow listed steps by hand. CI now runs `tools/check.py`
   and the membership lives in one place.
