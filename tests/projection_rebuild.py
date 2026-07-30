@@ -48,8 +48,15 @@ WHAT IT CHECKS
    verdict, so `--check true` and `--check false` over one execution collide;
    subject-hash edge derivation attached the real signed warrant to the
    UNSUPPORTED claim after rebuild (§5 MUST violation, same review). New
-   accepts carry an explicit oaip-claim:<id> note; legacy accepts without one
-   fall back to subject-hash matching restricted to supported claims.
+   accepts carry an explicit oaip-claim:<id> note; rebuild follows that.
+8b. The FALLBACK for note-less records was itself ATTACKER-SELECTABLE. "Has no
+   note" is the writer's choice, and `note.startswith("oaip-claim:")` made even
+   the prefix's LETTER CASE the writer's choice — so anyone able to file an
+   accept, using this project's own real key, could route it to subject-hash
+   guessing in a brand-new store. The prefix is now matched case-insensitively,
+   and the fallback needs BOTH `--allow-legacy-links` AND a record older than the
+   note convention as stamped in `.oaip/store.json` by `init` — a criterion the
+   filer of a record cannot choose.
 9. An ATTACKER'S OWN KEY cannot launder an acceptance. Case 7 only rules out
    signatures no key produced; this one is cryptographically perfect — a fresh
    `warrant keygen` key signs a well-formed accept naming a real SUPPORTED claim
@@ -348,34 +355,89 @@ def main():
              all(json.loads(w)["claim_id"] != cid_b for w in after["warrants"]),
              after["warrants"])
 
-        # LEGACY accepts carry no oaip-claim note; the fallback is subject-hash
-        # matching restricted to SUPPORTED claims. File one directly with the
-        # real key (bypassing cmd_accept, as any pre-fix store did).
+        # --- case 8b (F8): THE FALLBACK WAS ATTACKER-SELECTABLE.
+        #
+        # "Carries no oaip-claim note" is a property the WRITER chooses, and
+        # `note.startswith("oaip-claim:")` made even the prefix's LETTER CASE the
+        # writer's choice. So anyone who could file an accept could route it to
+        # the weaker subject-hash path in a brand-new store and fan one warrant
+        # onto every claim with a colliding subject — using this project's own
+        # real key, so nothing about the signature was wrong. Reproduced before
+        # the fix: both filings below produced an edge and `oaip verify` reported
+        # 0 errors.
+        #
+        # `--actor tester@local`, the actor case 8's own accept already bound to
+        # this ledger's key: these cases are about the LINK, and an unbound actor
+        # would make them pass or fail for the F7 reason instead.
         wcli = (os.environ.get("WARRANT_CLI")
                 or f"{sys.executable} "
                    f"{Path.home() / 'Projects/warrant/impl/warrant.py'}").split()
-        # `--actor tester@local`, the actor case 8's own accept already bound to
-        # this ledger's key: this case is about the missing NOTE, and mixing in an
-        # unbound actor would make it pass or fail for the F7 reason instead.
-        rr = subprocess.run(
-            wcli + ["--store", ".oaip/warrants", "accept",
-                    "--subject", subs[cid_a], "--under", ".oaip/policy.txt",
-                    "--reason", "legacy accept without a note",
-                    "--actor", "tester@local", "--key", ".oaip/dev.key"],
-            cwd=work, capture_output=True, text=True)
-        lwid = rr.stdout.strip().splitlines()[-1] if rr.stdout.strip() else ""
-        if len(lwid) != 64:
-            case("setup: legacy accept filed via the Warrant CLI", False,
-                 rr.stdout + rr.stderr)
+
+        def file_accept(*extra, reason="direct filing"):
+            rr = subprocess.run(
+                wcli + ["--store", ".oaip/warrants", "accept",
+                        "--subject", subs[cid_a], "--under", ".oaip/policy.txt",
+                        "--reason", reason, *extra,
+                        "--actor", "tester@local", "--key", ".oaip/dev.key"],
+                cwd=work, capture_output=True, text=True)
+            out = rr.stdout.strip().splitlines()
+            return out[-1] if out else ""
+
+        nowid = file_accept(reason="no note at all")
+        cvwid = file_accept("--note", f"OAIP-CLAIM:{cid_b}",
+                            reason="a case-variant prefix")
+        if len(nowid) != 64 or len(cvwid) != 64:
+            case("setup(8b): both downgrade attempts filed via the Warrant CLI",
+                 False, f"{nowid!r} {cvwid!r}")
         else:
             r = run("rebuild")
-            case("rebuild with a legacy accept ran", r.returncode == 0,
-                 r.stdout + r.stderr)
+            out = r.stdout + r.stderr
+            case("rebuild with two link-downgraded accepts ran",
+                 r.returncode == 0, out[-400:])
             rows = [json.loads(w) for w in snapshot(db)["warrants"]]
-            case("legacy accept: edge derived to the SUPPORTED claim only",
-                 any(w["claim_id"] == cid_a and w["warrant_id"] == lwid
+            wids = {w["warrant_id"] for w in rows}
+            case("note OMITTED in a store that requires one: NO edge derived",
+                 nowid not in wids, rows)
+            case("the refusal says which fact is missing (which claim, not "
+                 "which signature)", "carries no oaip-claim" in out, out[-500:])
+            case("case-variant prefix `OAIP-CLAIM:` is the EXPLICIT link, not a "
+                 "downgrade: it is read, and refused for naming the FAILED claim",
+                 cvwid not in wids and "check FAILED" in " ".join(out.split()),
+                 out[-600:])
+            case("the FAILED claim still has no acceptance edge",
+                 all(w["claim_id"] != cid_b for w in rows), rows)
+            case("the one honest edge is untouched",
+                 [w["claim_id"] for w in rows] == [cid_a], rows)
+
+            # --allow-legacy-links does NOT cover a record this store's own
+            # format marker says had every chance to carry the link.
+            r = run("rebuild", "--allow-legacy-links")
+            out = r.stdout + r.stderr
+            rows = [json.loads(w) for w in snapshot(db)["warrants"]]
+            case("--allow-legacy-links does not resurrect a NON-legacy record",
+                 nowid not in {w["warrant_id"] for w in rows}
+                 and "not a legacy record" in out, out[-500:])
+
+            # A store with NO format marker may genuinely predate the note
+            # convention. There, and only there, the operator can opt in — and is
+            # told exactly what the guess can get wrong.
+            (work / ".oaip" / "store.json").unlink()
+            r = run("rebuild", "--allow-legacy-links")
+            out = r.stdout + r.stderr
+            rows = [json.loads(w) for w in snapshot(db)["warrants"]]
+            case("a store with no format marker + explicit opt-in: the legacy "
+                 "edge IS derived, to the SUPPORTED claim only",
+                 any(w["claim_id"] == cid_a and w["warrant_id"] == nowid
                      for w in rows)
                  and all(w["claim_id"] != cid_b for w in rows), rows)
+            case("and the opt-in prints a loud warning naming the risk",
+                 "GUESSING by subject hash" in out
+                 and "never accepted" in out, out[-500:])
+            r = run("rebuild")
+            case("without the flag the same store derives no legacy edge",
+                 nowid not in {json.loads(w)["warrant_id"]
+                               for w in snapshot(db)["warrants"]},
+                 r.stdout + r.stderr)
 
     with tempfile.TemporaryDirectory() as tmp:
         # --- case 9 (F7/F3): AN ATTACKER'S OWN KEY MUST NOT LAUNDER AN ACCEPTANCE.

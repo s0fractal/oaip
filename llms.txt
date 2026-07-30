@@ -133,6 +133,15 @@ better evidence of good faith than finding them hidden.
     `{predicate, execution, effects}` excludes the check command and verdict, so
     `--check true` and `--check false` over one execution collide, and hash
     matching projected one signed acceptance onto a claim whose check FAILED.
+    The note is now **mandatory**, and the prefix is matched case-insensitively.
+    The earlier "legacy records fall back to subject-hash matching" was
+    attacker-selectable — omitting the note, or spelling it `OAIP-CLAIM:`, chose
+    the weaker path on demand in a brand-new store. The fallback now requires
+    **both** `oaip rebuild --allow-legacy-links` (an operator opt-in that prints
+    what the guess can get wrong) **and** a record older than the moment this
+    store began requiring the note, stamped by `oaip init` in
+    `.oaip/store.json` — a criterion the filer of a record cannot choose. In a
+    store created by a current `oaip init` there are no eligible records at all.
   - **Still outside OAIP's control:** `.oaip/trust.json` lives beside
     `.oaip/dev.key`, so anyone who can write the ledger directory can write the
     keyring — the binding raises the bar from "can run `keygen`" to "can write

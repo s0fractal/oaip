@@ -67,8 +67,12 @@ else:
 # program, so every call to it is bounded (2026-07-30 review, F11).
 WARRANT_TIMEOUT = int(os.environ.get("OAIP_WARRANT_TIMEOUT") or 120)
 VERIFY_REPORT = "warrant.verify-report@v0"
-# The explicit claim→warrant link, carried in the signed `subject.note`.
+# The explicit claim→warrant link, carried in the signed `subject.note`. Matched
+# CASE-INSENSITIVELY: `note.startswith("oaip-claim:")` let any writer choose the
+# weaker code path by spelling it `OAIP-CLAIM:` (2026-07-30, second review round).
 NOTE_PREFIX = "oaip-claim:"
+STOREMETA = OAIP / "store.json"     # store-format version, written once by `init`
+STORE_FORMAT = "oaip-store@v1"
 
 
 # ---------- content-addressed helpers ----------
@@ -142,6 +146,39 @@ def wrun(*args):
 # emitting branch is `if quiet: pass`), so the JSON an integrator is told to
 # consume reports 0 errors and no binding finding for an unbound signer.
 # Therefore the ENFORCED rule is OAIP's own, over OAIP's own keyring.
+def note_convention_since():
+    """The ts from which a missing `oaip-claim:` note is a DEFECT, not history.
+
+    Returns an int, or None when this store predates the store-format marker
+    entirely (in which case any of its records may genuinely be legacy).
+
+    WHY A STORE-FORMAT VERSION AND NOT A PROPERTY OF THE RECORD (F8, 2026-07-30,
+    second review round). Rebuild routed accepts without the note to a
+    subject-hash fallback and called those records "legacy" — but "has no note"
+    is a property the WRITER chooses. Omitting the note (or spelling the prefix
+    `OAIP-CLAIM:`) selected the weaker path on demand, in a brand-new store,
+    fanning one warrant onto every claim with a colliding subject. Reproduced
+    here: two direct filings, one with no note and one with a case-variant
+    prefix, both took the fallback and both produced an edge, `oaip verify`
+    reporting 0 errors.
+
+    So the criterion is one the writer cannot choose: `init` stamps
+    `.oaip/store.json` with the moment this store began requiring the note. A
+    record filed after that had every opportunity to carry the link, so a missing
+    link is a defect in the filer, and no edge is derived — not even with
+    --allow-legacy-links. Only a store with NO marker (created before OAIP
+    stamped one) can contain genuinely legacy records, and even there the
+    fallback stays off until the operator asks for it in as many words."""
+    if not STOREMETA.is_file():
+        return None
+    try:
+        meta = loads_ijson(STOREMETA.read_bytes())
+        ts = meta.get("note_convention_since")
+        return ts if isinstance(ts, int) and not isinstance(ts, bool) else None
+    except (ValueError, OSError):
+        return None
+
+
 def ensure_trust():
     """OAIP's keyring must exist before anything verifies: a missing trust config
     makes Warrant's settlement preflight fail closed, and an empty one is the
@@ -576,6 +613,13 @@ def cmd_init(_):
         if m:
             PUBKEY.write_text(m.group(1) + "\n")
     ensure_trust()
+    # Stamp the store format ONCE, and never restamp: this marker is what tells
+    # `rebuild` that every accept in this store had the chance to carry an
+    # explicit claim link, so a missing one is a defect and not history (F8).
+    if not STOREMETA.is_file():
+        STOREMETA.write_text(json.dumps(
+            {"oaip_store": STORE_FORMAT, "note_convention_since": int(time.time())},
+            sort_keys=True) + "\n")
     # Keep the signing key and the store out of the USER's own commits too.
     # workspace_snapshot() excludes .oaip by pathspec, but a plain `git add -A`
     # by the user would still commit dev.key; init owns the directory, so init
@@ -936,7 +980,7 @@ def signer_gate(report, actors, unbound_prefixes):
     return refuse
 
 
-def cmd_rebuild(_):
+def cmd_rebuild(a):
     """Reconstruct the SQLite projection from the canonical layer alone (§5).
 
     The MUST this exists to make true: "Deleting the projection and rebuilding it
@@ -954,6 +998,7 @@ def cmd_rebuild(_):
     WARRANT line. "The same graph" minus its most important edge is not the
     same graph.
     """
+    allow_legacy = bool(getattr(a, "allow_legacy_links", False))
     # Read and validate the canonical layer BEFORE touching the projection. A
     # fail-closed check that deletes the database and then refuses to rebuild it
     # has destroyed the thing it was protecting.
@@ -1060,23 +1105,37 @@ def cmd_rebuild(_):
     # above. Sorted filename order is deterministic, so two rebuilds agree
     # (same property the ts/id sort gives the artifact records).
     #
-    # THE LINK IS EXPLICIT, NOT GUESSED (2026-07-30 adversarial review). The
-    # claim subject {predicate, execution, effects} excludes the check command
-    # and the verdict, so a `--check true` claim and a `--check false` claim
-    # over the same execution have IDENTICAL subject hashes — and deriving the
-    # edge by subject hash projected one real signed acceptance onto the FAILED
-    # claim too, changing the graph across rebuild (§5 MUST violation). New
-    # accepts carry the accepted claim's id in subject.note ("oaip-claim:<id>",
-    # inside the signed body); rebuild follows that. Legacy accepts without the
-    # note fall back to subject-hash matching restricted to supported claims —
-    # never weaker than cmd_accept, which refuses unsupported claims.
+    # THE LINK IS EXPLICIT, AND MANDATORY (2026-07-30 adversarial review, both
+    # rounds). The claim subject {predicate, execution, effects} excludes the
+    # check command and the verdict, so a `--check true` claim and a `--check
+    # false` claim over the same execution have IDENTICAL subject hashes — and
+    # deriving the edge by subject hash projected one real signed acceptance onto
+    # the FAILED claim too, changing the graph across rebuild (§5 MUST
+    # violation). Accepts carry the accepted claim's id in subject.note
+    # ("oaip-claim:<id>", inside the signed body) and rebuild follows that.
+    #
+    # ROUND TWO: the fallback for note-less records was ATTACKER-SELECTABLE.
+    # "Has no note" is the writer's choice, and `note.startswith("oaip-claim:")`
+    # made even the prefix's LETTER CASE the writer's choice. Reproduced: two
+    # accepts filed directly with this project's own real key, one with no note
+    # and one noted `OAIP-CLAIM:<id>`, both took the fallback, both produced an
+    # edge, and `oaip verify` reported 0 errors. So:
+    #   * the prefix is matched case-insensitively — a case variant can no longer
+    #     downgrade anything, it simply IS the explicit link; and
+    #   * the fallback is OFF unless BOTH (a) the operator passes
+    #     --allow-legacy-links, and (b) the record predates this store's note
+    #     convention per `.oaip/store.json` (see note_convention_since) — a
+    #     criterion stamped by `init`, which the filer of a record cannot choose.
     claims_by_id = {d["id"]: d for d in records
                     if d["oaip_record"] == "claim@v1" and d.get("id")}
     supported_by_subject = {}
+    claim_subjects = set()
     for d in records:
-        if (d["oaip_record"] == "claim@v1" and d.get("subject")
-                and d.get("supported")):
-            supported_by_subject.setdefault(d["subject"], []).append(d["id"])
+        if d["oaip_record"] == "claim@v1" and d.get("subject"):
+            claim_subjects.add(d["subject"])
+            if d.get("supported"):
+                supported_by_subject.setdefault(d["subject"], []).append(d["id"])
+    cutoff = note_convention_since()
     counts["warrant@edge"] = 0
 
     def edge(cid, wid, wts):
@@ -1099,7 +1158,7 @@ def cmd_rebuild(_):
                   "no acceptance edge derived (`oaip bind --actor <id>` if the "
                   "key really is this ledger's)", file=sys.stderr)
             continue
-        if note.startswith(NOTE_PREFIX):
+        if note[:len(NOTE_PREFIX)].lower() == NOTE_PREFIX:
             cid = note[len(NOTE_PREFIX):]
             c = claims_by_id.get(cid)
             if c is None:
@@ -1116,11 +1175,38 @@ def cmd_rebuild(_):
                       "refuses the edge", file=sys.stderr)
             else:
                 edge(cid, wid, wts)
-        else:                           # legacy record: no explicit link
+        elif subj_hash not in claim_subjects:
+            # Not an OAIP claim acceptance at all. A Warrant store legitimately
+            # holds other decisions — root adoption, key rotation, anything the
+            # operator files with the same CLI — and emitting a forgery-adjacent
+            # warning about them on every rebuild was a false accusation, made
+            # repeatedly (F14).
+            pass
+        elif not allow_legacy:
+            print(f"WARN  accept {wid[:12]} is about an OAIP claim's subject but "
+                  "carries no oaip-claim:<id> note, so WHICH claim it accepted "
+                  "is not recorded — and the subject alone cannot say (two "
+                  "claims with opposite verdicts over one execution share it). "
+                  "No edge derived. Pass --allow-legacy-links to fall back to "
+                  "subject-hash matching for records that predate the note "
+                  "convention.", file=sys.stderr)
+        elif cutoff is not None and not (isinstance(wts, int) and wts < cutoff):
+            print(f"WARN  accept {wid[:12]} carries no oaip-claim:<id> note but "
+                  f"was filed at ts={wts}, at or after this store began "
+                  f"requiring one (ts={cutoff}, {STOREMETA}). It is not a legacy "
+                  "record; --allow-legacy-links does not cover it and no edge is "
+                  "derived.", file=sys.stderr)
+        else:
             cids = supported_by_subject.get(subj_hash, [])
-            if not cids:
-                print(f"WARN  accept {wid[:12]} matches no supported claim by "
-                      "subject hash; edge not derived", file=sys.stderr)
+            print(f"WARN  --allow-legacy-links: accept {wid[:12]} carries no "
+                  f"explicit claim link; GUESSING by subject hash -> "
+                  f"{len(cids)} supported claim(s). This can attach one signed "
+                  "acceptance to a claim its signer never accepted, because the "
+                  "claim subject excludes the check command and the verdict. "
+                  "Only records filed before "
+                  + (f"ts={cutoff}" if cutoff is not None
+                     else "this store had a format marker")
+                  + " are eligible.", file=sys.stderr)
             for cid in cids:
                 edge(cid, wid, wts)
     # Re-register the artifacts themselves, so the index over the canonical layer
@@ -1283,8 +1369,16 @@ def main():
     pd.add_argument("--predicate"); pd.add_argument("--actor", required=True)
     pd.add_argument("command", nargs=argparse.REMAINDER); pd.set_defaults(fn=cmd_do)
     sub.add_parser("log").set_defaults(fn=cmd_log)
-    sub.add_parser("rebuild", help="reconstruct the projection from artifacts (SPEC s5)"
-                   ).set_defaults(fn=cmd_rebuild)
+    prb = sub.add_parser("rebuild",
+                         help="reconstruct the projection from artifacts (SPEC s5)")
+    prb.add_argument("--allow-legacy-links", action="store_true",
+                     help="for accepts filed BEFORE this store began requiring an "
+                          "oaip-claim:<id> note, guess which claim was accepted "
+                          "from the subject hash. Unsafe by construction: the "
+                          "subject excludes the check command and the verdict, so "
+                          "one signed acceptance can be attached to a claim its "
+                          "signer never accepted")
+    prb.set_defaults(fn=cmd_rebuild)
     sub.add_parser("verify").set_defaults(fn=cmd_verify)
     pf = sub.add_parser("conformance"); pf.add_argument("vectors", nargs="?", default="examples/vectors.json"); pf.set_defaults(fn=cmd_conformance)
     a = ap.parse_args()
