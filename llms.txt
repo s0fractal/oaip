@@ -73,6 +73,19 @@ link was drawn).
 
 ## Where the honest gaps are
 
+**The boundaries of the threat model are stated formally in SPEC §8.5, "Security
+assumptions and non-goals"** — ten scoped assumptions (`SA-1` … `SA-10`) and four
+security non-goals (`NG-1` … `NG-4`), each with its reasoning, bounding the
+attacker-capability matrix in §8.2. That section is where they live. They are not
+restated here, so the same item is not maintained in two places and cannot drift
+between them.
+
+What remains in this section is the other thing: **the defect history and the
+release state** — what was broken, by which review round, and what the fix
+actually reached. That is a provenance record, not a duplicate list, and it stays
+verbatim. Where an entry below is the history behind an assumption, it names the
+assumption.
+
 Listed because a reviewer will find them anyway, and finding them listed is
 better evidence of good faith than finding them hidden.
 
@@ -144,49 +157,31 @@ that result are recorded below, the favourable one included.
   work (below) were done independently: SPEC §8's capability matrix was written
   against the older record shapes and has been re-checked against these, but
   re-reading is not the same evidence as a test.
-- **The fingerprints are reproducible, and thin.** `env_fingerprint` and
+- **The fingerprints are reproducible, and thin** (SPEC §8.5 SA-8 for what they
+  are and are not worth). The history: `env_fingerprint` and
   `toolchain_fingerprint` were undefined — a second implementation could not
   compute a StateID at all. They are now SHA-256 over `environment_probe` /
   `toolchain_probe` records under the registered profile `posix-base@v1`, whose
   scope is five environment variables (PATH, LANG, LC_ALL, TZ,
-  SOURCE_DATE_EPOCH) and one tool probe (`git --version`). SPEC §2.2.1 says in as
-  many words that any other variable can change what a command does without
-  changing this number: it is a discriminator, not evidence of environmental
-  equivalence. A verifier that cannot re-run the probes reports
-  `unreproducible`, which §2.2.4 forbids collapsing into `matched`. `oaip
-  verify` re-runs the probes and prints the three-way count; on the host that
-  wrote the records they match, a State the current environment no longer
-  reproduces is `mismatched` and NOT an error (environments change; a State says
-  what was observed then), and a pre-0.1 execution is `unreproducible` because
-  it carries no State at all. What `mismatched` does NOT tell you, and
-  SPEC §2.2.4 now says so instead of implying otherwise: whether it is the same
-  host changed since, or a different host entirely. No record carries a host
-  identity, so no implementation can tell those apart; a consumer that needs the
-  distinction has to establish it by some means outside this protocol. It is also
-  **not a security control**: neither `OAIP_TRUST_ROOT` nor `XDG_CONFIG_HOME` is
-  in the profile, and a party who can change the environment can change what the
-  probes report of it (SPEC §8.1, §8.2 row (c)).
-- **One implementation.** Warrant has three that agree on broken stores; OAIP has
-  Python only. Until a second exists, "conformant" here means "agrees with
-  itself". This is the reason the negative vectors below were written first: a
-  second implementation that agreed only on well-formed records would prove
-  nothing.
-- **Attribution is exclusive-window only.** §2.6 requires that a weaker method
-  carry a lower `confidence_ppm` *and its own registered `method`* — so the
-  format provides for uncertain causality. Since 2026-07-30 the methods are a
-  closed registry (§7.6) with exactly one entry, capped at 999999 rather than at
-  certainty, so a File-Watcher-style guess is not merely unimplemented: it cannot
-  be recorded at all until someone registers it. The reference implementation
-  only ever wraps the command, i.e. it emits the one method it can claim honestly
-  and never exercises the low-confidence path. The hard case is specified as an
-  extension point, not implemented.
-- **No signing of OAIP records themselves.** Integrity comes from
-  content-addressing plus the Warrant record at the decision layer; the artifacts
-  are not individually signed. In particular a `claim` record (`{"claim": "0.1"}`
-  since the format alignment; `claim@v1` in pre-0.1 stores) is unsigned, so
-  "which claim exists" is a property of the artifact directory, not of anyone's
-  key — which is why the acceptance link is pinned inside the *signed* warrant
-  body rather than inferred from the claim side.
+  SOURCE_DATE_EPOCH) and one tool probe (`git --version`). `oaip verify` re-runs
+  the probes and prints the three-way count; on the host that wrote the records
+  they match, a State the current environment no longer reproduces is
+  `mismatched` and NOT an error (environments change; a State says what was
+  observed then), and a pre-0.1 execution is `unreproducible` because it carries
+  no State at all — which §2.2.4 forbids collapsing into `matched`.
+- **One implementation** (SPEC §8.5 SA-7). Warrant has three that agree on broken
+  stores; OAIP has Python only. This is the reason the negative vectors below
+  were written first: a second implementation that agreed only on well-formed
+  records would prove nothing.
+- **Attribution is exclusive-window only** (SPEC §8.5 SA-9). What changed on
+  2026-07-30: the methods became a closed registry (§7.6) with exactly one entry,
+  so a File-Watcher-style guess went from unimplemented to unrecordable. The
+  reference implementation only ever wraps the command, i.e. it emits the one
+  method it can claim honestly and never exercises the low-confidence path.
+- **No signing of OAIP records themselves** (SPEC §8.5 NG-1). A `claim` record
+  (`{"claim": "0.1"}` since the format alignment; `claim@v1` in pre-0.1 stores) is
+  unsigned, which is why the acceptance link is pinned inside the *signed*
+  warrant body rather than inferred from the claim side.
 - **Concurrency is serialised, not concurrent.** `oaip accept` and `oaip rebuild`
   take an advisory `flock` on `.oaip/lock`, rebuild builds under a temporary name
   and `os.replace`s it into place, and the acceptance edge is
