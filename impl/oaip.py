@@ -216,12 +216,31 @@ def git(*args, **kw) -> str:
 def workspace_snapshot() -> str:
     """Content-addressed tree of the FULL worktree (tracked + staged + untracked),
     built in a throwaway index so `git log` is never touched. This is the honest
-    `before_state`/`after_state`, unlike HEAD."""
+    `before_state`/`after_state`, unlike HEAD.
+
+    `.oaip/` is NEVER part of the snapshot. Until 2026-07-30 it was: `git add -A`
+    into the throwaway index wrote `.oaip/dev.key` — the Ed25519 SIGNING KEY —
+    as a loose blob into `.git/objects` of any repo whose .gitignore did not
+    already exclude `.oaip/` (a fresh `git init` + `oaip init` was enough).
+    A throwaway index does not mean throwaway objects: `git add` writes blobs
+    to the object database, where they sit recoverable by hash and travel with
+    any clone/push that reaches them. The observer must not exfiltrate its own
+    key custody into the thing it observes; nor is the ledger/store part of the
+    observed workspace — a snapshot that contains the observation machinery
+    changes whenever the machinery does, which is the observer effect, not
+    provenance. The exclusion is done here with a pathspec (not .gitignore) so
+    it holds in every repo regardless of user configuration."""
     tmp_index = OAIP / "tmp.index"
     env = dict(os.environ, GIT_INDEX_FILE=str(tmp_index.resolve()))
     # seed the throwaway index from HEAD if it exists, else empty, then add all
     subprocess.run(["git", "read-tree", "HEAD"], env=env, capture_output=True)
-    subprocess.run(["git", "add", "-A"], env=env, capture_output=True)
+    subprocess.run(["git", "add", "-A", "--", ".", ":(exclude).oaip"],
+                   env=env, capture_output=True)
+    # If HEAD itself tracks .oaip (a user committed it before init learned to
+    # gitignore it), read-tree seeded those entries; drop them so no tree this
+    # function writes ever contains the key or the store.
+    subprocess.run(["git", "rm", "-r", "-q", "--cached", "--ignore-unmatch",
+                    "--", ".oaip"], env=env, capture_output=True)
     tree = subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True).stdout.strip()
     tmp_index.unlink(missing_ok=True)
     return tree
@@ -288,6 +307,17 @@ def cmd_init(_):
     subprocess.run(WARRANT + ["--store", str(WSTORE), "init"], capture_output=True)
     if not WKEY.exists():
         subprocess.run(WARRANT + ["keygen", "--out", str(WKEY)], capture_output=True)
+    # Keep the signing key and the store out of the USER's own commits too.
+    # workspace_snapshot() excludes .oaip by pathspec, but a plain `git add -A`
+    # by the user would still commit dev.key; init owns the directory, so init
+    # owns keeping it ignored. Idempotent: never duplicates the line.
+    gitignore = Path(".gitignore")
+    lines = gitignore.read_text().splitlines() if gitignore.exists() else []
+    if ".oaip/" not in (l.strip() for l in lines):
+        with gitignore.open("a") as f:
+            if lines and not gitignore.read_text().endswith("\n"):
+                f.write("\n")
+            f.write(".oaip/\n")
     print(f"initialized .oaip (ledger + warrant store + dev key)")
 
 
