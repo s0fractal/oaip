@@ -422,8 +422,20 @@ def read_artifact(path: Path):
     directory of files with long names.
 
     Returns (doc, error). `doc` is None when the artifact must not be used.
+
+    A DIRECTORY at an artifact's address is not an artifact: `read_bytes()` raised
+    IsADirectoryError and the traceback replaced every diagnosis this function
+    exists to give (F12, 2026-07-30). Any OSError is reported as what it is — an
+    unreadable path — because "the canonical layer contains something that is not
+    a file" is a real state of the world, and a refusal is a decision while a
+    traceback is an accident.
     """
-    raw = path.read_bytes()
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        kind = "a directory" if path.is_dir() else "unreadable"
+        return None, (f"{path.name[:12]}: {kind} at an artifact address "
+                      f"({type(e).__name__}) — not an artifact")
     if path.name != sha256(raw):
         return None, (f"{path.name[:12]}: bytes hash to {sha256(raw)[:12]} — "
                       "artifact does not match its own address")
@@ -472,6 +484,30 @@ def git(*args, **kw) -> str:
     if r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()}")
     return r.stdout.strip()
+
+
+def symlinked_ledger_target():
+    """The repo-relative path `.oaip` points at, when `.oaip` is a SYMLINK.
+
+    THE DEFECT THIS CLOSES (F6, 2026-07-30, second adversarial round). The ledger
+    exclusion is by NAME, and a symlink gives the same directory a second name:
+    `ln -s ledgerstore .oaip` made `git add -A` add the REAL path, which
+    `**/.oaip/**` does not match. Measured before this: the snapshot tree carried
+    `ledgerstore/dev.key`, `ledgerstore/ledger.db`, `ledgerstore/trust.json`,
+    `ledgerstore/tmp.index` and the key's blob was in `.git/objects` — the whole
+    original leak, one `ln -s` away. `oaip init` refuses to run into a symlinked
+    ledger, but a symlink can be made afterwards, so the snapshot must not depend
+    on init having refused.
+
+    Returns None when `.oaip` is not a symlink, or when the target lies outside
+    the repository (where `git add` would not have added it anyway)."""
+    if not OAIP.is_symlink():
+        return None
+    try:
+        top = Path(git("rev-parse", "--show-toplevel")).resolve()
+        return OAIP.resolve().relative_to(top).as_posix()
+    except (RuntimeError, ValueError, OSError):
+        return None
 
 
 def workspace_snapshot() -> str:
@@ -525,11 +561,24 @@ def workspace_snapshot() -> str:
     cases on a case-insensitive filesystem."""
     tmp_index = OAIP / "tmp.index"
     env = dict(os.environ, GIT_INDEX_FILE=str(tmp_index.resolve()))
+    # A SYMLINKED ledger has a second name, and the exclusion is by name (F6).
+    # Say so loudly — the arrangement is very likely a mistake — and exclude the
+    # real path too, so saying so is not the only protection.
+    target = symlinked_ledger_target()
+    extra_add, extra_rm = [], []
+    if target:
+        print(f"warning: {OAIP} is a SYMLINK to {target}; the ledger and its "
+              "signing key live outside the path this snapshot excludes by name. "
+              f"Excluding {target} as well — but move the ledger back inside "
+              f"{OAIP} rather than relying on this.", file=sys.stderr)
+        extra_add = [f":(top,exclude,glob,icase){target}/**",
+                     f":(top,exclude,glob,icase){target}"]
+        extra_rm = [f":(top,glob,icase){target}/**", f":(top,glob,icase){target}"]
     # seed the throwaway index from HEAD if it exists, else empty, then add all
     subprocess.run(["git", "read-tree", "HEAD"], env=env, capture_output=True)
     subprocess.run(["git", "add", "-A", "--", ":/",
                     ":(top,exclude,glob,icase)**/.oaip/**",
-                    ":(top,exclude,glob,icase)**/.oaip"],
+                    ":(top,exclude,glob,icase)**/.oaip", *extra_add],
                    env=env, capture_output=True)
     # If HEAD itself tracks .oaip (a user committed it before init learned to
     # gitignore it), read-tree seeded those entries; drop them so no tree this
@@ -537,7 +586,7 @@ def workspace_snapshot() -> str:
     # any cwd.
     subprocess.run(["git", "rm", "-r", "-q", "--cached", "--ignore-unmatch",
                     "--", ":(top,glob,icase)**/.oaip/**",
-                    ":(top,glob,icase)**/.oaip"],
+                    ":(top,glob,icase)**/.oaip", *extra_rm],
                    env=env, capture_output=True)
     tree = subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True).stdout.strip()
     tmp_index.unlink(missing_ok=True)
@@ -600,6 +649,16 @@ CREATE TABLE IF NOT EXISTS warrants(
 
 # ---------- commands ----------
 def cmd_init(_):
+    # A SYMLINKED ledger silently relocates the signing key out of the path every
+    # exclusion here names, and `init` used to follow the symlink without a word
+    # (F6). Refuse: the one moment OAIP owns this directory is when it creates it.
+    if OAIP.is_symlink():
+        sys.exit(f"refusing to init: {OAIP} is a symlink to "
+                 f"{os.readlink(OAIP)!r}. The ledger holds this observer's "
+                 "SIGNING KEY, and every protection here excludes it by the name "
+                 f"{OAIP} — through a symlink the key lands in the snapshot (and "
+                 "in .git/objects) under the target's name instead. Remove the "
+                 f"symlink and let `oaip init` create a real {OAIP} directory.")
     OAIP.mkdir(exist_ok=True)
     db().executescript(SCHEMA)
     wrun("--store", str(WSTORE), "init")
@@ -908,6 +967,16 @@ def read_warrant_store():
             continue
         try:
             doc = loads_ijson(path.read_bytes())
+        except OSError as e:
+            # A DIRECTORY named <hex64>.json is a legal record ADDRESS that is not
+            # a record. The except clause here was narrowed to ValueError, so this
+            # raised IsADirectoryError and printed a traceback instead of a
+            # diagnosis (F12, 2026-07-30).
+            kind = "a directory" if path.is_dir() else "unreadable"
+            errors.append(f"warrant store: {kind} at record address "
+                          f"{path.name} ({type(e).__name__}) — not a record; "
+                          "remove it")
+            continue
         except ValueError as e:
             errors.append(f"warrant {path.stem[:12]}: unreadable record: {e}")
             continue
@@ -1002,8 +1071,14 @@ def cmd_rebuild(a):
     # Read and validate the canonical layer BEFORE touching the projection. A
     # fail-closed check that deletes the database and then refuses to rebuild it
     # has destroyed the thing it was protecting.
+    # The two halves of the canonical layer are counted SEPARATELY. Every fault
+    # used to be reported as "corrupt artifact(s) in the canonical layer" — so a
+    # stray file in the Warrant store, or a Warrant CLI that could not run, was
+    # announced as artifact corruption and sent the reader to the wrong directory
+    # (F13, 2026-07-30). A diagnosis that names the wrong layer is worse than no
+    # diagnosis, because it is acted on.
     records = []
-    bad = []
+    art_bad, store_bad = [], []
     for path in sorted(ART.glob("*")):
         # An artifact whose bytes do not hash to its address is not a record with
         # a problem, it is not that record at all. Rebuilding from it would
@@ -1011,14 +1086,14 @@ def cmd_rebuild(a):
         # before this check existed.
         doc, err = read_artifact(path)
         if err:
-            bad.append(err)
+            art_bad.append(err)
             continue
         if isinstance(doc, dict) and isinstance(doc.get("oaip_record"), str):
             records.append(doc)
 
     # The other half of the canonical layer: the Warrant store.
-    accepts, wrec_files, store_bad = read_warrant_store()
-    bad += store_bad
+    accepts, wrec_files, store_errs = read_warrant_store()
+    store_bad += store_errs
 
     # WHAT VERIFICATION MEANS HERE, IN THREE LAYERS THAT WERE EACH ADDED AFTER
     # THE PREVIOUS ONE WAS BROKEN BY REVIEW (2026-07-30, two rounds):
@@ -1038,26 +1113,31 @@ def cmd_rebuild(a):
     if wrec_files:
         report, rerr = store_report()
         if rerr:
-            bad.append(f"warrant store: {rerr}")
+            store_bad.append(f"warrant store: {rerr}")
         elif report["errors"]:
             first = next((f"{f.get('subject','')[:12]} {f.get('message')}"
                           for f in report["findings"]
                           if isinstance(f, dict) and f.get("level") == "ERR"), "")
-            bad.append("warrant store: `warrant verify` reported "
-                       f"{report['errors']} error(s) — an unverified acceptance "
-                       f"must not become an edge ({first})")
+            store_bad.append("warrant store: `warrant verify` reported "
+                             f"{report['errors']} error(s) — an unverified "
+                             f"acceptance must not become an edge ({first})")
         else:
             actors, aerr = read_trust()
             if aerr:
-                bad.append(f"warrant store: {aerr}")
+                store_bad.append(f"keyring: {aerr}")
             unbound_prefixes = unbound_by_warrant()
 
-    if bad:
-        for e in bad:
+    if art_bad or store_bad:
+        for e in art_bad + store_bad:
             print("ERR ", e, file=sys.stderr)
-        sys.exit(f"refusing to rebuild: {len(bad)} corrupt artifact(s) in the "
-                 "canonical layer — the projection would assert forged facts "
-                 "(the existing projection has been left untouched)")
+        where = ", ".join(
+            p for p in (f"{len(art_bad)} corrupt artifact(s) in {ART}" if art_bad
+                        else "",
+                        f"{len(store_bad)} fault(s) in the decision layer "
+                        f"({WSTORE})" if store_bad else "") if p)
+        sys.exit(f"refusing to rebuild: {where} — the projection would assert "
+                 "facts the canonical layer does not support (the existing "
+                 "projection has been left untouched)")
 
     if DB.exists():
         DB.unlink()

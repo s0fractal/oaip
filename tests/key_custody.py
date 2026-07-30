@@ -51,6 +51,14 @@ key leaked as `.OAIP/dev.key`, tracked (4a) or untracked with a DIRECTORY named
 detector was `".oaip" in p.split("/")`, case-sensitive in exactly the same way.
 Both are fixed; the detector is case-insensitive and cases 4a/4b are the repros.
 
+AND A FOURTH TIME: A SYMLINK (case 4c, same round)
+--------------------------------------------------
+`ln -s ledgerstore .oaip` gives the ledger a second name, and every exclusion
+here works by NAME, so `git add -A` added the real path: `ledgerstore/dev.key`
+in the tree and the key's blob in `.git/objects`. `oaip init` followed the
+symlink without a word. `init` now refuses, and the snapshot excludes the
+symlink's target as well and says loudly that the arrangement is wrong.
+
 WHY THE NEGATIVE CONTROL IS IN THE FILE
 ---------------------------------------
 Case 1 re-runs the PRE-FIX snapshot procedure (read-tree, `git add -A` with no
@@ -237,6 +245,57 @@ def main():
              f"tree={tree} leaked={L.oaip_paths_in(tree)}")
         case("the .OAIP signing key's bytes never entered .git/objects",
              not L.key_in_odb(".OAIP/dev.key"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- 4c. A SYMLINKED LEDGER (F6, second adversarial round). The exclusion
+        # is by NAME, and a symlink gives the same directory a second name:
+        # `ln -s ledgerstore .oaip` and `git add -A` adds the REAL path, which
+        # `**/.oaip/**` does not match. Measured before the fix, this exact case:
+        # the tree carried `ledgerstore/dev.key`, `ledgerstore/ledger.db`,
+        # `ledgerstore/trust.json`, `ledgerstore/tmp.index`, and `git cat-file -e`
+        # found the key blob. `init` followed the symlink without a word.
+        d = Path(tmp) / "sym"
+        d.mkdir()
+        subprocess.run(["git", "init", "-q", "."], cwd=d, capture_output=True)
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-q", "--allow-empty", "-m", "init"],
+                       cwd=d, capture_output=True)
+        (d / "ledgerstore").mkdir()
+        (d / ".oaip").symlink_to("ledgerstore")
+        oaip = lambda *a: subprocess.run(
+            [sys.executable, str(ROOT / "impl" / "oaip.py"), *a], cwd=d,
+            capture_output=True, text=True)
+        r = oaip("init")
+        case("init REFUSES a symlinked .oaip instead of following it",
+             r.returncode != 0 and "symlink" in (r.stdout + r.stderr)
+             and "Traceback" not in r.stderr, f"rc={r.returncode} {r.stderr[:200]}")
+
+        # A symlink can also be made AFTER a legitimate init, so the snapshot must
+        # not depend on init having refused. Build that state directly.
+        (d / ".oaip").unlink()
+        r = oaip("init")
+        (d / ".gitignore").unlink(missing_ok=True)
+        os.rename(d / ".oaip", d / "ledgerstore2")
+        (d / ".oaip").symlink_to("ledgerstore2")
+        key = d / "ledgerstore2" / "dev.key"
+        if not key.exists():
+            key.write_text("5" * 63 + "1\n")
+        r = oaip("run", "--intent", "x", "--", "sh", "-c", "echo hi > f.txt")
+        tree = next((t.split("=", 1)[1] for t in r.stdout.split()
+                     if t.startswith("after=")), "")
+        paths = subprocess.run(["git", "ls-tree", "-r", "--name-only",
+                                "--full-tree", tree], cwd=d,
+                               capture_output=True, text=True).stdout.splitlines()
+        case("symlinked ledger: the snapshot excludes the SYMLINK'S TARGET too",
+             tree and not any(p.startswith("ledgerstore2/") for p in paths),
+             f"tree={tree} paths={paths}")
+        blob = subprocess.run(["git", "hash-object", "ledgerstore2/dev.key"],
+                              cwd=d, capture_output=True, text=True).stdout.strip()
+        case("symlinked ledger: the key's bytes never entered .git/objects",
+             subprocess.run(["git", "cat-file", "-e", blob], cwd=d,
+                            capture_output=True).returncode != 0)
+        case("symlinked ledger: the snapshot says so, loudly",
+             "SYMLINK" in r.stderr, r.stderr[:300])
 
     with tempfile.TemporaryDirectory() as tmp:
         # --- 5. a NESTED ledger: `oaip init` run in a subdirectory. The first

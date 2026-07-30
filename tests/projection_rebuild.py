@@ -252,6 +252,46 @@ def main():
              and "no body object" in out, out[-300:])
         (recdir / f"{addr}.json").unlink()
 
+        # P3 (F12): a DIRECTORY named <hex64>.json is a legal record ADDRESS that
+        # is not a record. The except clause had been narrowed to ValueError, so
+        # `read_bytes()` raised IsADirectoryError and a traceback replaced every
+        # diagnosis. Same for a directory at an artifact address.
+        (recdir / f"{'a' * 64}.json").mkdir()
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("a DIRECTORY at a record address: a refusal, not a traceback",
+             r.returncode != 0 and "Traceback" not in out
+             and "IsADirectoryError" in out and "not a record" in out, out[-300:])
+        (recdir / f"{'a' * 64}.json").rmdir()
+        (work / ".oaip" / "artifacts" / ("b" * 64)).mkdir()
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("a DIRECTORY at an artifact address: a refusal, not a traceback",
+             r.returncode != 0 and "Traceback" not in out
+             and "not an artifact" in out, out[-300:])
+        (work / ".oaip" / "artifacts" / ("b" * 64)).rmdir()
+
+        # P3 (F13): a fault in the DECISION layer used to be announced as
+        # "corrupt artifact(s) in the canonical layer", sending the reader to the
+        # wrong directory. Name the layer that is actually broken.
+        stray = recdir / "notes.json"
+        stray.write_bytes(b"")
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("a store-layer fault is diagnosed as a DECISION-layer fault",
+             "decision layer" in out and "corrupt artifact" not in out,
+             out[-300:])
+        stray.unlink()
+        art = next(p for p in (work / ".oaip" / "artifacts").iterdir()
+                   if p.is_file())
+        keep = art.read_bytes()
+        art.write_bytes(keep + b" ")
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("an artifact-layer fault still names the ARTIFACT directory",
+             "corrupt artifact" in out and ".oaip/artifacts" in out, out[-300:])
+        art.write_bytes(keep)
+
         # THE FORGERY (case 7): a real accept body, ts bumped so it is a NEW
         # record at its own valid address, "signed" with bytes no key produced.
         # The old gate (address matching) passes it by construction — the
