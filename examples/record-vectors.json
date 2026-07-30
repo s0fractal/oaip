@@ -1,0 +1,2099 @@
+{
+  "oaip_record_vectors": "0.1",
+  "note": "Record SHAPES, not bytes (SPEC §10). `examples/vectors.json` pins how a record is serialized; this file pins WHAT A RECORD IS. Every entry in `accept` MUST validate as the stated (type, version). Every entry in `reject` MUST produce the stated `outcome` — and `invalid`, `unsupported-version`, `unknown-type`, `legacy` and `not-a-record` are FIVE outcomes, not two: collapsing an unread record into `valid` reads what the reader does not understand, and collapsing it into `invalid` calls a forward-compatible writer an attacker (SPEC §6.2).",
+  "reject_note": "The `shape` class is the one a canonicalization vector cannot reach: every one of those records is impeccable JCS I-JSON whose SHAPE is wrong. An implementation that serializes correctly and validates nothing passes examples/vectors.json completely.",
+  "accept": [
+    {
+      "name": "artifact",
+      "type": "artifact",
+      "version": "0.1",
+      "record": {
+        "artifact": "0.1",
+        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "kind": "stdout",
+        "size": 0
+      },
+      "why": "the canonical shape of §2 artifact"
+    },
+    {
+      "name": "attribution",
+      "type": "attribution",
+      "version": "0.1",
+      "record": {
+        "attribution": "0.1",
+        "id": "1784000000001-eeee0005",
+        "effect_id": "1784000000001-dddd0004",
+        "cause": "1784000000001-bbbb0002",
+        "method": "exclusive-command-window",
+        "confidence_ppm": 999000,
+        "support": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ]
+      },
+      "why": "the canonical shape of §2 attribution"
+    },
+    {
+      "name": "claim",
+      "type": "claim",
+      "version": "0.1",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "the canonical shape of §2 claim"
+    },
+    {
+      "name": "claim_subject",
+      "type": "claim_subject",
+      "version": "0.1",
+      "record": {
+        "claim_subject": "0.1",
+        "predicate": "auth.rejects-expired",
+        "execution_id": "1784000000001-bbbb0002",
+        "effects": [
+          {
+            "target": "src/auth.py",
+            "kind": "file.modify",
+            "after": "1000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "why": "the canonical shape of §2 claim_subject"
+    },
+    {
+      "name": "effect",
+      "type": "effect",
+      "version": "0.1",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "execution_id": "1784000000001-bbbb0002",
+        "kind": "file.modify",
+        "target": "src/auth.py",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "1000000000000000000000000000000000000000",
+        "entities": []
+      },
+      "why": "the canonical shape of §2 effect"
+    },
+    {
+      "name": "environment_probe",
+      "type": "environment_probe",
+      "version": "0.1",
+      "record": {
+        "environment_probe": "0.1",
+        "profile": "posix-base@v1",
+        "os": "Linux",
+        "arch": "x86_64",
+        "vars": {
+          "LANG": "en_US.UTF-8",
+          "LC_ALL": null,
+          "PATH": "/usr/bin:/bin",
+          "SOURCE_DATE_EPOCH": null,
+          "TZ": null
+        }
+      },
+      "why": "the canonical shape of §2 environment_probe"
+    },
+    {
+      "name": "execution",
+      "type": "execution",
+      "version": "0.1",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "the canonical shape of §2 execution"
+    },
+    {
+      "name": "intent",
+      "type": "intent",
+      "version": "0.1",
+      "record": {
+        "intent": "0.1",
+        "id": "1784000000000-aaaa0001",
+        "actor": "agent-a@host",
+        "parent": null,
+        "objective": "reject expired tokens",
+        "constraints": [
+          "public API unchanged"
+        ],
+        "acceptance_refs": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "ts": 1784000000
+      },
+      "why": "the canonical shape of §2 intent"
+    },
+    {
+      "name": "state",
+      "type": "state",
+      "version": "0.1",
+      "record": {
+        "state": "0.1",
+        "repo_commit": "0000000000000000000000000000000000000000",
+        "worktree_tree": "0000000000000000000000000000000000000000",
+        "env_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "toolchain_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "why": "the canonical shape of §2 state"
+    },
+    {
+      "name": "toolchain_probe",
+      "type": "toolchain_probe",
+      "version": "0.1",
+      "record": {
+        "toolchain_probe": "0.1",
+        "profile": "posix-base@v1",
+        "tools": [
+          {
+            "name": "git",
+            "argv": [
+              "git",
+              "--version"
+            ],
+            "status": "ok",
+            "stdout_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "why": "the canonical shape of §2 toolchain_probe"
+    },
+    {
+      "name": "intent-empty-lists",
+      "type": "intent",
+      "version": "0.1",
+      "record": {
+        "intent": "0.1",
+        "id": "1784000000000-aaaa0001",
+        "actor": "agent-a@host",
+        "parent": null,
+        "objective": "reject expired tokens",
+        "constraints": [],
+        "acceptance_refs": [],
+        "ts": 1784000000
+      },
+      "why": "empty arrays and a null parent are the ordinary case, not an omission"
+    },
+    {
+      "name": "intent-with-parent",
+      "type": "intent",
+      "version": "0.1",
+      "record": {
+        "intent": "0.1",
+        "id": "1784000000000-aaaa0001",
+        "actor": "agent-a@host",
+        "parent": "1783999999999-0000aaaa",
+        "objective": "reject expired tokens",
+        "constraints": [
+          "public API unchanged"
+        ],
+        "acceptance_refs": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "ts": 1784000000
+      },
+      "why": "a sub-intent names its parent"
+    },
+    {
+      "name": "state-no-commit",
+      "type": "state",
+      "version": "0.1",
+      "record": {
+        "state": "0.1",
+        "repo_commit": null,
+        "worktree_tree": "0000000000000000000000000000000000000000",
+        "env_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "toolchain_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "why": "a repository with no commit yet: repo_commit is null, never omitted"
+    },
+    {
+      "name": "environment-probe-all-unset",
+      "type": "environment_probe",
+      "version": "0.1",
+      "record": {
+        "environment_probe": "0.1",
+        "profile": "posix-base@v1",
+        "os": "Linux",
+        "arch": "x86_64",
+        "vars": {
+          "LANG": null,
+          "LC_ALL": null,
+          "PATH": null,
+          "SOURCE_DATE_EPOCH": null,
+          "TZ": null
+        }
+      },
+      "why": "every variable unset — five nulls, because absence is a value here"
+    },
+    {
+      "name": "environment-probe-empty-string",
+      "type": "environment_probe",
+      "version": "0.1",
+      "record": {
+        "environment_probe": "0.1",
+        "profile": "posix-base@v1",
+        "os": "Linux",
+        "arch": "x86_64",
+        "vars": {
+          "LANG": "en_US.UTF-8",
+          "LC_ALL": "",
+          "PATH": "/usr/bin:/bin",
+          "SOURCE_DATE_EPOCH": null,
+          "TZ": null
+        }
+      },
+      "why": "LC_ALL set to the empty string is DISTINCT from LC_ALL unset"
+    },
+    {
+      "name": "toolchain-probe-git-absent",
+      "type": "toolchain_probe",
+      "version": "0.1",
+      "record": {
+        "toolchain_probe": "0.1",
+        "profile": "posix-base@v1",
+        "tools": [
+          {
+            "name": "git",
+            "argv": [
+              "git",
+              "--version"
+            ],
+            "status": "absent",
+            "stdout_sha256": null
+          }
+        ]
+      },
+      "why": "a host with no git still produces a fingerprint, and says why it is thin"
+    },
+    {
+      "name": "toolchain-probe-git-error",
+      "type": "toolchain_probe",
+      "version": "0.1",
+      "record": {
+        "toolchain_probe": "0.1",
+        "profile": "posix-base@v1",
+        "tools": [
+          {
+            "name": "git",
+            "argv": [
+              "git",
+              "--version"
+            ],
+            "status": "error",
+            "stdout_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "why": "a probe that ran and failed is not a probe that was absent"
+    },
+    {
+      "name": "execution-shell",
+      "type": "execution",
+      "version": "0.1",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "shell@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "echo hi >> f.txt"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "shell@v1 carries exactly one element: the script"
+    },
+    {
+      "name": "execution-failed",
+      "type": "execution",
+      "version": "0.1",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "failed",
+        "exit_code": null,
+        "ts": 1784000000
+      },
+      "why": "the invocation never became a process; there is no code to report"
+    },
+    {
+      "name": "execution-killed",
+      "type": "execution",
+      "version": "0.1",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "killed",
+        "exit_code": null,
+        "ts": 1784000000
+      },
+      "why": "killed by a signal: exit_code is null, not 137 and not 0"
+    },
+    {
+      "name": "execution-no-intent",
+      "type": "execution",
+      "version": "0.1",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": null,
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "an execution with no declared intent is legal and says so explicitly"
+    },
+    {
+      "name": "effect-create",
+      "type": "effect",
+      "version": "0.1",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "execution_id": "1784000000001-bbbb0002",
+        "kind": "file.create",
+        "target": "src/auth.py",
+        "before": null,
+        "after": "1000000000000000000000000000000000000000",
+        "entities": []
+      },
+      "why": "a created file has no before"
+    },
+    {
+      "name": "effect-delete",
+      "type": "effect",
+      "version": "0.1",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "execution_id": "1784000000001-bbbb0002",
+        "kind": "file.delete",
+        "target": "src/auth.py",
+        "before": "0000000000000000000000000000000000000000",
+        "after": null,
+        "entities": []
+      },
+      "why": "a deleted file has no after"
+    },
+    {
+      "name": "effect-no-entities",
+      "type": "effect",
+      "version": "0.1",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "execution_id": "1784000000001-bbbb0002",
+        "kind": "file.modify",
+        "target": "src/auth.py",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "1000000000000000000000000000000000000000"
+      },
+      "why": "entities is OPTIONAL: its absence is not a missing member"
+    },
+    {
+      "name": "attribution-at-ceiling",
+      "type": "attribution",
+      "version": "0.1",
+      "record": {
+        "attribution": "0.1",
+        "id": "1784000000001-eeee0005",
+        "effect_id": "1784000000001-dddd0004",
+        "cause": "1784000000001-bbbb0002",
+        "method": "exclusive-command-window",
+        "confidence_ppm": 999999,
+        "support": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ]
+      },
+      "why": "999999 is the registered ceiling for exclusive-command-window and is legal"
+    },
+    {
+      "name": "attribution-low-confidence",
+      "type": "attribution",
+      "version": "0.1",
+      "record": {
+        "attribution": "0.1",
+        "id": "1784000000001-eeee0005",
+        "effect_id": "1784000000001-dddd0004",
+        "cause": "1784000000001-bbbb0002",
+        "method": "exclusive-command-window",
+        "confidence_ppm": 1,
+        "support": []
+      },
+      "why": "an honest near-zero confidence is a record, not an error"
+    },
+    {
+      "name": "claim-fail",
+      "type": "claim",
+      "version": "0.1",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "fail",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "a REFUSAL is a first-class record (§4); a failing claim is well-formed"
+    },
+    {
+      "name": "claim-no-evidence",
+      "type": "claim",
+      "version": "0.1",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "evidence may be empty; it may not be unsorted or repeated"
+    },
+    {
+      "name": "claim-subject-empty-effects",
+      "type": "claim_subject",
+      "version": "0.1",
+      "record": {
+        "claim_subject": "0.1",
+        "predicate": "auth.rejects-expired",
+        "execution_id": "1784000000001-bbbb0002",
+        "effects": []
+      },
+      "why": "an execution that changed nothing still has a subject"
+    },
+    {
+      "name": "claim-subject-sorted",
+      "type": "claim_subject",
+      "version": "0.1",
+      "record": {
+        "claim_subject": "0.1",
+        "predicate": "auth.rejects-expired",
+        "execution_id": "1784000000001-bbbb0002",
+        "effects": [
+          {
+            "target": "a.py",
+            "kind": "file.create",
+            "after": "1000000000000000000000000000000000000000"
+          },
+          {
+            "target": "a.py",
+            "kind": "file.modify",
+            "after": "1000000000000000000000000000000000000000"
+          },
+          {
+            "target": "b.py",
+            "kind": "file.delete",
+            "after": null
+          }
+        ]
+      },
+      "why": "sorted by target then kind — the order IS part of the subject hash"
+    },
+    {
+      "name": "artifact-transcript",
+      "type": "artifact",
+      "version": "0.1",
+      "record": {
+        "artifact": "0.1",
+        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "kind": "check-transcript",
+        "size": 4096
+      },
+      "why": "artifact kind is an OPEN vocabulary (§7.4)"
+    },
+    {
+      "name": "artifact-unregistered-kind",
+      "type": "artifact",
+      "version": "0.1",
+      "record": {
+        "artifact": "0.1",
+        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "kind": "x-mycorp-sarif",
+        "size": 0
+      },
+      "why": "an unregistered artifact kind is PERMITTED — §7.4 keeps this set open on purpose, and a vector pins that so a future reader cannot quietly close it"
+    }
+  ],
+  "reject": [
+    {
+      "name": "two-type-tags",
+      "class": "type-tag",
+      "outcome": "invalid",
+      "record": {
+        "intent": "0.1",
+        "id": "1784000000000-aaaa0001",
+        "actor": "agent-a@host",
+        "parent": null,
+        "objective": "reject expired tokens",
+        "constraints": [
+          "public API unchanged"
+        ],
+        "acceptance_refs": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "ts": 1784000000,
+        "state": "0.1"
+      },
+      "why": "two registered type tags: a document that is two record types is neither"
+    },
+    {
+      "name": "unknown-type-tag",
+      "class": "type-tag",
+      "outcome": "unknown-type",
+      "record": {
+        "observation": "0.1",
+        "id": "x",
+        "ts": 1784000000
+      },
+      "why": "a type nobody registered is neither valid nor corrupt — it is unread"
+    },
+    {
+      "name": "unsupported-version",
+      "class": "type-tag",
+      "outcome": "unsupported-version",
+      "record": {
+        "intent": "0.2",
+        "id": "1784000000000-aaaa0001",
+        "actor": "agent-a@host",
+        "parent": null,
+        "objective": "reject expired tokens",
+        "constraints": [
+          "public API unchanged"
+        ],
+        "acceptance_refs": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "ts": 1784000000
+      },
+      "why": "a v0.1 reader MUST NOT read a 0.2 record, and MUST NOT call it corrupt"
+    },
+    {
+      "name": "unsupported-major-version",
+      "class": "type-tag",
+      "outcome": "unsupported-version",
+      "record": {
+        "execution": "1.0",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "no prefix matching: 1.0 is not 'a kind of 0.1'"
+    },
+    {
+      "name": "type-tag-not-a-version",
+      "class": "type-tag",
+      "outcome": "invalid",
+      "record": {
+        "claim": "v1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "the type is known and the version is unreadable; guessing one is forbidden"
+    },
+    {
+      "name": "type-tag-integer",
+      "class": "type-tag",
+      "outcome": "invalid",
+      "record": {
+        "state": 1,
+        "repo_commit": "0000000000000000000000000000000000000000",
+        "worktree_tree": "0000000000000000000000000000000000000000",
+        "env_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "toolchain_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "why": "a type tag whose value is not a string has no version at all"
+    },
+    {
+      "name": "legacy-record",
+      "class": "type-tag",
+      "outcome": "legacy",
+      "record": {
+        "oaip_record": "intent@v1",
+        "id": "1784000000000-aaaa0001",
+        "description": "reject expired tokens",
+        "parent": null,
+        "ts": 1784000000
+      },
+      "why": "the pre-0.1 shape: read under §6.4 legacy rules or reported, never reinterpreted as a 0.1 intent"
+    },
+    {
+      "name": "no-type-tag-at-all",
+      "class": "type-tag",
+      "outcome": "not-a-record",
+      "record": {
+        "hello": "world"
+      },
+      "why": "a blob that is JSON is not a malformed record; calling it one would make every ledger corrupt"
+    },
+    {
+      "name": "missing-intent-actor",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "intent": "0.1",
+        "id": "1784000000000-aaaa0001",
+        "parent": null,
+        "objective": "reject expired tokens",
+        "constraints": [
+          "public API unchanged"
+        ],
+        "acceptance_refs": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "ts": 1784000000
+      },
+      "why": "intent without actor is not a intent"
+    },
+    {
+      "name": "missing-intent-acceptance_refs",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "intent": "0.1",
+        "id": "1784000000000-aaaa0001",
+        "actor": "agent-a@host",
+        "parent": null,
+        "objective": "reject expired tokens",
+        "constraints": [
+          "public API unchanged"
+        ],
+        "ts": 1784000000
+      },
+      "why": "intent without acceptance_refs is not a intent"
+    },
+    {
+      "name": "missing-state-toolchain_fingerprint",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "state": "0.1",
+        "repo_commit": "0000000000000000000000000000000000000000",
+        "worktree_tree": "0000000000000000000000000000000000000000",
+        "env_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "why": "state without toolchain_fingerprint is not a state"
+    },
+    {
+      "name": "missing-execution-status",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "execution without status is not a execution"
+    },
+    {
+      "name": "missing-execution-executor",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "execution without executor is not a execution"
+    },
+    {
+      "name": "missing-effect-execution_id",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "kind": "file.modify",
+        "target": "src/auth.py",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "1000000000000000000000000000000000000000",
+        "entities": []
+      },
+      "why": "effect without execution_id is not a effect"
+    },
+    {
+      "name": "missing-attribution-method",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "attribution": "0.1",
+        "id": "1784000000001-eeee0005",
+        "effect_id": "1784000000001-dddd0004",
+        "cause": "1784000000001-bbbb0002",
+        "confidence_ppm": 999000,
+        "support": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ]
+      },
+      "why": "attribution without method is not a attribution"
+    },
+    {
+      "name": "missing-claim-validation",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "claim without validation is not a claim"
+    },
+    {
+      "name": "missing-claim_subject-effects",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "claim_subject": "0.1",
+        "predicate": "auth.rejects-expired",
+        "execution_id": "1784000000001-bbbb0002"
+      },
+      "why": "claim_subject without effects is not a claim_subject"
+    },
+    {
+      "name": "missing-artifact-size",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "artifact": "0.1",
+        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "kind": "stdout"
+      },
+      "why": "artifact without size is not a artifact"
+    },
+    {
+      "name": "missing-environment_probe-profile",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "environment_probe": "0.1",
+        "os": "Linux",
+        "arch": "x86_64",
+        "vars": {
+          "LANG": "en_US.UTF-8",
+          "LC_ALL": null,
+          "PATH": "/usr/bin:/bin",
+          "SOURCE_DATE_EPOCH": null,
+          "TZ": null
+        }
+      },
+      "why": "environment_probe without profile is not a environment_probe"
+    },
+    {
+      "name": "missing-toolchain_probe-tools",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "toolchain_probe": "0.1",
+        "profile": "posix-base@v1"
+      },
+      "why": "toolchain_probe without tools is not a toolchain_probe"
+    },
+    {
+      "name": "missing-executor-runtime",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "no runtime means no rule for interpreting `invocation`"
+    },
+    {
+      "name": "missing-validation-verdict",
+      "class": "missing-member",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "the verdict is the whole of §4; a claim without one asserts nothing"
+    },
+    {
+      "name": "unknown-member-intent-description",
+      "class": "unknown-member",
+      "outcome": "invalid",
+      "record": {
+        "intent": "0.1",
+        "id": "1784000000000-aaaa0001",
+        "actor": "agent-a@host",
+        "parent": null,
+        "objective": "reject expired tokens",
+        "constraints": [
+          "public API unchanged"
+        ],
+        "acceptance_refs": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "ts": 1784000000,
+        "description": "reject expired tokens"
+      },
+      "why": "`description` was the pre-0.1 spelling of `objective`; a closed schema refuses it rather than carrying both vocabularies"
+    },
+    {
+      "name": "unknown-member-execution-command",
+      "class": "unknown-member",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000,
+        "command": "bash change.sh"
+      },
+      "why": "the field the reference implementation used to write, refused by name"
+    },
+    {
+      "name": "unknown-member-effect-path",
+      "class": "unknown-member",
+      "outcome": "invalid",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "execution_id": "1784000000001-bbbb0002",
+        "kind": "file.modify",
+        "target": "src/auth.py",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "1000000000000000000000000000000000000000",
+        "entities": [],
+        "path": "src/auth.py"
+      },
+      "why": "`path` was the implementation's name for `target`"
+    },
+    {
+      "name": "unknown-member-claim-supported",
+      "class": "unknown-member",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000,
+        "supported": true
+      },
+      "why": "`supported` duplicated validation.verdict; two members, one fact, two readings"
+    },
+    {
+      "name": "unknown-member-in-executor",
+      "class": "unknown-member",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1",
+          "host": "build-1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "nested objects are closed too"
+    },
+    {
+      "name": "unknown-member-in-validation",
+      "class": "unknown-member",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000",
+          "exit_code": 0
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "validation is closed: an exit code is not part of a verdict"
+    },
+    {
+      "name": "unknown-member-in-subject-effect",
+      "class": "unknown-member",
+      "outcome": "invalid",
+      "record": {
+        "claim_subject": "0.1",
+        "predicate": "auth.rejects-expired",
+        "execution_id": "1784000000001-bbbb0002",
+        "effects": [
+          {
+            "target": "src/auth.py",
+            "kind": "file.modify",
+            "after": "1000000000000000000000000000000000000000",
+            "before": "0000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "why": "the subject's effect elements are closed — an extra member here changes the hash the decision is addressed by"
+    },
+    {
+      "name": "unknown-member-in-tool",
+      "class": "unknown-member",
+      "outcome": "invalid",
+      "record": {
+        "toolchain_probe": "0.1",
+        "profile": "posix-base@v1",
+        "tools": [
+          {
+            "name": "git",
+            "argv": [
+              "git",
+              "--version"
+            ],
+            "status": "ok",
+            "stdout_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "stderr_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "why": "stderr is deliberately not part of the toolchain fingerprint"
+    },
+    {
+      "name": "wrong-type-intent-ts",
+      "class": "wrong-type",
+      "outcome": "invalid",
+      "record": {
+        "intent": "0.1",
+        "id": "1784000000000-aaaa0001",
+        "actor": "agent-a@host",
+        "parent": null,
+        "objective": "reject expired tokens",
+        "constraints": [
+          "public API unchanged"
+        ],
+        "acceptance_refs": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "ts": "1784000000"
+      },
+      "why": "a timestamp as a string sorts differently and hashes differently"
+    },
+    {
+      "name": "wrong-type-intent-constraints",
+      "class": "wrong-type",
+      "outcome": "invalid",
+      "record": {
+        "intent": "0.1",
+        "id": "1784000000000-aaaa0001",
+        "actor": "agent-a@host",
+        "parent": null,
+        "objective": "reject expired tokens",
+        "constraints": "public API unchanged",
+        "acceptance_refs": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "ts": 1784000000
+      },
+      "why": "one constraint is still an array of one"
+    },
+    {
+      "name": "wrong-type-execution-invocation-string",
+      "class": "wrong-type",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": "bash change.sh",
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "THE format decision, pinned: a joined string cannot reconstruct argv, so the string form is not an invocation"
+    },
+    {
+      "name": "wrong-type-execution-invocation-empty",
+      "class": "wrong-type",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "an execution with no invocation observed nothing"
+    },
+    {
+      "name": "wrong-type-execution-invocation-nonstring",
+      "class": "wrong-type",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          7
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "argv elements are strings"
+    },
+    {
+      "name": "wrong-type-attribution-confidence-string",
+      "class": "wrong-type",
+      "outcome": "invalid",
+      "record": {
+        "attribution": "0.1",
+        "id": "1784000000001-eeee0005",
+        "effect_id": "1784000000001-dddd0004",
+        "cause": "1784000000001-bbbb0002",
+        "method": "exclusive-command-window",
+        "confidence_ppm": "999000",
+        "support": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ]
+      },
+      "why": "confidence is an integer; the whole point of ppm is to avoid floats"
+    },
+    {
+      "name": "wrong-type-effect-entities-object",
+      "class": "wrong-type",
+      "outcome": "invalid",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "execution_id": "1784000000001-bbbb0002",
+        "kind": "file.modify",
+        "target": "src/auth.py",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "1000000000000000000000000000000000000000",
+        "entities": {
+          "fn": "login"
+        }
+      },
+      "why": "entities is a reserved ARRAY, and reserved means empty in 0.1"
+    },
+    {
+      "name": "wrong-type-claim-validation-array",
+      "class": "wrong-type",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": [
+          "cmd@v1",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "pass",
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "validation is an object; a tuple has no member names to close"
+    },
+    {
+      "name": "wrong-type-artifact-size-string",
+      "class": "wrong-type",
+      "outcome": "invalid",
+      "record": {
+        "artifact": "0.1",
+        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "kind": "stdout",
+        "size": "0"
+      },
+      "why": "size is an integer count of bytes"
+    },
+    {
+      "name": "wrong-type-env-var-boolean",
+      "class": "wrong-type",
+      "outcome": "invalid",
+      "record": {
+        "environment_probe": "0.1",
+        "profile": "posix-base@v1",
+        "os": "Linux",
+        "arch": "x86_64",
+        "vars": {
+          "LANG": "en_US.UTF-8",
+          "LC_ALL": null,
+          "PATH": "/usr/bin:/bin",
+          "SOURCE_DATE_EPOCH": null,
+          "TZ": false
+        }
+      },
+      "why": "an environment variable is a string or unset; `false` is neither"
+    },
+    {
+      "name": "shape-attribution-over-ceiling",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "attribution": "0.1",
+        "id": "1784000000001-eeee0005",
+        "effect_id": "1784000000001-dddd0004",
+        "cause": "1784000000001-bbbb0002",
+        "method": "exclusive-command-window",
+        "confidence_ppm": 1000000,
+        "support": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ]
+      },
+      "why": "exclusive-command-window may not claim certainty: the observer cannot exclude a writer it did not start (§7.6)"
+    },
+    {
+      "name": "shape-attribution-out-of-range",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "attribution": "0.1",
+        "id": "1784000000001-eeee0005",
+        "effect_id": "1784000000001-dddd0004",
+        "cause": "1784000000001-bbbb0002",
+        "method": "exclusive-command-window",
+        "confidence_ppm": 1000001,
+        "support": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ]
+      },
+      "why": "parts per million has a maximum"
+    },
+    {
+      "name": "shape-attribution-unregistered-method",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "attribution": "0.1",
+        "id": "1784000000001-eeee0005",
+        "effect_id": "1784000000001-dddd0004",
+        "cause": "1784000000001-bbbb0002",
+        "method": "vibes",
+        "confidence_ppm": 999000,
+        "support": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ]
+      },
+      "why": "a confidence number means nothing without a defined method"
+    },
+    {
+      "name": "shape-effect-unregistered-kind",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "execution_id": "1784000000001-bbbb0002",
+        "kind": "file.touch",
+        "target": "src/auth.py",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "1000000000000000000000000000000000000000",
+        "entities": []
+      },
+      "why": "a reader meeting an unregistered kind cannot tell whether state was added or removed"
+    },
+    {
+      "name": "shape-effect-create-with-before",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "execution_id": "1784000000001-bbbb0002",
+        "kind": "file.create",
+        "target": "src/auth.py",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "1000000000000000000000000000000000000000",
+        "entities": []
+      },
+      "why": "a created file had no prior content"
+    },
+    {
+      "name": "shape-effect-modify-identical",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "execution_id": "1784000000001-bbbb0002",
+        "kind": "file.modify",
+        "target": "src/auth.py",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "0000000000000000000000000000000000000000",
+        "entities": []
+      },
+      "why": "before == after records no mutation"
+    },
+    {
+      "name": "shape-effect-delete-with-after",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "execution_id": "1784000000001-bbbb0002",
+        "kind": "file.delete",
+        "target": "src/auth.py",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "1000000000000000000000000000000000000000",
+        "entities": []
+      },
+      "why": "a deleted file has no after"
+    },
+    {
+      "name": "shape-effect-entities-nonempty",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "effect": "0.1",
+        "id": "1784000000001-dddd0004",
+        "execution_id": "1784000000001-bbbb0002",
+        "kind": "file.modify",
+        "target": "src/auth.py",
+        "before": "0000000000000000000000000000000000000000",
+        "after": "1000000000000000000000000000000000000000",
+        "entities": [
+          {
+            "scope": "login"
+          }
+        ]
+      },
+      "why": "entities is reserved in 0.1 — a v0.1 reader must never be handed semantics it will silently drop"
+    },
+    {
+      "name": "shape-execution-exited-null-code",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": null,
+        "ts": 1784000000
+      },
+      "why": "a process that exited returned a code"
+    },
+    {
+      "name": "shape-execution-killed-with-code",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "killed",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "a killed process never returned 0; recording one is the lie §2.4 exists to prevent"
+    },
+    {
+      "name": "shape-execution-exit-code-256",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 256,
+        "ts": 1784000000
+      },
+      "why": "an exit status is 0..255"
+    },
+    {
+      "name": "shape-execution-unregistered-runtime",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "a",
+          "runtime": "mcp@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "unregistered means invalid, so a forward-dated runtime cannot mean valid here and invalid elsewhere (§7)"
+    },
+    {
+      "name": "shape-execution-shell-multi-arg",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "a",
+          "runtime": "shell@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "sh",
+          "-c",
+          "echo hi"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "shell@v1 is one script element; the argv form is exec@v1"
+    },
+    {
+      "name": "shape-execution-state-not-hex64",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "execution": "0.1",
+        "id": "1784000000001-bbbb0002",
+        "intent_id": "1784000000000-aaaa0001",
+        "executor": {
+          "actor": "agent-a@host",
+          "runtime": "exec@v1"
+        },
+        "input_state": "0000000000000000000000000000000000000000",
+        "output_state": "1000000000000000000000000000000000000000000000000000000000000000",
+        "invocation": [
+          "bash",
+          "change.sh"
+        ],
+        "environment": "0000000000000000000000000000000000000000000000000000000000000000",
+        "status": "exited",
+        "exit_code": 0,
+        "ts": 1784000000
+      },
+      "why": "a git tree id in a StateID position is the pre-0.1 confusion, and it is exactly 40 characters of it"
+    },
+    {
+      "name": "shape-claim-ski-runtime",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "ski@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "ski@v1 is RESERVED in claim 0.1: a verifier without a Σ-GLYPH oracle cannot evaluate it, so admitting it would split conforming verifiers"
+    },
+    {
+      "name": "shape-claim-unregistered-runtime",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "bash@v9",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "an unregistered validation runtime is a check nobody can re-run"
+    },
+    {
+      "name": "shape-claim-verdict-uppercase",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "PASS",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "the enum is lowercase; case-insensitive enums are how a spelling selects a code path"
+    },
+    {
+      "name": "shape-claim-check-is-text",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "pytest -q",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "the check is cited by HASH: a command echoed into a record is a description of a check, not the check"
+    },
+    {
+      "name": "shape-claim-evidence-unsorted",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "1000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "array order is significant in JCS, so an unsorted set has two hashes"
+    },
+    {
+      "name": "shape-claim-evidence-duplicate",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "a set does not repeat"
+    },
+    {
+      "name": "shape-claim-subject-not-hex64",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "claim": "0.1",
+        "id": "1784000000002-cccc0003",
+        "subject": "the auth change",
+        "predicate": "auth.rejects-expired",
+        "evidence": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "validation": {
+          "runtime": "cmd@v1",
+          "check": "0000000000000000000000000000000000000000000000000000000000000000",
+          "verdict": "pass",
+          "transcript": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "proposed_by": "agent-a@host",
+        "ts": 1784000000
+      },
+      "why": "the subject is a hash; prose here is what §3 addresses a decision by"
+    },
+    {
+      "name": "shape-intent-acceptance-ref-uppercase",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "intent": "0.1",
+        "id": "1784000000000-aaaa0001",
+        "actor": "agent-a@host",
+        "parent": null,
+        "objective": "reject expired tokens",
+        "constraints": [
+          "public API unchanged"
+        ],
+        "acceptance_refs": [
+          "000000000000000000000000000000000000000000000000000000000000000A"
+        ],
+        "ts": 1784000000
+      },
+      "why": "hashes are lowercase hex; two spellings would be two addresses"
+    },
+    {
+      "name": "shape-intent-empty-objective",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "intent": "0.1",
+        "id": "1784000000000-aaaa0001",
+        "actor": "agent-a@host",
+        "parent": null,
+        "objective": "",
+        "constraints": [
+          "public API unchanged"
+        ],
+        "acceptance_refs": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "ts": 1784000000
+      },
+      "why": "an intent with no objective declares nothing"
+    },
+    {
+      "name": "shape-state-commit-wrong-length",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "state": "0.1",
+        "repo_commit": "0000000000000000000000000000000000000000000000000000000000000000",
+        "worktree_tree": "0000000000000000000000000000000000000000",
+        "env_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "toolchain_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "why": "a commit id is hex40; hex64 here is a fingerprint pasted into a git field"
+    },
+    {
+      "name": "shape-state-fingerprint-wrong-length",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "state": "0.1",
+        "repo_commit": "0000000000000000000000000000000000000000",
+        "worktree_tree": "0000000000000000000000000000000000000000",
+        "env_fingerprint": "0000000000000000000000000000000000000000",
+        "toolchain_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "why": "and the same confusion in the other direction"
+    },
+    {
+      "name": "shape-env-probe-missing-var",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "environment_probe": "0.1",
+        "profile": "posix-base@v1",
+        "os": "Linux",
+        "arch": "x86_64",
+        "vars": {
+          "LANG": null,
+          "LC_ALL": null,
+          "PATH": null,
+          "TZ": null
+        }
+      },
+      "why": "the profile's five names are always present; absence is null, never an omitted member — otherwise two implementations hash two objects"
+    },
+    {
+      "name": "shape-env-probe-extra-var",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "environment_probe": "0.1",
+        "profile": "posix-base@v1",
+        "os": "Linux",
+        "arch": "x86_64",
+        "vars": {
+          "LANG": "en_US.UTF-8",
+          "LC_ALL": null,
+          "PATH": "/usr/bin:/bin",
+          "SOURCE_DATE_EPOCH": null,
+          "TZ": null,
+          "HOME": "/root"
+        }
+      },
+      "why": "a variable outside the profile changes the fingerprint and cannot be reproduced by a reader following the profile"
+    },
+    {
+      "name": "shape-env-probe-unregistered-profile",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "environment_probe": "0.1",
+        "profile": "everything@v1",
+        "os": "Linux",
+        "arch": "x86_64",
+        "vars": {
+          "LANG": "en_US.UTF-8",
+          "LC_ALL": null,
+          "PATH": "/usr/bin:/bin",
+          "SOURCE_DATE_EPOCH": null,
+          "TZ": null
+        }
+      },
+      "why": "an unregistered profile is a fingerprint nobody else can compute"
+    },
+    {
+      "name": "shape-toolchain-absent-with-hash",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "toolchain_probe": "0.1",
+        "profile": "posix-base@v1",
+        "tools": [
+          {
+            "name": "git",
+            "argv": [
+              "git",
+              "--version"
+            ],
+            "status": "absent",
+            "stdout_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "why": "a tool that was not there produced no output to hash"
+    },
+    {
+      "name": "shape-toolchain-ok-without-hash",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "toolchain_probe": "0.1",
+        "profile": "posix-base@v1",
+        "tools": [
+          {
+            "name": "git",
+            "argv": [
+              "git",
+              "--version"
+            ],
+            "status": "ok",
+            "stdout_sha256": null
+          }
+        ]
+      },
+      "why": "a probe that ran produced output, even if empty"
+    },
+    {
+      "name": "shape-toolchain-wrong-probe",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "toolchain_probe": "0.1",
+        "profile": "posix-base@v1",
+        "tools": [
+          {
+            "name": "git",
+            "argv": [
+              "git",
+              "version"
+            ],
+            "status": "ok",
+            "stdout_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "why": "the probe set IS the profile: a different argv is a different profile"
+    },
+    {
+      "name": "shape-toolchain-extra-probe",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "toolchain_probe": "0.1",
+        "profile": "posix-base@v1",
+        "tools": [
+          {
+            "name": "git",
+            "argv": [
+              "git",
+              "--version"
+            ],
+            "status": "ok",
+            "stdout_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "name": "python",
+            "argv": [
+              "python3",
+              "-V"
+            ],
+            "status": "ok",
+            "stdout_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "why": "an implementation that hashes its own runtime cannot agree with one written in another language"
+    },
+    {
+      "name": "shape-subject-effects-unsorted",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "claim_subject": "0.1",
+        "predicate": "auth.rejects-expired",
+        "execution_id": "1784000000001-bbbb0002",
+        "effects": [
+          {
+            "target": "b.py",
+            "kind": "file.modify",
+            "after": "1000000000000000000000000000000000000000"
+          },
+          {
+            "target": "a.py",
+            "kind": "file.modify",
+            "after": "1000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "why": "unsorted effects give one execution two subject hashes, and the subject hash is how §3 addresses the decision"
+    },
+    {
+      "name": "shape-subject-effects-duplicate",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "claim_subject": "0.1",
+        "predicate": "auth.rejects-expired",
+        "execution_id": "1784000000001-bbbb0002",
+        "effects": [
+          {
+            "target": "a.py",
+            "kind": "file.modify",
+            "after": "1000000000000000000000000000000000000000"
+          },
+          {
+            "target": "a.py",
+            "kind": "file.modify",
+            "after": "0000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "why": "one (target, kind) is one fact"
+    },
+    {
+      "name": "shape-artifact-negative-size",
+      "class": "shape",
+      "outcome": "invalid",
+      "record": {
+        "artifact": "0.1",
+        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "kind": "stdout",
+        "size": -1
+      },
+      "why": "a blob has a non-negative length"
+    },
+    {
+      "name": "bytes-duplicate-member",
+      "class": "bytes",
+      "outcome": "invalid",
+      "bytes_hex": "7b22696e74656e74223a22302e31222c226964223a2269222c226163746f72223a2261222c226163746f72223a2262222c22706172656e74223a6e756c6c2c226f626a656374697665223a226f222c22636f6e73747261696e7473223a5b5d2c22616363657074616e63655f72656673223a5b5d2c227473223a317d",
+      "why": "a record-shaped document is still refused at INGESTION when its bytes leave the §1 domain; the shape layer never sees it"
+    },
+    {
+      "name": "bytes-leading-bom",
+      "class": "bytes",
+      "outcome": "invalid",
+      "bytes_hex": "efbbbf7b227374617465223a22302e31222c227265706f5f636f6d6d6974223a6e756c6c2c22776f726b747265655f74726565223a2230303030303030303030303030303030303030303030303030303030303030303030303030303030222c22656e765f66696e6765727072696e74223a2230303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030222c22746f6f6c636861696e5f66696e6765727072696e74223a2230303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030227d",
+      "why": "the same record with a BOM would have a second address"
+    },
+    {
+      "name": "bytes-float-confidence",
+      "class": "bytes",
+      "outcome": "invalid",
+      "bytes_hex": "7b226174747269627574696f6e223a22302e31222c226964223a2261222c226566666563745f6964223a2265222c226361757365223a2263222c226d6574686f64223a226578636c75736976652d636f6d6d616e642d77696e646f77222c22636f6e666964656e63655f70706d223a302e3939392c22737570706f7274223a5b5d7d",
+      "why": "confidence as a float is outside the §1 domain before it is outside §2.6's range — both refusals are correct and the ingestion one comes first"
+    }
+  ]
+}

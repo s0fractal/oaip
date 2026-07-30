@@ -841,6 +841,447 @@ def loads_ijson(raw):
             "walked cannot be canonicalized, hashed or compared") from None
 
 
+# ---------- record shapes (SPEC §1.1, §2, §6.2) ----------
+# WHY A SCHEMA LAYER EXISTS AT ALL (2026-07-30, O3)
+# ------------------------------------------------
+# Until this section, "conformance" in this repository meant `examples/
+# vectors.json`: byte-exact canonicalization over a handful of records, plus 25
+# byte sequences the loader must refuse. That pins the SERIALIZER and says
+# nothing about the RECORD — and the reference implementation was, in fact,
+# writing a different record for every type in SPEC §2 (`oaip_record:
+# "intent@v1"` with `description` where §2.3 declares `intent: "0.1"` with
+# `actor`/`constraints`/`acceptance_refs`; no State records at all; nested
+# effects; `check`/`check_exit`/`supported` where §2.7 declares `validation`).
+# Both halves passed every vector, because no vector ever looked at a shape.
+#
+# So the shapes are now code, the code is pinned by `examples/record-vectors.
+# json`, and every reader in this file runs them. The negative half is the half
+# that matters: an implementation that accepts everything passes every positive
+# vector, and the same is true one layer up — a validator that accepts every
+# object validates nothing.
+RECORD_TYPES = ("artifact", "attribution", "claim", "claim_subject", "effect",
+                "environment_probe", "execution", "intent", "state",
+                "toolchain_probe")
+RECORD_VERSION = "0.1"                  # the only version this reader knows
+LEGACY_TAG = "oaip_record"
+_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+$")
+_TAGNAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_LEGACY_RE = re.compile(r"^[a-z_]+@v[0-9]+$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+
+# §7 registries, as data. An unregistered value in a CLOSED field makes the
+# record invalid (§7): unknown-means-invalid is what stops a forward-dated value
+# from meaning "valid" here and "invalid" in a second implementation.
+EXECUTOR_RUNTIMES = {"exec@v1", "shell@v1"}
+VALIDATION_RUNTIMES = {"cmd@v1"}        # ski@v1 is RESERVED in claim 0.1 (§7.3)
+VALIDATION_RESERVED = {"ski@v1"}
+EFFECT_KINDS = {"file.create", "file.modify", "file.delete", "file.typechange"}
+ENV_PROFILES = {"posix-base@v1"}
+TOOLCHAIN_PROFILES = {"posix-base@v1"}
+# §2.2.1: exactly these five names, always present, absence encoded as null.
+ENV_PROFILE_VARS = ("LANG", "LC_ALL", "PATH", "SOURCE_DATE_EPOCH", "TZ")
+# §2.2.2: exactly this probe, in this order.
+TOOLCHAIN_PROFILE_TOOLS = ({"name": "git", "argv": ["git", "--version"]},)
+# §7.6: the ceiling is BELOW certainty on purpose — an observer that started one
+# process cannot exclude a writer it did not start.
+ATTRIBUTION_METHODS = {"exclusive-command-window": 999999}
+
+
+def classify_record(doc):
+    """SPEC §1.1: what IS this document? -> (outcome, type, version, detail).
+
+    outcome is one of: "record" (known type+version, shape not yet checked),
+    "unsupported-version", "unknown-type", "legacy", "invalid", "not-a-record".
+    The order of the tests is normative (§1.1) — without a fixed order two
+    readers issue two different refusals for one document."""
+    if not isinstance(doc, dict):
+        return "not-a-record", None, None, None
+    tags = [k for k in doc if k in RECORD_TYPES]
+    if len(tags) > 1:
+        return ("invalid", None, None,
+                "carries " + str(len(tags)) + " type tags (" +
+                ", ".join(sorted(tags)) + "): a document that is two record "
+                "types is neither")
+    if tags:
+        t = tags[0]
+        v = doc[t]
+        if not (isinstance(v, str) and _VERSION_RE.match(v)):
+            return ("invalid", t, None,
+                    f"the type tag {t!r} carries {v!r}, which is not a version "
+                    "string — the type is known and its version is not, and "
+                    "guessing one is what §1.1 forbids")
+        if v != RECORD_VERSION:
+            return ("unsupported-version", t, v,
+                    f"{t} {v} is not a version this reader knows (it reads "
+                    f"{RECORD_VERSION}); it is neither valid nor corrupt")
+        return "record", t, v, None
+    legacy = doc.get(LEGACY_TAG)
+    if isinstance(legacy, str) and _LEGACY_RE.match(legacy):
+        return "legacy", legacy, None, None
+    for k, v in doc.items():
+        if (isinstance(k, str) and _TAGNAME_RE.match(k)
+                and isinstance(v, str) and _VERSION_RE.match(v)):
+            return ("unknown-type", k, v,
+                    f"{k!r} is not a registered OAIP record type (§7.1)")
+    return "not-a-record", None, None, None
+
+
+def _hex64(v):
+    return isinstance(v, str) and bool(HEX64.match(v))
+
+
+def _hex40(v):
+    return isinstance(v, str) and bool(HEX40.match(v))
+
+
+def _int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _text(v):
+    return isinstance(v, str) and v != ""
+
+
+def _closed(doc, required, optional=()):
+    """Members exactly `required`, plus at most `optional`. §1.1: an unknown
+    member makes the record invalid, because a member one reader ignores and
+    another reads is a member about which two readers derive different graphs
+    from identical bytes."""
+    have = set(doc)
+    unknown = sorted(have - set(required) - set(optional))
+    if unknown:
+        return f"unknown member(s) {', '.join(repr(u) for u in unknown)}"
+    missing = sorted(set(required) - have)
+    if missing:
+        return f"missing required member(s) {', '.join(repr(m) for m in missing)}"
+    return None
+
+
+def _hash_list(v, what, elem=_hex64, kind="hex64"):
+    if not isinstance(v, list):
+        return f"{what} must be an array"
+    for h in v:
+        if not elem(h):
+            return f"{what} must contain only {kind} values (found {h!r})"
+    if v != sorted(v):
+        return f"{what} must be sorted ascending (array order is significant)"
+    if len(set(v)) != len(v):
+        return f"{what} must not repeat a value"
+    return None
+
+
+def _v_artifact(d):
+    e = _closed(d, ("artifact", "hash", "kind", "size"))
+    if e:
+        return e
+    if not _hex64(d["hash"]):
+        return "hash must be hex64"
+    if not _text(d["kind"]):
+        return "kind must be a non-empty string"
+    if not _int(d["size"]) or d["size"] < 0:
+        return "size must be a non-negative integer"
+    return None
+
+
+def _v_state(d):
+    e = _closed(d, ("state", "repo_commit", "worktree_tree", "env_fingerprint",
+                    "toolchain_fingerprint"))
+    if e:
+        return e
+    if not (d["repo_commit"] is None or _hex40(d["repo_commit"])):
+        return "repo_commit must be hex40 or null (null = no commit yet)"
+    if not _hex40(d["worktree_tree"]):
+        return "worktree_tree must be a hex40 git tree id"
+    for f in ("env_fingerprint", "toolchain_fingerprint"):
+        if not _hex64(d[f]):
+            return f"{f} must be hex64 (§2.2.1/§2.2.2)"
+    return None
+
+
+def _v_environment_probe(d):
+    e = _closed(d, ("environment_probe", "profile", "os", "arch", "vars"))
+    if e:
+        return e
+    if d["profile"] not in ENV_PROFILES:
+        return (f"profile {d['profile']!r} is not registered (§7.5) — an "
+                "unregistered profile is a fingerprint nobody else can reproduce")
+    if not (_text(d["os"]) and _text(d["arch"])):
+        return "os and arch must be non-empty strings (§2.2.3)"
+    v = d["vars"]
+    if not isinstance(v, dict):
+        return "vars must be an object"
+    extra = sorted(set(v) - set(ENV_PROFILE_VARS))
+    missing = sorted(set(ENV_PROFILE_VARS) - set(v))
+    if extra or missing:
+        return ("vars must carry EXACTLY the profile's five names"
+                + (f"; unexpected {extra}" if extra else "")
+                + (f"; missing {missing} (absence is encoded as null, never by "
+                   "omitting the member)" if missing else ""))
+    for name in ENV_PROFILE_VARS:
+        if not (v[name] is None or isinstance(v[name], str)):
+            return f"vars.{name} must be a string or null"
+    return None
+
+
+def _v_toolchain_probe(d):
+    e = _closed(d, ("toolchain_probe", "profile", "tools"))
+    if e:
+        return e
+    if d["profile"] not in TOOLCHAIN_PROFILES:
+        return f"profile {d['profile']!r} is not registered (§7.5)"
+    tools = d["tools"]
+    if not isinstance(tools, list) or len(tools) != len(TOOLCHAIN_PROFILE_TOOLS):
+        return (f"tools must hold exactly {len(TOOLCHAIN_PROFILE_TOOLS)} probe(s), "
+                "in the profile's order")
+    for got, want in zip(tools, TOOLCHAIN_PROFILE_TOOLS):
+        if not isinstance(got, dict):
+            return "each tool must be an object"
+        err = _closed(got, ("name", "argv", "status", "stdout_sha256"))
+        if err:
+            return f"tool: {err}"
+        if got["name"] != want["name"] or got["argv"] != want["argv"]:
+            return (f"tool {got.get('name')!r} does not match the profile's probe "
+                    f"{want['name']!r} {want['argv']} — the probe set IS the "
+                    "profile")
+        if got["status"] not in ("ok", "absent", "error"):
+            return "tool.status must be ok | absent | error"
+        h = got["stdout_sha256"]
+        if got["status"] == "absent":
+            if h is not None:
+                return "an absent tool produced no stdout: stdout_sha256 must be null"
+        elif not _hex64(h):
+            return "stdout_sha256 must be hex64 unless the tool was absent"
+    return None
+
+
+def _v_intent(d):
+    e = _closed(d, ("intent", "id", "actor", "parent", "objective",
+                    "constraints", "acceptance_refs", "ts"))
+    if e:
+        return e
+    for f in ("id", "actor", "objective"):
+        if not _text(d[f]):
+            return f"{f} must be a non-empty string"
+    if not (d["parent"] is None or _text(d["parent"])):
+        return "parent must be an intent id or null"
+    if not (isinstance(d["constraints"], list)
+            and all(_text(c) for c in d["constraints"])):
+        return "constraints must be an array of non-empty strings"
+    err = _hash_list(d["acceptance_refs"], "acceptance_refs")
+    if err:
+        return err
+    if not _int(d["ts"]):
+        return "ts must be an integer (Unix seconds)"
+    return None
+
+
+def _v_execution(d):
+    e = _closed(d, ("execution", "id", "intent_id", "executor", "input_state",
+                    "output_state", "invocation", "environment", "status",
+                    "exit_code", "ts"))
+    if e:
+        return e
+    if not _text(d["id"]):
+        return "id must be a non-empty string"
+    if not (d["intent_id"] is None or _text(d["intent_id"])):
+        return "intent_id must be an intent id or null"
+    ex = d["executor"]
+    if not isinstance(ex, dict):
+        return "executor must be an object"
+    err = _closed(ex, ("actor", "runtime"))
+    if err:
+        return f"executor: {err}"
+    if not _text(ex["actor"]):
+        return "executor.actor must be a non-empty string"
+    if ex["runtime"] not in EXECUTOR_RUNTIMES:
+        return (f"executor.runtime {ex['runtime']!r} is not registered (§7.2); "
+                "the runtime is what says how `invocation` is interpreted")
+    for f in ("input_state", "output_state", "environment"):
+        if not _hex64(d[f]):
+            return f"{f} must be hex64 (a StateID, §2.2)" if f.endswith("state") \
+                   else f"{f} must be hex64 (§2.2.1)"
+    inv = d["invocation"]
+    if not (isinstance(inv, list) and inv and all(isinstance(s, str) for s in inv)):
+        return ("invocation must be a non-empty array of strings — a joined "
+                "string cannot reconstruct an argv vector (§2.4)")
+    if ex["runtime"] == "shell@v1" and len(inv) != 1:
+        return ("shell@v1 takes EXACTLY one invocation element (the script); "
+                f"this record has {len(inv)}")
+    if d["status"] not in ("exited", "failed", "killed"):
+        return "status must be exited | failed | killed (§2.4)"
+    code = d["exit_code"]
+    if d["status"] == "exited":
+        if not _int(code) or not 0 <= code <= 255:
+            return "an exited process has an integer exit_code in 0..255"
+    elif code is not None:
+        return (f"a {d['status']} process never returned a code: exit_code must "
+                "be null")
+    if not _int(d["ts"]):
+        return "ts must be an integer (Unix seconds)"
+    return None
+
+
+def _v_effect(d):
+    e = _closed(d, ("effect", "id", "execution_id", "kind", "target", "before",
+                    "after"), optional=("entities",))
+    if e:
+        return e
+    for f in ("id", "execution_id", "target"):
+        if not _text(d[f]):
+            return f"{f} must be a non-empty string"
+    if d["kind"] not in EFFECT_KINDS:
+        return (f"kind {d['kind']!r} is not registered (§7.4); a reader that "
+                "meets an unregistered kind cannot tell whether state was added "
+                "or removed")
+    for f in ("before", "after"):
+        if not (d[f] is None or _hex40(d[f])):
+            return f"{f} must be a hex40 git blob id or null"
+    b, a = d["before"], d["after"]
+    if d["kind"] == "file.create" and not (b is None and a is not None):
+        return "file.create requires before=null and a non-null after"
+    if d["kind"] == "file.delete" and not (a is None and b is not None):
+        return "file.delete requires after=null and a non-null before"
+    if d["kind"] in ("file.modify", "file.typechange"):
+        if b is None or a is None:
+            return f"{d['kind']} requires both before and after"
+        if b == a:
+            return f"{d['kind']} with before == after records no mutation"
+    if "entities" in d:
+        if not isinstance(d["entities"], list):
+            return "entities must be an array"
+        if d["entities"]:
+            return ("entities is RESERVED in effect 0.1 and must be empty — a "
+                    "v0.1 reader must never be handed semantics it will "
+                    "silently drop (§2.5)")
+    return None
+
+
+def _v_attribution(d):
+    e = _closed(d, ("attribution", "id", "effect_id", "cause", "method",
+                    "confidence_ppm", "support"))
+    if e:
+        return e
+    for f in ("id", "effect_id", "cause"):
+        if not _text(d[f]):
+            return f"{f} must be a non-empty string"
+    if d["method"] not in ATTRIBUTION_METHODS:
+        return (f"method {d['method']!r} is not registered (§7.6) — a confidence "
+                "number means nothing without a named, defined method")
+    c = d["confidence_ppm"]
+    if not _int(c) or not 0 <= c <= 1000000:
+        return "confidence_ppm must be an integer in 0..1000000 (no floats)"
+    cap = ATTRIBUTION_METHODS[d["method"]]
+    if c > cap:
+        return (f"confidence_ppm {c} exceeds the ceiling {cap} registered for "
+                f"{d['method']!r} (§7.6): the observer cannot exclude a writer "
+                "it did not start, so this method may not claim certainty")
+    err = _hash_list(d["support"], "support")
+    if err:
+        return err
+    return None
+
+
+def _v_claim(d):
+    e = _closed(d, ("claim", "id", "subject", "predicate", "evidence",
+                    "validation", "proposed_by", "ts"))
+    if e:
+        return e
+    for f in ("id", "predicate", "proposed_by"):
+        if not _text(d[f]):
+            return f"{f} must be a non-empty string"
+    if not _hex64(d["subject"]):
+        return "subject must be hex64 (the hash of a claim_subject, §2.8)"
+    err = _hash_list(d["evidence"], "evidence")
+    if err:
+        return err
+    v = d["validation"]
+    if not isinstance(v, dict):
+        return "validation must be an object"
+    err = _closed(v, ("runtime", "check", "verdict", "transcript"))
+    if err:
+        return f"validation: {err}"
+    if v["runtime"] in VALIDATION_RESERVED:
+        return (f"validation.runtime {v['runtime']!r} is RESERVED in claim 0.1 "
+                "(§7.3): a v0.1 verifier without a Σ-GLYPH oracle cannot "
+                "evaluate it, so admitting it would make conforming verifiers "
+                "disagree")
+    if v["runtime"] not in VALIDATION_RUNTIMES:
+        return f"validation.runtime {v['runtime']!r} is not registered (§7.3)"
+    for f in ("check", "transcript"):
+        if not _hex64(v[f]):
+            return (f"validation.{f} must be hex64 — the check is EVIDENCE, so "
+                    "the record cites the bytes that ran, not a description "
+                    "of them")
+    if v["verdict"] not in ("pass", "fail"):
+        return "validation.verdict must be pass | fail"
+    if not _int(d["ts"]):
+        return "ts must be an integer (Unix seconds)"
+    return None
+
+
+def _v_claim_subject(d):
+    e = _closed(d, ("claim_subject", "predicate", "execution_id", "effects"))
+    if e:
+        return e
+    for f in ("predicate", "execution_id"):
+        if not _text(d[f]):
+            return f"{f} must be a non-empty string"
+    effects = d["effects"]
+    if not isinstance(effects, list):
+        return "effects must be an array"
+    keys = []
+    for el in effects:
+        if not isinstance(el, dict):
+            return "each effects element must be an object"
+        err = _closed(el, ("target", "kind", "after"))
+        if err:
+            return f"effects element: {err}"
+        if not _text(el["target"]):
+            return "effects[].target must be a non-empty string"
+        if el["kind"] not in EFFECT_KINDS:
+            return f"effects[].kind {el['kind']!r} is not registered (§7.4)"
+        if not (el["after"] is None or _hex40(el["after"])):
+            return "effects[].after must be a hex40 git blob id or null"
+        keys.append((el["target"], el["kind"]))
+    if keys != sorted(keys):
+        return ("effects must be sorted by (target, kind): array order is "
+                "significant in JCS, and this array's hash IS the decision's "
+                "subject (§2.8)")
+    if len(set(keys)) != len(keys):
+        return "effects must not repeat a (target, kind) pair"
+    return None
+
+
+VALIDATORS = {
+    "artifact": _v_artifact,
+    "attribution": _v_attribution,
+    "claim": _v_claim,
+    "claim_subject": _v_claim_subject,
+    "effect": _v_effect,
+    "environment_probe": _v_environment_probe,
+    "execution": _v_execution,
+    "intent": _v_intent,
+    "state": _v_state,
+    "toolchain_probe": _v_toolchain_probe,
+}
+
+
+def validate_record(doc):
+    """SPEC §6.2 -> (outcome, type, version, detail).
+
+    outcome ∈ {valid, invalid, unsupported-version, unknown-type, legacy,
+    not-a-record}. `unsupported-version` and `unknown-type` are DISTINCT from
+    both valid and invalid and callers must keep them so: collapsing them into
+    "valid" reads a record this code does not understand, and collapsing them
+    into "invalid" calls a future record corrupt, which makes a
+    forward-compatible writer indistinguishable from an attacker."""
+    outcome, t, v, detail = classify_record(doc)
+    if outcome != "record":
+        return outcome, t, v, detail
+    err = VALIDATORS[t](doc)
+    return ("invalid" if err else "valid"), t, v, err
+
+
 def read_artifact(path: Path):
     """Load an artifact, refusing bytes that do not hash to their own address.
 
@@ -2322,6 +2763,53 @@ def cmd_conformance(a):
     sys.exit(0 if ok == total else 1)
 
 
+def cmd_records(a):
+    """SPEC §10: the RECORD-SHAPE vectors, positive and negative.
+
+    `conformance` pins the serializer; this pins what a record IS. The two are
+    not the same check and this repository shipped only the first one for its
+    whole life — which is how the reference implementation came to write a
+    different record from the one SPEC §2 declares for every single type while
+    reporting ALL PASS.
+
+    Every reject vector names the OUTCOME it must produce, not merely "not
+    valid": `unsupported-version` and `unknown-type` are distinct from
+    `invalid`, and an implementation that returns one for the other has a real
+    interoperability bug (§6.2) that a boolean assertion would hide."""
+    doc = json.loads(Path(a.vectors).read_text(encoding="utf-8"))
+    ok = total = 0
+    for v in doc["accept"]:
+        total += 1
+        outcome, t, ver, detail = validate_record(v["record"])
+        good = (outcome == "valid" and t == v["type"] and ver == v["version"])
+        print(("OK   " if good else "FAIL "), f"accept/{v['type']}/{v['name']}",
+              "" if good else f"-> {outcome} {t}/{ver} {detail or ''}")
+        ok += good
+    for v in doc["reject"]:
+        total += 1
+        want = v["outcome"]
+        if "bytes_hex" in v:
+            # These leave the §1 domain, so they are refused at INGESTION and the
+            # shape layer never sees them. A vector whose refusal comes from the
+            # wrong layer is still a pass here, and saying which layer refused it
+            # is the point of printing the detail.
+            try:
+                rec = loads_ijson(bytes.fromhex(v["bytes_hex"]))
+                outcome, detail = validate_record(rec)[0], "shape layer"
+            except (ValueError, UnicodeDecodeError) as e:
+                outcome, detail = "invalid", f"ingestion: {e}"
+        else:
+            outcome, _t, _ver, detail = validate_record(v["record"])
+        good = outcome == want
+        print(("OK   " if good else "FAIL "),
+              f"reject/{v['class']}/{v['name']}",
+              "" if good else f"-> {outcome}, wanted {want} ({detail or ''})")
+        ok += good
+    tag = "ALL PASS" if ok == total else "FAILURES"
+    print(f"\nOAIP-RECORDS: {tag} ({ok}/{total})")
+    sys.exit(0 if ok == total else 1)
+
+
 def main():
     ap = argparse.ArgumentParser(prog="oaip", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2357,6 +2845,10 @@ def main():
     prb.set_defaults(fn=cmd_rebuild)
     sub.add_parser("verify").set_defaults(fn=cmd_verify)
     pf = sub.add_parser("conformance"); pf.add_argument("vectors", nargs="?", default="examples/vectors.json"); pf.set_defaults(fn=cmd_conformance)
+    pv = sub.add_parser("records", help="record-SHAPE conformance vectors "
+                        "(SPEC §10) — what a record is, not how it serializes")
+    pv.add_argument("vectors", nargs="?", default="examples/record-vectors.json")
+    pv.set_defaults(fn=cmd_records)
     a = ap.parse_args()
     if a.cmd in ("run", "do") and a.command and a.command[0] == "--":
         a.command = a.command[1:]

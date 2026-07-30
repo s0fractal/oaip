@@ -49,6 +49,14 @@ CHECKS = [
     ("canonicalization conformance (§1 vectors: byte-exact AND must-reject)",
      ["python3", "impl/oaip.py", "conformance", "examples/vectors.json"], None,
      "OAIP-CONFORMANCE: ALL PASS"),
+    # The other half of "conformance", and the half that did not exist until
+    # 2026-07-30: the vectors above pin the SERIALIZER, these pin what a record
+    # IS. While only the first existed, the reference implementation wrote a
+    # different record from SPEC §2 for every type in the specification and
+    # reported ALL PASS the whole time.
+    ("record-shape conformance (§10 vectors: valid shapes AND must-reject)",
+     ["python3", "impl/oaip.py", "records", "examples/record-vectors.json"],
+     None, "OAIP-RECORDS: ALL PASS"),
     ("canonical layer integrity (forged artifacts, §5 truth)",
      ["python3", "tests/canonical_layer.py"], None,
      "CANONICAL-LAYER: ALL PASS"),
