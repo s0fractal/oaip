@@ -141,7 +141,17 @@ and move with one command: `oaip trust-root --migrate`.
 `v0.1` DRAFT — see [`SPEC.md`](SPEC.md). Reference implementation in
 [`impl/oaip.py`](impl/oaip.py) (stdlib + the Warrant CLI), which as of
 2026-07-30 emits the records SPEC §2 declares; ledgers written before that are
-read under §6.4 legacy mode and marked, never rewritten. The wedge is
+read under §6.4 legacy mode and marked, never rewritten.
+
+**Requires Warrant SPEC v0.4 / package ≥ 0.6.0** (CI pins commit `8508a4a`).
+Warrant v0.4 changed the bytes an Ed25519 signature covers to
+`"warrant-sig-v1:" || WarrantID`, OAIP verifies that signature itself, and the
+old and new constructions are disjoint on purpose — so an older Warrant makes
+every acceptance fail, and a `.oaip/warrants` store signed before 2026-07-31
+needs `warrant resign --key <keyfile>` once before it yields an acceptance edge
+again. Re-signing moves no WarrantID and changes nothing else in the graph.
+This is deliberately **not** the §6.4 legacy path: a superseded signature is
+refused and diagnosed, never read in a weaker mode (SPEC §8.6). The wedge is
 **provable agent-action acceptance for regulated / multi-agent development**, not
 a general dev tool; for a solo human in an IDE, git is enough.
 
