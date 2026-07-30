@@ -234,11 +234,23 @@ def part_a():
         s = env["sigs"][0]
         case("a REAL warrant signature verifies under OAIP's own Ed25519 check",
              O.signature_verifies(p.stem, s), f"{p.stem[:12]} {s}")
-        case("the signed message is the WarrantID OAIP recomputes itself",
-             p.stem == sha256(canon(env["body"])))
+        case("the WarrantID the message is built from is one OAIP recomputes "
+             "itself", p.stem == sha256(canon(env["body"])))
         bad = dict(s, sig="ab" * 64)
         case("the same entry with garbage `sig` does NOT verify",
              not O.signature_verifies(p.stem, bad))
+        # THE DEPENDENCY, MEASURED RATHER THAN PINNED. The line above says a real
+        # signature verifies; this one says WHICH message it was over, against
+        # the Warrant CLI that is actually installed. A pin in a YAML file is a
+        # claim about a checkout; this is the claim that matters.
+        case("the CLI that signed it signed the v0.4 message, not the bare "
+             "WarrantID (Warrant SPEC §5 warrant-sig-v1)",
+             O.ed25519_verify(bytes.fromhex(s["key"]), O.sig_message(p.stem),
+                              bytes.fromhex(s["sig"]))
+             and not O.ed25519_verify(bytes.fromhex(s["key"]),
+                                      bytes.fromhex(p.stem),
+                                      bytes.fromhex(s["sig"])),
+             f"the configured Warrant CLI ({' '.join(wcli())}) is pre-0.6.0")
 
 
 def forge(work, key_hex, actor="tester@local", sig="ab" * 64):
@@ -396,7 +408,7 @@ def part_c():
         # A SECOND ENDORSER. Warrant SPEC §5 permits appending a co-signature to a
         # filed record — the envelope is not hashed, only the body is — and
         # deliberately will not let one invalidate a good record.
-        pub, sig = ed25519_sign(bytes.fromhex("11" * 32), bytes.fromhex(wid))
+        pub, sig = ed25519_sign(bytes.fromhex("11" * 32), O.sig_message(wid))
         env["sigs"].append({"actor": "cosigner@other", "key": pub.hex(),
                             "sig": sig.hex()})
         p.write_text(json.dumps(env))
@@ -534,7 +546,7 @@ def part_e():
 
         # A REAL second endorser, kept across the flood: the bounded path must not
         # be "stop looking", it must be "stop verifying what cannot decide".
-        pub, sig = ed25519_sign(bytes.fromhex("11" * 32), bytes.fromhex(wid))
+        pub, sig = ed25519_sign(bytes.fromhex("11" * 32), O.sig_message(wid))
         env["sigs"].append({"actor": "cosigner@other", "key": pub.hex(),
                             "sig": sig.hex()})
         p.write_text(json.dumps(env))
@@ -606,7 +618,7 @@ def file_accept(work, body, seed, actor):
     WARNING by specification (§5, §5.1), so the store still verifies at 0 errors
     and the record reaches OAIP's own gate."""
     wid = sha256(canon(body))
-    pub, sig = ed25519_sign(seed, bytes.fromhex(wid))
+    pub, sig = ed25519_sign(seed, O.sig_message(wid))
     (work / ".oaip" / "warrants" / "records" / f"{wid}.json").write_text(
         json.dumps({"body": body, "sigs": [{"actor": actor, "key": pub.hex(),
                                             "sig": sig.hex()}]}))
@@ -726,6 +738,179 @@ def part_g():
         case("and it is in the keyring", pub.hex() in trust.read_text())
 
 
+def part_h():
+    """Warrant SPEC v0.4 §5: WHICH BYTES does a Warrant key cover?
+
+    OAIP verifies Ed25519 itself (the whole point of part A), so OAIP holds its
+    own copy of the construction — and on 2026-07-31 upstream changed it:
+
+        v0.3, warrant <= 0.5.x   msg = WarrantID_raw                    32 bytes
+        v0.4, warrant >= 0.6.0   msg = b"warrant-sig-v1:" || WarrantID  47 bytes
+
+    Two copies of one rule is a rule that can drift, and the drift is silent in
+    the worst possible direction: the verifier stays green against its own
+    fixtures while disagreeing with the CLI about what a valid signature is. The
+    unit half below pins the construction itself, in both directions, so a
+    regression cannot hide behind "well, SOMETHING verified".
+
+    THE DISJOINTNESS IS THE PROPERTY, not the prefix. Exactly one message
+    verifies for a given (key, sig, WarrantID) and never both — there is no
+    dual-accept window at any time under any flag (Warrant DEC-001 §4.3). A
+    verifier that accepted both would have no domain separation at all."""
+    wid = sha256(b"a warrant id to sign")
+    seed = bytes.fromhex("77" * 32)
+
+    case("the separator is the 15 ASCII bytes SPEC §5 names",
+         O.SIG_DOMAIN == b"warrant-sig-v1:" and len(O.SIG_DOMAIN) == 15,
+         O.SIG_DOMAIN)
+    msg = O.sig_message(wid)
+    case("the signed message is the separator || the 32 RAW WarrantID bytes, "
+         "47 bytes total",
+         msg == b"warrant-sig-v1:" + bytes.fromhex(wid) and len(msg) == 47,
+         f"{len(msg)} bytes: {msg!r}")
+
+    pub_v1, sig_v1 = ed25519_sign(seed, msg)
+    pub_old, sig_old = ed25519_sign(seed, bytes.fromhex(wid))
+    e_v1 = {"actor": "a@b", "key": pub_v1.hex(), "sig": sig_v1.hex()}
+    e_old = {"actor": "a@b", "key": pub_old.hex(), "sig": sig_old.hex()}
+
+    case("a signature over the v0.4 message VERIFIES",
+         O.signature_verifies(wid, e_v1))
+    case("a signature by the SAME key over the bare WarrantID does NOT verify "
+         "(this is the change)", not O.signature_verifies(wid, e_old))
+    case("`legacy_signature` recognises the pre-v1 one",
+         O.legacy_signature(wid, e_old))
+    case("...and does NOT also fire on the current one — the two constructions "
+         "are disjoint, so a diagnosis can never be ambiguous",
+         not O.legacy_signature(wid, e_v1))
+    # The direction that would matter if someone "fixed" the drift by accepting
+    # both: there must be no input for which both predicates are true.
+    case("no entry is ever both accepted and diagnosed as legacy",
+         not any(O.signature_verifies(wid, e) and O.legacy_signature(wid, e)
+                 for e in (e_v1, e_old)))
+    case("`legacy_signature` is total in the same inputs as the gate",
+         O.legacy_signature(None, e_old) is False
+         and O.legacy_signature(wid, "not an object") is False
+         and O.legacy_signature(wid, {"key": "zz", "sig": "zz"}) is False)
+    # The report string is NORMATIVE (Warrant SPEC §5): a consumer branches on
+    # these exact bytes, so a paraphrase here is a conformance break.
+    case("the diagnosis is the exact §5 report string, and names the remedy",
+         O.LEGACY_SIG_MESSAGE ==
+         'signature does not verify (excluded): LEGACY pre-v1 signature '
+         'construction (signed the bare 32-byte WarrantID; SPEC 5 requires '
+         '"warrant-sig-v1:" || WarrantID). Re-sign with: warrant resign '
+         '--key <keyfile>', O.LEGACY_SIG_MESSAGE)
+
+    # --- THE END-TO-END HALF: a pre-v1 signature must never produce an
+    # acceptance edge. This is a real store, signed by the ledger's OWN key,
+    # BOUND to the ledger's own actor in its own keyring — every check except
+    # the construction passes. It is exactly a user's store from before the flag
+    # day, and it is exactly what must not quietly work.
+    with tempfile.TemporaryDirectory() as tmp:
+        work, run = make_repo(tmp, "prev1")
+        r = run("do", "--intent", "real work", "--check", "test -f f.txt",
+                "--actor", "tester@local", "--", "sh", "-c", "echo hi > f.txt")
+        if "ACCEPTED" not in r.stdout:
+            case("setup(H): the one-shot flow accepted", False, r.stdout + r.stderr)
+            return
+        honest = edges(work)
+        case("setup(H): there is an acceptance edge to lose", len(honest) == 1,
+             honest)
+
+        keyfile = trust_root(work) / "dev.key"
+        seed = bytes.fromhex(keyfile.read_text().strip())
+        p, env = real_accept(work)
+        wid = p.stem
+        current = json.loads(json.dumps(env))       # kept for the control below
+        pub, old_sig = ed25519_sign(seed, bytes.fromhex(wid))
+        case("setup(H): the pre-v1 signature is by the ledger's OWN bound key "
+             "(nothing but the construction is wrong)",
+             pub.hex() == env["sigs"][0]["key"], pub.hex()[:16])
+        env["sigs"][0]["sig"] = old_sig.hex()
+        p.write_text(json.dumps(env))
+        case("setup(H): and it really is a VALID pre-v1 signature",
+             O.legacy_signature(wid, env["sigs"][0])
+             and not O.signature_verifies(wid, env["sigs"][0]))
+
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("a pre-v1 signature makes the rebuild fail closed, not exit 0 with "
+             "a silently smaller graph", r.returncode != 0, out[-400:])
+        case("...and the refusal NAMES the construction and the remedy, not "
+             "just 'does not verify'",
+             O.LEGACY_SIG_MESSAGE in out, out[-800:])
+        case("...and says it is not the §6.4 legacy-read path, so nobody "
+             "reaches for --allow-legacy-links",
+             "8.6" in out and "disjoint" in out, out[-800:])
+        case("...and it marks the projection untrusted, so the edge the OLD "
+             "projection still holds is disowned rather than left readable",
+             (work / ".oaip" / "projection.untrusted").is_file())
+        lg = run("log")
+        case("`oaip log` does not go on asserting the acceptance",
+             lg.returncode != 0 or "WARRANT" not in lg.stdout,
+             (lg.stdout + lg.stderr)[-300:])
+
+        # WHOSE REFUSAL WAS THAT, THOUGH? Not OAIP's. A current `warrant verify`
+        # reports the pre-v1 record as an ERROR, and OAIP refuses on a delegate
+        # error before its own per-record gate runs — so every assertion above
+        # would hold IDENTICALLY if `signature_verifies` had a dual-accept
+        # window in it. Measured: with `or ed25519_verify(pub,
+        # bytes.fromhex(wid), raw)` spliced into the gate, all five still passed.
+        # A check that cannot fail when the thing it names is broken is the
+        # defect class this repository keeps finding, so the delegate is now
+        # taken out of the answer entirely.
+        #
+        # The stub is the one from part B: a clean `warrant.verify-report@v0`,
+        # 0 errors, no findings. It cannot veto anything. What refuses now is
+        # OAIP's own in-process Ed25519 check and nothing else.
+        stub = work / "fakewarrant.py"
+        stub.write_text(STUB)
+        stub_env = {"WARRANT_CLI": f"{sys.executable} {stub}"}
+        r = run("rebuild", env=stub_env)
+        out = r.stdout + r.stderr
+        case("with the delegate NEUTRALISED (a stub reporting 0 errors), a "
+             "pre-v1 signature still derives NO acceptance edge — this is "
+             "OAIP's own gate, alone", edges(work) == [],
+             f"{edges(work)} | {out[-600:]}")
+        case("...and OAIP's own refusal names the construction and the remedy",
+             O.LEGACY_SIG_MESSAGE in out, out[-800:])
+        case("...and losing the edge is reported as a change to the graph, not "
+             "as a successful reconstruction (C2-F1b)",
+             r.returncode != 0 and "LOST an acceptance edge" in out, out[-500:])
+        # The control that makes the three lines above mean something: the SAME
+        # stub, the SAME store, with the signature put back to the current
+        # construction, must produce the edge. Otherwise "no edge" would only be
+        # evidence that a stub breaks rebuilds.
+        good = json.loads(json.dumps(env))
+        good["sigs"][0]["sig"] = current["sigs"][0]["sig"]
+        p.write_text(json.dumps(good))
+        r = run("rebuild", env=stub_env)
+        case("control: under the same stub, a v0.4 signature DOES produce the "
+             "edge — so the refusal above is about the construction, not about "
+             "the stub", edges(work) == honest,
+             f"{edges(work)} vs {honest} | {(r.stdout + r.stderr)[-400:]}")
+        p.write_text(json.dumps(env))           # back to pre-v1 for the remedy
+
+        # THE REMEDY, EXECUTED. A diagnosis naming a fix that does not work is
+        # worse than no diagnosis, so the sentence above is measured: run the
+        # command it prints and the edge must come back.
+        rs = subprocess.run(wcli() + ["--store", ".oaip/warrants", "resign",
+                                      "--key", str(keyfile)],
+                            cwd=work, capture_output=True, text=True)
+        case("`warrant resign --key <keyfile>` — the remedy the diagnosis names "
+             "— runs", rs.returncode == 0, (rs.stdout + rs.stderr)[-400:])
+        case("...and it re-signed without moving the WarrantID (the record is "
+             "at the same address)",
+             json.loads(p.read_text())["body"] == current["body"])
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("after the remedy the acceptance edge is back",
+             edges(work) == honest, f"{edges(work)} vs {honest} | {out[-400:]}")
+        case("...and that rebuild exits 0", r.returncode == 0, out[-300:])
+        case("...and says nothing more about a legacy construction",
+             O.LEGACY_SIG_MESSAGE not in out, out[-400:])
+
+
 def main():
     part_a()
     part_b()
@@ -734,6 +919,7 @@ def main():
     part_e()
     part_f()
     part_g()
+    part_h()
     print("\nSIGNATURE-GATE: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1
 

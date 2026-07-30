@@ -9,9 +9,15 @@ whether an action was correct, whether an intent was met, or which policy has
 authority. Those are the decision layer (Warrant) and the policy layer.
 
 **Normative dependencies.**
-- **Warrant SPEC v0.3** ([R3]) — the decision layer. OAIP **reuses Warrant §4
-  canonicalization verbatim** and bridges accepted claims into Warrant records
-  (§3). Not reimplemented here.
+- **Warrant SPEC v0.4** ([R3]), package **≥ 0.6.0** — the decision layer. OAIP
+  **reuses Warrant §4 canonicalization verbatim** and bridges accepted claims
+  into Warrant records (§3). Not reimplemented here.
+  **The lower bound is normative, not advisory.** Warrant v0.4 is a breaking
+  change to §5: the signed message is `"warrant-sig-v1:" || WarrantID_raw`
+  (47 bytes) and **not** the bare 32-byte WarrantID. OAIP verifies that
+  signature itself, in process (§8.3.1), so an implementation MUST use the v0.4
+  construction and MUST NOT accept the pre-v1 one — the two are disjoint, and a
+  verifier that took both would have no domain separation at all. See §8.6.
 - **RFC 8785 (JCS)** [R4], **RFC 7493 (I-JSON)** [R5], **RFC 8259 (JSON)** [R6] —
   through Warrant §4, and directly for §1.
 - **Σ-GLYPH Book I** [R7] (optional) — for `ski@v1` portable, budget-bounded
@@ -529,6 +535,14 @@ Reject / revise / supersede use Warrant's native `prior` chain
 it produces the subject and the evidence; Warrant owns the decision and its
 signature, hash-addressing, and settlement.
 
+**The signature on that record is Warrant's to define and OAIP's to check.** An
+acceptance edge (§5) MUST NOT be derived unless the signature by the actor the
+record names verifies under Warrant SPEC §5's current construction —
+`"warrant-sig-v1:" || WarrantID_raw` as of v0.4 — checked by the implementation
+itself and not delegated (§8.3.1), against a WarrantID the implementation
+recomputed from the record's own bytes. A signature valid only under a superseded
+construction is governed by §8.6.
+
 ## 4. The cardinal rule: execution success ≠ acceptance (MUST)
 
 Three distinct successes, **never** conflated:
@@ -829,7 +843,7 @@ a derived edge that nobody decided is neither.
 
 | Capability | Can forge an acceptance? | What they CAN do | Mechanism that stops them |
 |---|---|---|---|
-| **(a) The observed agent** — write access to the workspace, i.e. everything under the repository including `.oaip/`, running as the observer's uid *if unconfined* | **Not by workspace write alone** (default deployment). **Yes** if it also runs unconfined as the observer's uid | Write/delete artifacts and store records; plant a keyring at `.oaip/trust.json`; rewrite `.oaip/store.json`; edit the file a validation check tests **before the check runs**; cause refusals at will | Trust root (key + keyring) outside the workspace (§8.4 profile B) — the planted keyring is never read; in-process Ed25519 verification over the WarrantID OAIP recomputes; keyring binding; the signed `oaip-claim:<id>` link (§3). **Nothing stops the check-target rewrite** — see §8.5 SA-1 |
+| **(a) The observed agent** — write access to the workspace, i.e. everything under the repository including `.oaip/`, running as the observer's uid *if unconfined* | **Not by workspace write alone** (default deployment). **Yes** if it also runs unconfined as the observer's uid | Write/delete artifacts and store records; plant a keyring at `.oaip/trust.json`; rewrite `.oaip/store.json`; edit the file a validation check tests **before the check runs**; cause refusals at will | Trust root (key + keyring) outside the workspace (§8.4 profile B) — the planted keyring is never read; in-process Ed25519 verification over `"warrant-sig-v1:" \|\| WarrantID`, the WarrantID being one OAIP recomputes; keyring binding; the signed `oaip-claim:<id>` link (§3). **Nothing stops the check-target rewrite** — see §8.5 SA-1 |
 | **(b) A party with write access to the TRUST ROOT** | **Yes, completely** | Bind their own key to any actor, or read the key and sign directly | Nothing. This is the trust root's definition: whoever holds it decides. Mode bits (§8.3(4)) exclude *other accounts on the host*, not this party |
 | **(c) A party who controls the environment or PATH** | **Yes** | Set `OAIP_TRUST_ROOT`/`XDG_CONFIG_HOME` to a keyring they wrote; replace `git` or `sh` and lie about the snapshot; replace `$WARRANT_CLI` | Nothing for the trust root or the toolchain. `$WARRANT_CLI` alone is closed: signature validity is decided in process, so a hostile CLI can make OAIP **refuse** but not believe. The `posix-base@v1` probes (§2.2.1) record `PATH` but neither `OAIP_TRUST_ROOT` nor `XDG_CONFIG_HOME`, and they are a discriminator, not a barrier. The environment is part of the TCB and OAIP says so rather than pretending otherwise |
 | **(d) A party with read-only access to the workspace** | **No** | Read every record, claim, transcript and the projection; correlate what an agent did | Nothing needs to: no OAIP record is secret. The signing key is not in the workspace (profile B) and is not readable by anyone else on the host (§8.3(4)) |
@@ -842,10 +856,17 @@ work — is kept runnable in the same file.
 ### 8.3 The mechanisms, and what each is worth
 
 1. **In-process Ed25519 verification** (`ed25519_verify`, RFC 8032 [R14],
-   verify-only). The signature that decides is checked by OAIP itself, over the
-   WarrantID OAIP recomputed from the record's own bytes. Removes the delegate —
-   no program named by `$WARRANT_CLI` can manufacture an acceptance. Warrant is
-   still consulted and may still veto.
+   verify-only). The signature that decides is checked by OAIP itself, over
+   Warrant SPEC §5's domain-separated message — `"warrant-sig-v1:"` followed by
+   the 32 raw bytes of the WarrantID **OAIP recomputed from the record's own
+   bytes**, 47 bytes in total. Removes the delegate — no program named by
+   `$WARRANT_CLI` can manufacture an acceptance. Warrant is still consulted and
+   may still veto.
+   The cost of removing the delegate is that OAIP holds its own copy of that
+   construction, and two copies of one rule can drift; §8.6 states what OAIP
+   does when they have. The 15-byte separator also narrows §8.2 row (c): a
+   signature by one of this ledger's bound keys made in another protocol over a
+   bare 32-byte digest is no longer syntactically an OAIP acceptance.
 2. **Keyring binding** (`.../trust.json`, OAIP's own rule). An edge is derived
    only from a signature by the actor the record NAMES, under a key this ledger
    binds to that actor. Warrant SPEC §5 makes binding a report, never a failure,
@@ -957,6 +978,11 @@ holds the signing key chooses.** Legacy records also carry no `State`, so nothin
 about the environment they ran in can be re-checked: the only available
 fingerprint outcome is `unreproducible`.
 
+**SA-6 is about record SHAPE and stops there.** It does not extend, and MUST NOT
+be extended, to a signature made under a superseded construction: §8.6 states
+why, and its whole argument is that this assumption is the one thing that must
+not be reused there.
+
 **SA-7. "Conformant" is assumed on one implementation's agreement with itself.**
 There is one implementation (Python). The conformance vectors of §10 are checked
 by that implementation against itself, and a second implementation is what would
@@ -999,6 +1025,26 @@ therefore never in a snapshot and no effect over it is ever attributed. The
 snapshot now names every excluded path that is not a ledger; the exclusion itself
 stays, because leaving things out is the safe direction for a signing key.
 
+**SA-11. A bound key is assumed not to be used for anything else.** The keyring
+says a key MAY sign as an actor; **nothing says what else that key may sign.**
+Warrant SPEC §5's `warrant-sig-v1` separator means a signature made in another
+protocol over a bare 32-byte digest is no longer syntactically an acceptance here
+(§8.3.1) — a real narrowing, from "any protocol signing a bare 32-byte digest" to
+"any protocol whose signed message is `warrant-sig-v1:` followed by 32 bytes",
+which is this one. It is **not** closure: a key reused in a protocol that happens
+to prefix the same 15 bytes, or used for anything an OAIP acceptance does not
+describe, is outside what this format can reach. Key purpose is a PKI property
+and OAIP has no PKI (SA-3, SA-4).
+
+This assumption was **absent** before 2026-07-31, and its absence was a defect in
+this section by this section's own rule ("a limit found in neither and true is a
+defect in this section"). Until Warrant v0.4 the message an OAIP acceptance
+covered was a bare SHA-256 digest, byte-indistinguishable from an in-toto/DSSE
+payload digest — and `tools/intoto.py` puts one exactly one hop from this ledger
+— from a Σ-GLYPH NodeHash, or from a git object id. No `SA-n` said so. It is
+recorded here in its narrowed form rather than quietly dropped, because the
+residue is the part that is still true.
+
 #### Explicit non-goals
 
 **NG-1. Signing OAIP records themselves.** No OAIP record is signed (§8.1).
@@ -1034,6 +1080,67 @@ The remaining non-goals are matters of scope rather than of security and are
 listed once, in **§11**: semantic-entity extraction, an `Observation` stream, a
 Reaction runtime, federation and jurisdictions, and any opinion on whether an
 intent was satisfied or which policy has authority.
+
+### 8.6 Superseded signature constructions (MUST)
+
+Warrant SPEC v0.4 (package 0.6.0, 2026-07-31) replaced the §5 signed message
+with `"warrant-sig-v1:" || WarrantID_raw`. OAIP verifies that signature itself
+(§8.3.1), so OAIP has an opinion about records signed under the previous
+construction, and this section is it.
+
+**The rule.** An implementation:
+
+- **MUST** verify the current construction and **MUST NOT** derive an acceptance
+  edge from a signature valid only under a superseded one, under any flag, at any
+  time. There is no dual-accept window — a verifier accepting both has no domain
+  separation at all, since an adversary simply presents the older message.
+- **SHOULD** *diagnose* such a signature rather than reporting it as a generic
+  bad signature, and when it does, **MUST** use Warrant SPEC §5's exact report
+  string, which names the construction and the remedy (`warrant resign`). A
+  corrupted byte, a truncated file, a wrong key and a store from before the flag
+  day are otherwise one indistinguishable message, and the operator's next action
+  differs in every case.
+
+Refusal and diagnosis are not alternatives. **The refusal is unconditional and
+the diagnosis is a sentence about it** — a diagnosis that changed a verdict would
+be an acceptance path wearing a different name.
+
+**This is NOT §6.4 legacy-read mode, and conflating them would be a mistake.**
+The two look alike — both are "an old ledger, still on disk, written before a
+change" — and they are different in the one place that matters:
+
+| | §6.4 legacy-read (record shape) | §8.6 (signature construction) |
+|---|---|---|
+| The question | syntactic: the same facts, differently spelled | cryptographic: which bytes did the key cover? |
+| Old bytes are | fully trustworthy; only the spelling moved | not evidence of an OAIP acceptance at all |
+| Correct outcome | translate, mark as legacy, **derive the edge** | refuse, diagnose, **derive nothing** |
+| Operator control | `--allow-legacy-links`, a flag that WIDENS derivation | none, and none may be added |
+| Gated on | the store-format marker's `ts` — **which whoever holds the signing key chooses** (SA-6) | nothing; the construction is checked on every record, every time |
+| Remedy | none needed; migration is read-side | `warrant resign`, which rewrites `sigs` and moves no WarrantID |
+
+Two consequences of routing §8.6 through §6.4 are worth stating because each
+would be reached by an ordinary next step:
+
+1. §6.4 has a flag that widens what produces an edge. Giving signatures the same
+   framing eventually produces `--allow-legacy-signatures`, which is the
+   dual-accept window arriving through the back door.
+2. §6.4's second gate is the accept's own signed `ts` — a value SA-6 already
+   records as chosen by whoever holds the signing key. Applying that gate to
+   signatures would let that party select the weaker *cryptographic* rule by
+   choosing a timestamp, promoting SA-6's known weakness from "which claim was
+   accepted" to "is this signature valid at all". Strictly worse than SA-6.
+
+So the two paths share no flag, no code path and no vocabulary. An implementation
+that reports a superseded signature MUST NOT describe it as "legacy mode", and
+MUST NOT let a §6.4 legacy record reach a weaker signature rule.
+
+**Migration is not a format concern.** A record re-signed under the current
+construction keeps its WarrantID — the WarrantID is SHA-256 of the canonical body
+and the envelope is not hashed (Warrant §4/§5) — so no `evidence`, `under`,
+`prior`, `subject` or `oaip-claim:` reference moves, and the OAIP graph is
+unchanged. A record whose signing key no longer exists cannot be migrated at all;
+it stays in the store, readable and unaccepted, and no implementation may invent
+an edge for it.
 
 ## 9. Relationship to prior art (normative context)
 
@@ -1158,7 +1265,8 @@ rewritten — with the consequences §8.5 SA-6 records.
   BCP 14, RFC 2119, March 1997. <https://www.rfc-editor.org/rfc/rfc2119>
 - [R2] Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words",
   BCP 14, RFC 8174, May 2017. <https://www.rfc-editor.org/rfc/rfc8174>
-- [R3] Warrant SPEC v0.3, s0fractal. <https://github.com/s0fractal/warrant>
+- [R3] Warrant SPEC v0.4 (package 0.6.0; pinned in CI at commit `8508a4a`),
+  s0fractal. <https://github.com/s0fractal/warrant>
 - [R4] Rundgren, A., Jordan, B., Erdtman, S., "JSON Canonicalization Scheme
   (JCS)", RFC 8785, June 2020. <https://www.rfc-editor.org/rfc/rfc8785>
 - [R5] Bray, T., "The I-JSON Message Format", RFC 7493, March 2015.

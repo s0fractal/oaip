@@ -19,12 +19,27 @@ jobs:
       # lone-surrogate cases and a leading BOM were all accepted there and are
       # refused here. Refresh deliberately, and expect the parity test to say so
       # when the pin drifts behind again.
-      - name: Warrant (normative dependency, pinned)
+      #
+      # 2026-07-31 — THIS PIN IS NOW A BREAKING ONE, IN BOTH DIRECTIONS.
+      # 8508a4a is Warrant SPEC v0.4 / package 0.6.0, which replaced the §5
+      # signed message: `"warrant-sig-v1:" || WarrantID_raw` (47 bytes) instead
+      # of the bare 32-byte WarrantID. OAIP verifies Ed25519 in process, so it
+      # carries its own copy of that construction — and the two constructions are
+      # DISJOINT by design, with no dual-accept window. Therefore:
+      #
+      #   * this checkout does NOT work against a pre-0.6.0 Warrant, and
+      #   * a pre-0.6.0 checkout does NOT work against this pin.
+      #
+      # Move the pin and the implementation TOGETHER or the suite is measuring a
+      # verifier that agrees with nothing. `tests/signature_gate.py` part A
+      # asserts the installed CLI really signs the v0.4 message, so a half-bump
+      # fails here rather than in a user's store.
+      - name: Warrant (normative dependency, pinned — v0.4 / 0.6.0)
         run: |
           set -euo pipefail
           python3 -m pip install --quiet 'cryptography>=42,<46'
           git clone -q https://github.com/s0fractal/warrant /tmp/warrant
-          git -C /tmp/warrant checkout -q 1f4915404db9542fb78baca7d4058d0ec313754e
+          git -C /tmp/warrant checkout -q 8508a4adfd15f95c1acd7b8c64340c5e3d9374a2
 
       # ONE command. The previous workflow listed steps by hand, and that is how
       # `tools/intoto.py selftest` came to exist while running nowhere: a commit

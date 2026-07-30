@@ -264,16 +264,58 @@ def ed25519_verify(pub: bytes, msg: bytes, sig: bytes) -> bool:
             and (lhs[1] * rhs[2] - rhs[1] * lhs[2]) % _ED_P == 0)
 
 
-def signature_verifies(wid: str, s) -> bool:
-    """Does signature entry `s` verify over WarrantID `wid`, per OAIP itself?
+# ---------- THE SIGNED MESSAGE (Warrant SPEC v0.4 §5, package 0.6.0) ----------
+# WHAT MOVED, AND WHY OAIP HAS A COPY OF IT AT ALL
+# -----------------------------------------------
+# OAIP verifies Ed25519 in process (see `ed25519_verify` above) precisely so that
+# no program named by `$WARRANT_CLI` decides what a valid signature is. The price
+# of that independence is that OAIP holds its own copy of the CONSTRUCTION — the
+# exact bytes a Warrant key covers — and two copies of one rule is a rule that
+# can drift. It drifted on 2026-07-31: Warrant SPEC v0.4 replaced the message.
+#
+#     before (v0.3, warrant <= 0.5.x):  msg = WarrantID_raw                32 bytes
+#     now    (v0.4, warrant >= 0.6.0):  msg = b"warrant-sig-v1:" || WarrantID_raw
+#                                                                 15 + 32 = 47 bytes
+#
+# Still pure RFC 8032 Ed25519 over a byte string — no Ed25519ctx, no dom2 prefix,
+# nothing a from-scratch verifier has to grow. Only the message changed.
+#
+# WHY UPSTREAM CHANGED IT. A bare 32-byte WarrantID is byte-indistinguishable
+# from any other bare SHA-256 digest, so a key that also signs digests in a
+# neighbouring protocol — in-toto/DSSE payload digests (which `tools/intoto.py`
+# puts one hop away from this ledger), TUF metadata, Σ-GLYPH NodeHashes, RFC 6962
+# roots, git object ids — produces bytes that are syntactically a valid signature
+# in both, in both directions. The 15 ASCII bytes name this protocol inside the
+# message the key covers.
+#
+# THE TWO CONSTRUCTIONS ARE DISJOINT, DELIBERATELY. Exactly one of them verifies
+# for a given (key, sig, WarrantID), never both, and there is NO dual-accept
+# window at any time under any flag (Warrant DEC-001 §4.3). A verifier that
+# accepted both would have no domain separation at all — an attacker would simply
+# present the legacy one — so OAIP does not have a compatibility mode here, and
+# `legacy_signature` below exists only to say a better sentence about a refusal
+# that has already happened. See SPEC §8.6 for why this is NOT the same thing as
+# §6.4 legacy-read mode, and must never be routed through it.
+SIG_DOMAIN = b"warrant-sig-v1:"
 
-    Warrant signs the RAW 32 BYTES of the WarrantID (`sk.sign(bytes.fromhex(
-    wid))`, warrant.py `sign_envelope`), and the WarrantID is sha256 over the
-    canonical body — which `read_warrant_store` has already recomputed from the
-    file. So this check is anchored in bytes OAIP hashed itself, not in anything
-    a store, an env var or a subprocess said."""
+
+def sig_message(wid: str) -> bytes:
+    """The exact 47 bytes an Ed25519 Warrant signature covers (Warrant SPEC §5).
+
+    Callers must have already established that `wid` is 64 lowercase hex; every
+    one of them reaches this through `signature_verifies`, which is total."""
+    return SIG_DOMAIN + bytes.fromhex(wid)
+
+
+def _sig_entry_bytes(wid, s):
+    """(pub, sig) as raw bytes for a well-formed entry, or None.
+
+    Shared by the two predicates below so that "is this entry even shaped like a
+    signature?" is answered in ONE place: when the accepting predicate and the
+    diagnosing one disagree about what they will look at, the diagnosis starts
+    describing records the gate never considered."""
     if not isinstance(s, dict):
-        return False
+        return None
     key, sig = s.get("key"), s.get("sig")
     # `isinstance(wid, str)` because this function is total about EVERY other
     # input and was not about this one: `HEX64.match(None)` raised TypeError
@@ -282,11 +324,62 @@ def signature_verifies(wid: str, s) -> bool:
     # will (2026-07-30, fourth round).
     if not (isinstance(key, str) and isinstance(sig, str)
             and isinstance(wid, str) and HEX64.match(wid)):
-        return False
+        return None
     try:
-        pub, raw = bytes.fromhex(key), bytes.fromhex(sig)
+        return bytes.fromhex(key), bytes.fromhex(sig)
     except ValueError:
+        return None
+
+
+def signature_verifies(wid: str, s) -> bool:
+    """Does signature entry `s` verify over WarrantID `wid`, per OAIP itself?
+
+    The message is the domain-separated one above, NOT the bare WarrantID; the
+    WarrantID inside it is sha256 over the canonical body, which
+    `read_warrant_store` has already recomputed from the file. So this check is
+    anchored in bytes OAIP hashed itself, not in anything a store, an env var or
+    a subprocess said.
+
+    This is the ONLY predicate in this file an acceptance edge is derived from.
+    `legacy_signature` is never consulted before it and never overrides it."""
+    parts = _sig_entry_bytes(wid, s)
+    if parts is None:
         return False
+    pub, raw = parts
+    return ed25519_verify(pub, sig_message(wid), raw)
+
+
+# The §6 report string Warrant SPEC §5 makes NORMATIVE for a verifier that
+# recognises a pre-v1 signature: "A verifier that recognises a signature valid
+# over the bare WarrantID MUST report it with these exact bytes". OAIP verifies
+# Warrant records, so OAIP is such a verifier and emits the same bytes — a
+# consumer can then branch on the diagnosis rather than on whose rendering it is.
+# Pure ASCII on purpose: several implementations, several JSON encoders, one
+# string. `SPEC 5` and the straight quotes are upstream's, not a typo here.
+LEGACY_SIG_MESSAGE = (
+    "signature does not verify (excluded): LEGACY pre-v1 signature construction "
+    "(signed the bare 32-byte WarrantID; SPEC 5 requires \"warrant-sig-v1:\" || "
+    "WarrantID). Re-sign with: warrant resign --key <keyfile>")
+
+
+def legacy_signature(wid: str, s) -> bool:
+    """True if `s` is a valid signature over the BARE 32-byte WarrantID — the
+    pre-0.6.0 construction Warrant SPEC v0.4 §5 replaced.
+
+    DIAGNOSIS ONLY, AND THAT IS A LOAD-BEARING SENTENCE. Nothing in this file
+    treats a true return as acceptance: no caller of this function derives an
+    edge, writes a keyring binding, or changes an exit status from non-zero to
+    zero. It is called only where OAIP has ALREADY refused, to replace the
+    sentence "the signature does NOT verify against key ab12cd34…" — which a
+    corrupted byte, a truncated file, a wrong key and a stale Warrant all produce
+    identically — with one that names the cause and the remedy.
+
+    A store signed before the flag day is exactly the case this is for. It is
+    also exactly the case that must NOT quietly work: see SPEC §8.6."""
+    parts = _sig_entry_bytes(wid, s)
+    if parts is None:
+        return False
+    pub, raw = parts
     return ed25519_verify(pub, bytes.fromhex(wid), raw)
 
 
@@ -929,6 +1022,13 @@ def accepting_signature(wid, env, actors):
             key = claiming[0]["key"]
             why = (f"the signature by {claimed!r} does NOT verify against key "
                    f"{key[:12]} (OAIP's own Ed25519 check)")
+            # NAME THE CAUSE WHEN OAIP CAN. The refusal above is unchanged and
+            # unconditional; this only appends WHICH failure it was, for the one
+            # cause that is a migration rather than a forgery. A pre-0.6.0 store
+            # is otherwise indistinguishable here from a corrupted one, and the
+            # operator's next action is completely different.
+            if any(legacy_signature(wid, s) for s in claiming[:SIG_DECIDE_CAP]):
+                why += f" — {LEGACY_SIG_MESSAGE}"
 
     # PASS 2 — THE NOTES: everything else on the record, reported and never fatal
     # (§5 permits appended co-signatures). Past SIG_NOTE_CAP they are COUNTED
@@ -953,7 +1053,9 @@ def accepting_signature(wid, env, actors):
         if not verifies(s):
             notes.append(f"a signature by {a!r} does not verify and is EXCLUDED "
                          "(Warrant SPEC §5 permits appended co-signatures; a junk "
-                         "one must not invalidate a good record)")
+                         "one must not invalidate a good record)"
+                         + (f" — {LEGACY_SIG_MESSAGE}"
+                            if legacy_signature(wid, s) else ""))
         elif k not in (actors.get(a) or []):
             notes.append(f"a VALID co-signature by {a!r} (key {k[:12]}) is not "
                          f"bound in {TRUST} — recorded, but it endorses rather "
@@ -2839,11 +2941,24 @@ def _accept(a):
     # program to sign, so it cannot avoid delegating the SIGNING; it can decline
     # to take the result on trust.
     if not signature_verifies(wid, signed):
+        # The one cause worth naming: the Warrant CLI that just signed this
+        # record is older than SPEC v0.4 and signed the bare WarrantID. That is
+        # a PINNING fault, not a forgery, and "whatever produced it is not
+        # signing with the key it claims" is actively misleading about it — the
+        # key is right, the message is not.
+        why = ("(OAIP's own Ed25519 check). The record is in the store and "
+               "nothing was recorded here — whatever produced it is not "
+               "signing with the key it claims.")
+        if legacy_signature(wid, signed):
+            why = ("(OAIP's own Ed25519 check). The record is in the store and "
+                   "nothing was recorded here.\n  " + LEGACY_SIG_MESSAGE
+                   + f"\n  The configured Warrant CLI ({' '.join(WARRANT)}) "
+                   "signs the pre-v1 message; OAIP requires SPEC v0.4 "
+                   "(warrant >= 0.6.0). Upgrade it — the two constructions are "
+                   "disjoint by design and OAIP has no mode that accepts both.")
         sys.exit(f"filed warrant {wid[:12]}: the signature attributed to "
                  f"{a.actor} does NOT verify against key {signed_key[:12]} "
-                 "(OAIP's own Ed25519 check). The record is in the store and "
-                 "nothing was recorded here — whatever produced it is not "
-                 "signing with the key it claims.")
+                 + why)
     bind_actor(a.actor, signed_key)
     con.execute("INSERT OR IGNORE INTO warrants(claim_id,warrant_id,created_at)"
                 " VALUES (?,?,?)", (a.claim, wid, wts))
@@ -3236,6 +3351,27 @@ def _rebuild(a):
             store_bad.append("warrant store: `warrant verify` reported "
                              f"{report['errors']} error(s) — an unverified "
                              f"acceptance must not become an edge ({first})")
+            # OAIP MUST BE ABLE TO EXPLAIN ITS OWN REFUSAL. This branch quotes
+            # the delegate's first ERR and stops, which is correct as a veto and
+            # useless as a diagnosis for the one cause that is a MIGRATION: a
+            # store signed before Warrant SPEC v0.4. `signer_gate` would name it
+            # (see `legacy_signature`) but never runs — the refusal above is
+            # already fatal — so the record is examined here instead, by OAIP,
+            # in process. Adds a sentence to a refusal; changes no verdict, no
+            # edge and no exit status.
+            legacy = sorted({a["wid"][:12] for a in accepts
+                             if any(legacy_signature(a["wid"], s)
+                                    for s in (a["env"].get("sigs") or [])[:SIG_DECIDE_CAP]
+                                    if isinstance(s, dict))})
+            if legacy:
+                store_bad.append(
+                    f"warrant store: {len(legacy)} record(s) carry a signature "
+                    f"under the PRE-v1 construction ({', '.join(legacy[:5])}"
+                    + (", …" if len(legacy) > 5 else "") + "). "
+                    + LEGACY_SIG_MESSAGE
+                    + " — OAIP has no mode that accepts both constructions; they "
+                      "are disjoint by design (Warrant SPEC §5, DEC-001 §4.3), "
+                      "and this is NOT the §6.4 legacy-read path (SPEC §8.6)")
         else:
             actors, aerr = read_trust()
             if aerr:

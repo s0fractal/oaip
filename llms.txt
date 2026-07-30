@@ -41,7 +41,9 @@ only outcome it could ever have produced in CI.
 Warrant is a **normative dependency**, not an optional extra (§1 defines
 canonicalization as "exactly per Warrant SPEC §4"; §3 makes the decision layer a
 real Warrant record). Set `WARRANT_IMPL` / `WARRANT_CLI`, or keep a checkout at
-`~/Projects/warrant`.
+`~/Projects/warrant`. It must be **Warrant SPEC v0.4 / package ≥ 0.6.0** (CI pins
+commit `8508a4a`): an older one signs a different message and OAIP will refuse
+every acceptance it files — see the BREAKING entry below.
 
 ## Interoperating with the provenance world
 
@@ -110,6 +112,44 @@ break it; its findings were all in the code that FEEDS the verifier — how much
 work an attacker can make it do, how much of its output a human can still read,
 and what happens to a refusal that raises instead of returning. Both halves of
 that result are recorded below, the favourable one included.
+
+- **BREAKING (2026-07-31): OAIP now requires Warrant SPEC v0.4 / package
+  ≥ 0.6.0, and refuses everything older.** Warrant replaced the §5 signed
+  message with `"warrant-sig-v1:" || WarrantID_raw` — 47 bytes, still pure RFC
+  8032 Ed25519 — so that a Warrant signature is no longer byte-indistinguishable
+  from a signature over any other bare 32-byte digest. OAIP verifies Ed25519 **in
+  process** (the entry below), which means OAIP carries its own copy of that
+  construction; until this change it carried the old one, and the two disagreed
+  about what a valid signature is. Measured on `main` against warrant `8508a4a`
+  before the fix: **7 of 15 checks failed**, each on `filed warrant <id>: the
+  signature attributed to <actor> does NOT verify` — the acceptance edge
+  unobtainable through OAIP's own happy path.
+
+  What this costs a reader, stated plainly rather than implied:
+  - `pip install`-ing an older Warrant, or keeping a pre-0.6.0 checkout at
+    `~/Projects/warrant`, makes **every** acceptance fail. That is intended. The
+    message names the cause and the fix rather than saying "does not verify".
+  - **An existing `.oaip/warrants` store signed before the flag day gets NO
+    acceptance edge** until its records are re-signed with
+    `warrant resign --key <keyfile>`. Re-signing rewrites `sigs` only and moves
+    no WarrantID, so nothing else in the graph changes. A record whose signing
+    key is gone cannot be migrated and stays unaccepted.
+  - There is **no dual-accept window** and no flag that creates one, now or
+    later (SPEC §8.6). A verifier taking both messages would have no domain
+    separation at all.
+  - This is **narrowed, not closed**: the separator stops a signature made over
+    a bare digest in a neighbouring protocol from being syntactically an OAIP
+    acceptance. It does not say what else a bound key may sign — that residue is
+    now written down as SPEC §8.5 **SA-11**, an assumption whose *absence* before
+    this date was itself a defect in that section.
+  - Pinned together, deliberately: `.github/workflows/ci.yml` (`8508a4a`),
+    `tools/check.py`, SPEC §1/§3/§8.3/§8.6 and [R3]. A partial bump leaves a
+    verifier that is green until the day it is not.
+  - Regression-tested and **confirmed RED first**, including against the
+    realistic wrong fix (a dual-accept window spliced into the gate, which
+    derived `warrant-edge=1` from a pre-v1 signature). `tests/signature_gate.py`
+    part H; `tests/legacy_store.py`. Self-audited, **no independent gate ran**,
+    not adopted by any warrant.
 
 - **Version 0.1.0 of this package IS published, and that is the only thing the
   publish path has ever done.** This entry used to read "nothing has ever been
@@ -222,8 +262,10 @@ that result are recorded below, the favourable one included.
     unpinned default path `~/Projects/warrant/impl/warrant.py`.
   - *Ed25519 verification is now OAIP's own, in process* (`ed25519_verify`, RFC
     8032, stdlib integer arithmetic, verify-only — no secret is ever handled).
-    The signature that decides must verify against the WarrantID **OAIP
-    recomputed from the record's own bytes** before any edge is derived. That is
+    The signature that decides must verify over Warrant SPEC §5's
+    domain-separated message — `"warrant-sig-v1:"` followed by the 32 raw bytes
+    of the WarrantID **OAIP recomputed from the record's own bytes**, 47 bytes
+    in total (see the v0.4 entry below) — before any edge is derived. That is
     why no program named by `$WARRANT_CLI` can manufacture an acceptance any
     more; Warrant is still consulted and its errors still refuse a rebuild — a
     delegate may veto, it may not vouch. `oaip accept` verifies the record it
