@@ -96,7 +96,19 @@ better evidence of good faith than finding them hidden.
   specified, not implemented.
 - **No signing of OAIP records themselves.** Integrity comes from
   content-addressing plus the Warrant record at the decision layer; the artifacts
-  are not individually signed.
+  are not individually signed. In particular a `claim@v1` record is unsigned, so
+  "which claim exists" is a property of the artifact directory, not of anyone's
+  key — which is why the acceptance link is pinned inside the *signed* warrant
+  body rather than inferred from the claim side.
+- **Concurrency is serialised, not concurrent.** `oaip accept` and `oaip rebuild`
+  take an advisory `flock` on `.oaip/lock`, rebuild builds under a temporary name
+  and `os.replace`s it into place, and the acceptance edge is
+  `UNIQUE(claim_id, warrant_id)`. Before that, four concurrent rebuilds wrote
+  four identical edges for one store record and a concurrent accept + rebuild
+  raised an uncaught `sqlite3.OperationalError` and lost the insert. On a
+  platform without `fcntl` the lock degrades to nothing; the constraint and the
+  atomic rename still hold. No attempt is made to be safe against a process that
+  crashes mid-`accept`.
 - **§5 rebuild reconstructs the projection, never the Warrant store.** `oaip
   rebuild` reads both halves of the canonical layer — `.oaip/artifacts` plus the
   Warrant store — and re-derives the claim→warrant acceptance edge from the

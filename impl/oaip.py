@@ -36,6 +36,7 @@ Usage:
 Stdlib only (+ the Warrant reference CLI for the bridge). Run inside a git repo.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -73,6 +74,11 @@ VERIFY_REPORT = "warrant.verify-report@v0"
 NOTE_PREFIX = "oaip-claim:"
 STOREMETA = OAIP / "store.json"     # store-format version, written once by `init`
 STORE_FORMAT = "oaip-store@v1"
+LOCK = OAIP / "lock"                # serialises projection-mutating commands
+try:
+    import fcntl
+except ImportError:                 # non-POSIX: no advisory locking available
+    fcntl = None
 
 
 # ---------- content-addressed helpers ----------
@@ -620,10 +626,50 @@ def effects_between(before_tree: str, after_tree: str):
 
 
 # ---------- ledger (SQLite projection) ----------
-def db():
-    con = sqlite3.connect(DB)
+def db(path=None):
+    con = sqlite3.connect(path or DB)
     con.execute("PRAGMA foreign_keys=ON")
+    # Wait for a writer instead of raising. A concurrent `accept` and `rebuild`
+    # used to abort with an uncaught sqlite3.OperationalError and LOSE the insert
+    # (F10, 2026-07-30); the lock below is the real serialisation, this is the
+    # backstop for every other command that touches the projection.
+    con.execute("PRAGMA busy_timeout=10000")
     return con
+
+
+@contextlib.contextmanager
+def store_lock():
+    """Serialise the commands that MUTATE the projection.
+
+    THE DEFECT THIS CLOSES (F10, 2026-07-30, second adversarial round). `rebuild`
+    deleted `ledger.db` and rebuilt it in place, with nothing excluding a second
+    rebuild. Measured: four concurrent `oaip rebuild` runs produced FOUR identical
+    acceptance edges for ONE store record (there was no UNIQUE constraint either,
+    so nothing downstream noticed) and, depending on timing, a FileNotFoundError
+    traceback from `DB.unlink()` racing another process's unlink. A concurrent
+    `accept` + `rebuild` raised an uncaught sqlite3.OperationalError and lost the
+    insert. Three changes together: this lock, `UNIQUE(claim_id, warrant_id)` on
+    the edge, and building the new projection under a temporary name and
+    `os.replace`-ing it into place, so no window exists in which the projection is
+    absent.
+
+    Advisory `flock` on `.oaip/lock` — inside the ledger, so the exclusion
+    pathspecs already keep it out of every snapshot. On a platform without
+    `fcntl` the lock degrades to nothing rather than failing; the UNIQUE
+    constraint and the atomic rename still hold there."""
+    OAIP.mkdir(exist_ok=True)
+    if fcntl is None:
+        yield
+        return
+    fh = open(LOCK, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 
 SCHEMA = """
@@ -642,8 +688,13 @@ CREATE TABLE IF NOT EXISTS attributions(
 CREATE TABLE IF NOT EXISTS claims(
   id TEXT PRIMARY KEY, execution_id TEXT, predicate TEXT, check_cmd TEXT,
   check_exit INTEGER, transcript_hash TEXT, subject_hash TEXT, supported INTEGER, created_at INTEGER);
+-- UNIQUE because this is the protocol's central edge and it had no constraint at
+-- all: four concurrent rebuilds wrote four identical rows for one store record
+-- and nothing downstream could tell that from four acceptances (F10, 2026-07-30).
+-- One (claim, warrant) pair is one fact.
 CREATE TABLE IF NOT EXISTS warrants(
-  claim_id TEXT, warrant_id TEXT, created_at INTEGER);
+  claim_id TEXT, warrant_id TEXT, created_at INTEGER,
+  UNIQUE(claim_id, warrant_id));
 """
 
 
@@ -808,7 +859,15 @@ def cmd_claim(a):
 
 
 def cmd_accept(a):
-    """THE BRIDGE: an accepted claim becomes a signed Warrant record."""
+    """THE BRIDGE: an accepted claim becomes a signed Warrant record.
+
+    Serialised against `rebuild` (F10): a concurrent accept and rebuild used to
+    raise an uncaught sqlite3.OperationalError and lose this insert."""
+    with store_lock():
+        return _accept(a)
+
+
+def _accept(a):
     con = db()
     c = con.execute("""SELECT predicate,check_cmd,check_exit,transcript_hash,subject_hash,supported
                        FROM claims WHERE id=?""", (a.claim,)).fetchone()
@@ -877,8 +936,8 @@ def cmd_accept(a):
         sys.exit(f"filed warrant {wid[:12]} was signed by {signed_key[:12]}, "
                  f"not by this ledger's own key ({PUBKEY.read_text().strip()[:12]})")
     bind_actor(a.actor, signed_key)
-    con.execute("INSERT INTO warrants(claim_id,warrant_id,created_at) VALUES (?,?,?)",
-                (a.claim, wid, wts))
+    con.execute("INSERT OR IGNORE INTO warrants(claim_id,warrant_id,created_at)"
+                " VALUES (?,?,?)", (a.claim, wid, wts))
     con.commit()
     print(f"ACCEPTED -> warrant {wid}\n  (signed, hash-addressed, cites the provenance as evidence "
           f"and the validation as a cmd@v1 check)")
@@ -1067,6 +1126,11 @@ def cmd_rebuild(a):
     WARRANT line. "The same graph" minus its most important edge is not the
     same graph.
     """
+    with store_lock():
+        return _rebuild(a)
+
+
+def _rebuild(a):
     allow_legacy = bool(getattr(a, "allow_legacy_links", False))
     # Read and validate the canonical layer BEFORE touching the projection. A
     # fail-closed check that deletes the database and then refuses to rebuild it
@@ -1078,6 +1142,7 @@ def cmd_rebuild(a):
     # (F13, 2026-07-30). A diagnosis that names the wrong layer is worse than no
     # diagnosis, because it is acted on.
     records = []
+    rec_addr = {}                  # id(doc) -> the address it was read from
     art_bad, store_bad = [], []
     for path in sorted(ART.glob("*")):
         # An artifact whose bytes do not hash to its address is not a record with
@@ -1090,6 +1155,7 @@ def cmd_rebuild(a):
             continue
         if isinstance(doc, dict) and isinstance(doc.get("oaip_record"), str):
             records.append(doc)
+            rec_addr[id(doc)] = path.name
 
     # The other half of the canonical layer: the Warrant store.
     accepts, wrec_files, store_errs = read_warrant_store()
@@ -1139,9 +1205,14 @@ def cmd_rebuild(a):
                  "facts the canonical layer does not support (the existing "
                  "projection has been left untouched)")
 
-    if DB.exists():
-        DB.unlink()
-    con = db()
+    # BUILD UNDER A TEMPORARY NAME, THEN RENAME (F10). The old code deleted
+    # `ledger.db` and rebuilt in place, so between those two moments there was no
+    # projection at all — and a second rebuild racing the first hit
+    # FileNotFoundError on the unlink. `os.replace` is atomic on POSIX: a reader
+    # sees the old projection or the new one, never neither.
+    tmp_db = OAIP / "ledger.rebuild.db"
+    tmp_db.unlink(missing_ok=True)
+    con = db(tmp_db)
     con.executescript(SCHEMA)       # one schema definition, not a copy of it
     # Deterministic order: by timestamp then id, so a rebuild is reproducible and
     # two rebuilds of the same artifacts give the same projection.
@@ -1219,9 +1290,9 @@ def cmd_rebuild(a):
     counts["warrant@edge"] = 0
 
     def edge(cid, wid, wts):
-        con.execute("INSERT INTO warrants(claim_id,warrant_id,created_at)"
-                    " VALUES (?,?,?)", (cid, wid, wts))
-        counts["warrant@edge"] += 1
+        cur = con.execute("INSERT OR IGNORE INTO warrants(claim_id,warrant_id,"
+                          "created_at) VALUES (?,?,?)", (cid, wid, wts))
+        counts["warrant@edge"] += cur.rowcount or 0
 
     refuse_signer = signer_gate(report, actors, unbound_prefixes)
 
@@ -1291,10 +1362,49 @@ def cmd_rebuild(a):
                 edge(cid, wid, wts)
     # Re-register the artifacts themselves, so the index over the canonical layer
     # is complete rather than only covering what the records referenced.
+    #
+    # THE KIND IS RE-DERIVED, NOT OVERWRITTEN (F15, 2026-07-30, second review
+    # round). This loop used to insert every artifact as kind "rebuilt", which
+    # DESTROYED "record:intent" / "record:execution" / "record:claim" /
+    # "claim-subject" / "stdout" / "check-transcript" on a CLEAN, honest store —
+    # a real post-rebuild difference in the graph §5 says must be identical. The
+    # test could not see it: `TABLES` omitted `artifacts` (7 tables exist, 6 were
+    # compared), the same "the comparison couldn't see the loss" pattern that
+    # earlier hid the missing claim→warrant edge.
+    #
+    # The kinds are recovered from what the records SAY, replayed in the order the
+    # live path writes them. Order matters because `put_artifact` is INSERT OR
+    # IGNORE and two artifacts can share one address — an empty stdout and an
+    # empty check transcript hash alike, which is the common case for a quiet
+    # command — so the FIRST writer's kind is the one that stands. `cmd_run` puts
+    # stdout, then the execution record; `cmd_claim` puts the transcript, then the
+    # subject, then the claim record. `records` is already sorted by (ts, id), so
+    # mentioning each record's referents in that same order reproduces the live
+    # projection exactly rather than approximately.
+    kinds = {}
+    for d in records:
+        k = d["oaip_record"]
+        if k == "execution@v1" and isinstance(d.get("stdout"), str):
+            kinds.setdefault(d["stdout"], "stdout")
+        elif k == "claim@v1":
+            if isinstance(d.get("transcript"), str):
+                kinds.setdefault(d["transcript"], "check-transcript")
+            if isinstance(d.get("subject"), str):
+                kinds.setdefault(d["subject"], "claim-subject")
+        addr = rec_addr.get(id(d))
+        if addr:
+            kinds.setdefault(addr, "record:" + k.split("@")[0])
     for path in sorted(ART.glob("*")):
+        # "unreferenced" only for a blob no record explains — which the live path
+        # cannot produce, since `put_artifact` always names a kind. Saying
+        # "rebuilt" for everything was the defect; saying it for nothing that has
+        # a real kind is the fix.
         con.execute("INSERT OR IGNORE INTO artifacts(hash,kind,size) VALUES (?,?,?)",
-                    (path.name, "rebuilt", path.stat().st_size))
+                    (path.name, kinds.get(path.name, "unreferenced"),
+                     path.stat().st_size))
     con.commit()
+    con.close()
+    os.replace(tmp_db, DB)          # atomic: never a moment with no projection
     print("rebuilt projection from the canonical layer: "
           + ", ".join(f"{k.split('@')[0]}={v}" for k, v in sorted(counts.items())))
 

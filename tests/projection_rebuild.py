@@ -69,6 +69,13 @@ WHAT IT CHECKS
    `WARRANT_CLI=/usr/bin/true` (exit 0 is not a verification — the CLI must emit
    a parseable `warrant.verify-report@v0`), and a CLI that never exits (every
    call is timeout-bounded).
+10. CONCURRENCY. `rebuild` deleted the projection and rebuilt it in place, with
+   nothing excluding a second rebuild and NO UNIQUE constraint on the protocol's
+   central edge: four concurrent rebuilds left four identical rows for one store
+   record, and a concurrent accept + rebuild raised an uncaught
+   sqlite3.OperationalError and lost the insert. Rebuild now holds an advisory
+   lock, builds under a temporary name and `os.replace`s it into place, and the
+   edge is UNIQUE(claim_id, warrant_id).
 """
 import hashlib
 import time
@@ -86,8 +93,16 @@ ROOT = Path(__file__).resolve().parents[1]
 # how the projection could silently lose the claim→warrant edge on rebuild —
 # the one fact this protocol exists to record. It is in the graph; it is in the
 # comparison.
+#
+# `artifacts` was absent for the same reason and cost the same kind of fact:
+# rebuild inserted every artifact as kind "rebuilt", destroying "record:claim",
+# "claim-subject", "stdout" and "check-transcript" on a CLEAN, honest store — a
+# real post-rebuild graph difference that six-of-seven tables could not show
+# (2026-07-30, second adversarial round). The tuple is now every table the
+# schema defines, and `schema_tables_are_all_compared` below refuses to let a
+# future table be added to the schema and forgotten here.
 TABLES = ("intents", "executions", "effects", "claims", "attributions",
-          "warrants")
+          "warrants", "artifacts")
 ok = True
 
 
@@ -157,10 +172,33 @@ def main():
             return 1
 
         db = work / ".oaip" / "ledger.db"
+        # EVERY table the schema defines is compared. Twice now a fact has
+        # survived rebuild-as-code and died in the comparison instead, because
+        # this tuple was shorter than the schema: the claim→warrant edge, then
+        # `artifacts.kind`. So the tuple is checked against the database itself.
+        con = sqlite3.connect(db)
+        schema_tables = sorted(
+            r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE "
+                                      "type='table' AND name NOT LIKE 'sqlite_%'"))
+        con.close()
+        case("every table in the schema is in the comparison "
+             "(the comparison cannot be shorter than the graph)",
+             schema_tables == sorted(TABLES),
+             f"schema={schema_tables} compared={sorted(TABLES)}")
+
         before = snapshot(db)
         case("a live run produced a graph",
              all(before[t] for t in ("intents", "executions", "effects",
-                                     "claims", "warrants")))
+                                     "claims", "warrants", "artifacts")))
+
+        # The artifact KINDS, named individually: "rebuilt" for all of them was
+        # the defect, and a diff of two dictionaries would not say which fact went.
+        kinds_before = {json.loads(r)["hash"]: json.loads(r)["kind"]
+                        for r in before["artifacts"]}
+        for want in ("record:intent", "record:execution", "record:claim",
+                     "claim-subject"):
+            case(f"artifacts carry kind {want!r} before rebuild",
+                 want in kinds_before.values(), sorted(set(kinds_before.values())))
 
         # The acceptance edge, named before rebuild so its loss is a regression
         # in THIS fact, not a diff in a dictionary. `log`'s WARRANT line is the
@@ -204,6 +242,13 @@ def main():
             case(f"warrant.{field} survived the projection",
                  wr2.get(field) == wr.get(field),
                  f"before={wr.get(field)!r} after={wr2.get(field)!r}")
+        kinds_after = {json.loads(r)["hash"]: json.loads(r)["kind"]
+                       for r in after["artifacts"]}
+        case("artifacts.kind survived the projection (not all 'rebuilt')",
+             kinds_after == kinds_before,
+             f"before={sorted(set(kinds_before.values()))} "
+             f"after={sorted(set(kinds_after.values()))}")
+
         log_after = run("log")
         case("log still shows the WARRANT line after rebuild",
              "WARRANT" in log_after.stdout, log_after.stdout)
@@ -593,6 +638,80 @@ def main():
         case("after all of the above the honest store rebuilds, edge intact",
              r.returncode == 0 and len(rows) == real_edges,
              r.stdout + r.stderr + str(rows))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- case 10 (F10): CONCURRENCY. `rebuild` deleted ledger.db and rebuilt
+        # it in place, with nothing excluding a second rebuild and no UNIQUE
+        # constraint on the protocol's central edge. Measured before the fix: four
+        # concurrent `oaip rebuild` runs left FOUR identical rows for ONE store
+        # record, and — depending on timing — a FileNotFoundError traceback from
+        # `DB.unlink()` racing another process's unlink. A concurrent accept +
+        # rebuild raised an uncaught sqlite3.OperationalError and lost the insert.
+        work, run = make_repo(tmp)
+        r = run("do", "--intent", "add a file", "--check", "test -f f.txt",
+                "--actor", "tester@local", "--", "sh", "-c", "echo hi > f.txt")
+        if "ACCEPTED" not in r.stdout:
+            print("FAIL  setup(10): the one-shot flow did not accept\n",
+                  r.stdout, r.stderr)
+            return 1
+        db = work / ".oaip" / "ledger.db"
+        expect = snapshot(db)
+
+        procs = [subprocess.Popen([sys.executable, "impl/oaip.py", "rebuild"],
+                                  cwd=work, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True)
+                 for _ in range(4)]
+        outs = [(p.wait(timeout=180), p.stdout.read()) for p in procs]
+        case("4 concurrent rebuilds: none tracebacks",
+             all("Traceback" not in o for _, o in outs),
+             next((o for _, o in outs if "Traceback" in o), "")[-400:])
+        case("4 concurrent rebuilds: all succeed",
+             all(rc == 0 for rc, _ in outs), str([rc for rc, _ in outs]))
+        got = snapshot(db)
+        case("4 concurrent rebuilds: ONE edge per store record, not four",
+             got["warrants"] == expect["warrants"],
+             f"\n      expect={expect['warrants']}\n      got   ={got['warrants']}")
+        case("4 concurrent rebuilds: the whole graph is still the same graph",
+             got == expect, [t for t in TABLES if got[t] != expect[t]])
+
+        # The edge is UNIQUE in the schema, so even a single-process double insert
+        # cannot double-count it. Named separately from the race, because the race
+        # is timing and the constraint is a fact about the projection.
+        con = sqlite3.connect(db)
+        sql = con.execute("SELECT sql FROM sqlite_master WHERE name='warrants'"
+                          ).fetchone()[0]
+        con.close()
+        case("the acceptance edge carries a UNIQUE constraint",
+             "UNIQUE" in sql.upper(), sql)
+
+        # accept racing rebuild: the insert must survive, not vanish.
+        iid = run("intent", "concurrent").stdout.strip()
+        eid = run("run", "--intent", iid, "--", "sh", "-c",
+                  "echo z > z.txt").stdout.split()[1]
+        cid = run("claim", "--execution", eid, "--predicate", "z",
+                  "--check", "true").stdout.split()[1]
+        pa = subprocess.Popen([sys.executable, "impl/oaip.py", "accept",
+                               "--claim", cid, "--actor", "tester@local"],
+                              cwd=work, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+        pr = subprocess.Popen([sys.executable, "impl/oaip.py", "rebuild"],
+                              cwd=work, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+        oa, orb = pa.communicate(timeout=180), pr.communicate(timeout=180)
+        case("accept racing rebuild: neither tracebacks",
+             "Traceback" not in oa[0] and "Traceback" not in orb[0],
+             (oa[0] + orb[0])[-400:])
+        case("accept racing rebuild: both succeed",
+             pa.returncode == 0 and pr.returncode == 0,
+             f"accept={pa.returncode} rebuild={pr.returncode} "
+             + (oa[0] + orb[0])[-300:])
+        # Whichever order they ran in, one more rebuild must SEE the acceptance:
+        # the Warrant record is canonical, so an insert lost from the projection is
+        # recoverable — but only if the record was filed at all.
+        run("rebuild")
+        rows = [json.loads(x) for x in snapshot(db)["warrants"]]
+        case("accept racing rebuild: the acceptance is not lost",
+             any(x["claim_id"] == cid for x in rows), rows)
 
     print("\nPROJECTION-REBUILD: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1
