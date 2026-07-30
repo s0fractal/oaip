@@ -229,18 +229,40 @@ def workspace_snapshot() -> str:
     observed workspace — a snapshot that contains the observation machinery
     changes whenever the machinery does, which is the observer effect, not
     provenance. The exclusion is done here with a pathspec (not .gitignore) so
-    it holds in every repo regardless of user configuration."""
+    it does not depend on user configuration.
+
+    The pathspecs are REPO-ROOTED and DEPTH-AGNOSTIC, and both properties are
+    load-bearing (2026-07-30 adversarial review, fresh-context Claude-family
+    reviewer — both holes reproduced):
+      * The first fix used `-- . ':(exclude).oaip'`. `:(exclude).oaip` anchors
+        at the pathspec root, so a NESTED ledger (`sub/.oaip/dev.key`, from an
+        `oaip init` run in a subdirectory) still landed in `.git/objects` —
+        the same key leak, one directory down. `:(top,exclude,glob)**/.oaip/**`
+        excludes the ledger at ANY depth (a leading `**/` matches zero or more
+        components, so the top level is covered too).
+      * Both pathspecs were cwd-relative. Run from `sub/`, `-- .` silently
+        NARROWED the snapshot from the whole worktree to the cwd subtree (a
+        wrapped command mutating anything outside cwd became unobserved), and
+        `git rm --cached -- .oaip` referred to `sub/.oaip`, so a HEAD-tracked
+        root `.oaip` survived into every tree written here. `:/` (add) and
+        `:(top,…)` (both) resolve from the repository root regardless of cwd.
+    Verified against git 2.50: top-level and nested, from root and from a
+    subdirectory, with and without a HEAD-tracked `.oaip`."""
     tmp_index = OAIP / "tmp.index"
     env = dict(os.environ, GIT_INDEX_FILE=str(tmp_index.resolve()))
     # seed the throwaway index from HEAD if it exists, else empty, then add all
     subprocess.run(["git", "read-tree", "HEAD"], env=env, capture_output=True)
-    subprocess.run(["git", "add", "-A", "--", ".", ":(exclude).oaip"],
+    subprocess.run(["git", "add", "-A", "--", ":/",
+                    ":(top,exclude,glob)**/.oaip/**",
+                    ":(top,exclude,glob)**/.oaip"],
                    env=env, capture_output=True)
     # If HEAD itself tracks .oaip (a user committed it before init learned to
     # gitignore it), read-tree seeded those entries; drop them so no tree this
-    # function writes ever contains the key or the store.
+    # function writes ever contains the key or the store — at any depth, from
+    # any cwd.
     subprocess.run(["git", "rm", "-r", "-q", "--cached", "--ignore-unmatch",
-                    "--", ".oaip"], env=env, capture_output=True)
+                    "--", ":(top,glob)**/.oaip/**", ":(top,glob)**/.oaip"],
+                   env=env, capture_output=True)
     tree = subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True).stdout.strip()
     tmp_index.unlink(missing_ok=True)
     return tree
@@ -310,14 +332,23 @@ def cmd_init(_):
     # Keep the signing key and the store out of the USER's own commits too.
     # workspace_snapshot() excludes .oaip by pathspec, but a plain `git add -A`
     # by the user would still commit dev.key; init owns the directory, so init
-    # owns keeping it ignored. Idempotent: never duplicates the line.
+    # owns keeping it ignored. Idempotent: never duplicates the line, and a
+    # bare `.oaip` already present is already an exclusion — appending `.oaip/`
+    # next to it would be noise. A DIRECTORY named .gitignore is not writable
+    # config: warn and move on rather than crash (IsADirectoryError, found in
+    # the 2026-07-30 adversarial review).
     gitignore = Path(".gitignore")
-    lines = gitignore.read_text().splitlines() if gitignore.exists() else []
-    if ".oaip/" not in (l.strip() for l in lines):
-        with gitignore.open("a") as f:
-            if lines and not gitignore.read_text().endswith("\n"):
-                f.write("\n")
-            f.write(".oaip/\n")
+    if gitignore.exists() and not gitignore.is_file():
+        print(f"warning: {gitignore} is not a regular file; add '.oaip/' to "
+              "your git excludes yourself", file=sys.stderr)
+    else:
+        lines = gitignore.read_text().splitlines() if gitignore.is_file() else []
+        already = {".oaip", ".oaip/", "/.oaip", "/.oaip/"}
+        if not any(l.strip() in already for l in lines):
+            with gitignore.open("a") as f:
+                if lines and not gitignore.read_text().endswith("\n"):
+                    f.write("\n")
+                f.write(".oaip/\n")
     print(f"initialized .oaip (ledger + warrant store + dev key)")
 
 

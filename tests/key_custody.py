@@ -23,6 +23,23 @@ The fix is two independent walls, and this test checks each one ALONE:
      missing, never duplicating the line), so the USER's own `git add -A`
      does not commit the key either.
 
+THE FIRST PATHSPEC WAS ITSELF DEFECTIVE (2026-07-30 adversarial review)
+-----------------------------------------------------------------------
+`-- . ':(exclude).oaip'` passed every case above and still leaked, two ways,
+both reproduced by a fresh-context Claude-family reviewer:
+
+  * `:(exclude).oaip` anchors at the pathspec root, so a NESTED ledger
+    (`sub/.oaip/dev.key`, from `oaip init` run in a subdirectory) was added
+    like any other file — the identical key leak, one directory down.
+  * Both pathspecs were cwd-RELATIVE. Run from `sub/`: `git rm --cached --
+    .oaip` meant `sub/.oaip`, so a HEAD-tracked root `.oaip` survived into
+    every snapshot; and `-- .` silently narrowed the "FULL worktree" snapshot
+    to the cwd subtree, so a wrapped command mutating anything outside cwd
+    produced effects=0 — an observer that observed less the deeper you stood.
+
+Cases 5–7 below pin all three properties: nested exclusion, repo-rooted
+removal from a subdirectory, and full-worktree reach from a subdirectory.
+
 WHY THE NEGATIVE CONTROL IS IN THE FILE
 ---------------------------------------
 Case 1 re-runs the PRE-FIX snapshot procedure (read-tree, `git add -A` with no
@@ -69,30 +86,38 @@ class Repo:
         return subprocess.run(["git", *a], cwd=self.dir,
                               capture_output=True, text=True)
 
-    def run(self, *a):
+    def run(self, *a, sub=None):
+        """Run oaip; `sub` runs it from a SUBDIRECTORY of the repo (the cwd the
+        cwd-relative pathspecs leaked from)."""
+        cwd = self.dir / sub if sub else self.dir
         return subprocess.run([sys.executable, str(ROOT / "impl" / "oaip.py"), *a],
-                              cwd=self.dir, capture_output=True, text=True)
+                              cwd=cwd, capture_output=True, text=True)
 
-    def snapshot_tree(self):
+    def snapshot_tree(self, sub=None, cmd="echo hi > f.txt"):
         """One real snapshot, extracted from a real `oaip run`."""
-        r = self.run("run", "--intent", "x", "--", "sh", "-c", "echo hi > f.txt")
+        r = self.run("run", "--intent", "x", "--", "sh", "-c", cmd, sub=sub)
         for tok in r.stdout.split():
             if tok.startswith("after="):
                 return tok.split("=", 1)[1]
         raise SystemExit(f"setup failed: no after= in {r.stdout!r} {r.stderr!r}")
 
-    def key_blob(self):
+    def key_blob(self, key=".oaip/dev.key"):
         """The git blob id the key WOULD have — without writing it anywhere."""
-        r = subprocess.run(["git", "hash-object", ".oaip/dev.key"], cwd=self.dir,
+        r = subprocess.run(["git", "hash-object", key], cwd=self.dir,
                            capture_output=True, text=True)
         return r.stdout.strip()
 
-    def key_in_odb(self):
-        return self.git("cat-file", "-e", self.key_blob()).returncode == 0
+    def key_in_odb(self, key=".oaip/dev.key"):
+        return self.git("cat-file", "-e", self.key_blob(key)).returncode == 0
+
+    def tree_paths(self, tree):
+        return self.git("ls-tree", "-r", "--name-only", "--full-tree",
+                        tree).stdout.splitlines()
 
     def oaip_paths_in(self, tree):
-        out = self.git("ls-tree", "-r", "--name-only", tree).stdout
-        return [p for p in out.splitlines() if p.startswith(".oaip")]
+        # ANY path component named .oaip, at ANY depth — `startswith(".oaip")`
+        # was how this file failed to see the nested-ledger leak.
+        return [p for p in self.tree_paths(tree) if ".oaip" in p.split("/")]
 
 
 def main():
@@ -146,7 +171,59 @@ def main():
              f"tree={tree} leaked={L.oaip_paths_in(tree)}")
 
     with tempfile.TemporaryDirectory() as tmp:
-        # --- 4. wall 2: init owns the .gitignore line.
+        # --- 5. a NESTED ledger: `oaip init` run in a subdirectory. The first
+        # pathspec (':(exclude).oaip') anchored at the root and leaked
+        # sub/.oaip/dev.key into the object database exactly as the original
+        # bug leaked ./.oaip/dev.key (2026-07-30 adversarial review).
+        L = Repo(Path(tmp) / "n")
+        (L.dir / ".gitignore").unlink(missing_ok=True)
+        (L.dir / "sub").mkdir()
+        L.run("init", sub="sub")
+        (L.dir / "sub" / ".gitignore").unlink(missing_ok=True)
+        subkey = L.dir / "sub" / ".oaip" / "dev.key"
+        if not subkey.exists():                     # no Warrant CLI: sentinel
+            subkey.parent.mkdir(parents=True, exist_ok=True)
+            subkey.write_text("2" * 63 + "1\n")
+        tree = L.snapshot_tree()
+        case("nested ledger: snapshot tree carries no sub/.oaip path",
+             L.oaip_paths_in(tree) == [],
+             f"tree={tree} leaked={L.oaip_paths_in(tree)}")
+        case("the nested signing key's bytes never entered .git/objects",
+             not L.key_in_odb("sub/.oaip/dev.key"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- 6. run from a SUBDIRECTORY with a HEAD-tracked root .oaip: the
+        # cwd-relative `git rm --cached -- .oaip` meant sub/.oaip, so the
+        # root key survived into every tree the observer wrote.
+        L = Repo(Path(tmp) / "s")
+        (L.dir / ".gitignore").unlink(missing_ok=True)
+        L.git("add", "-f", ".oaip")
+        L.git("-c", "user.email=t@t", "-c", "user.name=t",
+              "commit", "-q", "-m", "user committed the root ledger")
+        (L.dir / "sub").mkdir()
+        L.run("init", sub="sub")                    # the cwd's own ledger
+        (L.dir / "sub" / ".gitignore").unlink(missing_ok=True)
+        tree = L.snapshot_tree(sub="sub")
+        case("run from sub/: the HEAD-tracked root .oaip is still purged",
+             L.oaip_paths_in(tree) == [],
+             f"tree={tree} leaked={L.oaip_paths_in(tree)}")
+
+        # --- 7. the REGRESSION half of the same finding: `-- .` narrowed the
+        # snapshot to the cwd subtree, so a wrapped command mutating a file
+        # OUTSIDE the cwd was unobserved (effects=0, before==after). The
+        # docstring promises the FULL worktree; hold it to that.
+        r = L.run("run", "--intent", "x", "--", "sh", "-c",
+                  "echo escaped > ../outside.txt", sub="sub")
+        after = next((t.split("=", 1)[1] for t in r.stdout.split()
+                      if t.startswith("after=")), "")
+        case("a mutation OUTSIDE the cwd is still observed (effects != 0)",
+             "effects=0" not in r.stdout and "effects=" in r.stdout, r.stdout)
+        case("the snapshot tree is the full worktree, not the cwd subtree",
+             "outside.txt" in L.tree_paths(after),
+             f"tree={after} paths={L.tree_paths(after)}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- 8. wall 2: init owns the .gitignore line.
         L = Repo(Path(tmp) / "g")
         gi = L.dir / ".gitignore"
         text = gi.read_text() if gi.is_file() else ""     # a clean FAIL, no crash
@@ -165,6 +242,21 @@ def main():
              gi.read_text())
         case("appending respected the missing trailing newline",
              "*.pyc.oaip/" not in gi.read_text(), gi.read_text())
+        # A bare `.oaip` line already excludes the directory (gitignore matches
+        # it at any depth); appending `.oaip/` next to it is noise.
+        gi.write_text(".oaip\n")
+        L.run("init")
+        case("a bare `.oaip` line is recognized; no redundant `.oaip/` appended",
+             gi.read_text() == ".oaip\n", gi.read_text())
+        # A DIRECTORY named .gitignore is not writable config. init used to die
+        # with an uncaught IsADirectoryError; a warning is a decision, a
+        # traceback is an accident (2026-07-30 adversarial review, P3).
+        gi.unlink()
+        gi.mkdir()
+        r = L.run("init")
+        case("init with a directory .gitignore warns instead of crashing",
+             r.returncode == 0 and "Traceback" not in r.stderr
+             and "warning" in r.stderr, f"rc={r.returncode} {r.stderr[:200]}")
 
     print("\nKEY-CUSTODY: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1
