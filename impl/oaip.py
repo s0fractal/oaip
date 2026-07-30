@@ -483,6 +483,35 @@ def bind_actor(actor: str, key: str):
     write_keyring(actors)
 
 
+# HOW MUCH WORK ONE RECORD MAY COST OAIP (F1/F2, 2026-07-30, FOURTH round)
+# ------------------------------------------------------------------------
+# `sigs` lives OUTSIDE the hashed body — a record's address is
+# `sha256(canon(body))` — so anyone who can write `.oaip/warrants/records/` can
+# append UNLIMITED signature entries to an HONEST record without breaking its
+# address, and the gate below used to verify every one of them. OAIP's Ed25519
+# check is pure Python (measured here: ~1.6 ms for an entry crafted to reach the
+# scalar multiplication, against ~0.06 ms for OpenSSL), so appended entries are a
+# CPU amplifier that is paid again on EVERY rebuild and EVERY verify. Measured
+# before these caps, 5,000 appended entries on one accept:
+#     oaip rebuild  8.54 s   (0.35 s on the same store without them)
+#     oaip verify   8.59 s   —  `warrant verify` over the same file: 0.28 s
+# and 10,000 NOTE lines on stderr / 10,003 on stdout for that ONE record, with
+# the `ERR`/`decision layer:` summary buried as the first and last line of the
+# dump — the notes exist so a human can adjudicate co-signatures, so a flood
+# defeats their purpose exactly as it defeats the CPU budget.
+#
+# The caps below are not a guess about attacker behaviour. They follow from what
+# can DECIDE: only an entry naming this record's actor AND a key already bound to
+# that actor, both string comparisons. An honest record costs one verification
+# however much junk is appended to it.
+SIG_DECIDE_CAP = 32     # entries that could decide, verified per record
+SIG_NOTE_CAP = 8        # other entries described individually per record
+# An honest accept record is well under a kilobyte. A record far outside that is
+# padding, and parsing 100 MB of it is the same denial with the arithmetic moved
+# one layer down.
+MAX_STORE_RECORD_BYTES = 4 << 20
+
+
 def accepting_signature(wid, env, actors):
     """Does a VALID, BOUND signature by the actor this record NAMES stand on it?
 
@@ -505,7 +534,14 @@ def accepting_signature(wid, env, actors):
 
     So the question is the one OAIP actually needs answered: did the actor this
     record names sign it, with a key this ledger binds to that actor? Extra
-    signatures endorse; they do not decide, and they cannot un-decide."""
+    signatures endorse; they do not decide, and they cannot un-decide.
+
+    AND IT ANSWERS IT IN BOUNDED WORK (F1, fourth round; see the caps above).
+    This function used to verify EVERY entry before deciding anything, which made
+    an append-only, address-preserving field into a ~50x CPU amplifier against
+    every rebuild and every verify. It now runs the cheap tests first — does this
+    entry name the record's actor, is its key already bound to that actor — and
+    verifies only what could decide, stopping at the first entry that does."""
     body = env.get("body") if isinstance(env, dict) else None
     actor = body.get("actor") if isinstance(body, dict) else None
     claimed = actor.get("id") if isinstance(actor, dict) else None
@@ -515,8 +551,74 @@ def accepting_signature(wid, env, actors):
     sigs = env.get("sigs")
     if not isinstance(sigs, list) or not sigs:
         return "the record carries no signatures", [], None, claimed
-    notes, by_claimed = [], []
+
+    verdict = {}                    # so no entry is ever verified twice
+    def verifies(s):
+        if id(s) not in verdict:
+            verdict[id(s)] = signature_verifies(wid, s)
+        return verdict[id(s)]
+
+    bound_keys = actors.get(claimed) or []
+    claiming = [s for s in sigs if isinstance(s, dict)
+                and s.get("actor") == claimed and isinstance(s.get("key"), str)]
+
+    # PASS 1 — THE DECISION, and the only place cryptography is required. In file
+    # order, so the honest signature (which Warrant writes first) decides on the
+    # first verification no matter how much is appended after it.
+    decided, over_cap, checked = None, False, 0
+    for s in claiming:
+        if s["key"] not in bound_keys:
+            continue                # cannot decide: nothing vouches for this key
+        if checked >= SIG_DECIDE_CAP:
+            over_cap = True
+            break
+        checked += 1
+        if verifies(s):
+            decided = s
+            break
+
+    why, key = None, None
+    if decided is not None:
+        key = decided["key"]
+    elif over_cap:
+        # Reaching this needs MORE THAN SIG_DECIDE_CAP entries that each name this
+        # actor AND a key this ledger binds to them, none of the first
+        # SIG_DECIDE_CAP verifying — which no honest filer produces and no
+        # APPENDER can produce either (an appended entry lands after the real
+        # one). Refusing here is a decision with a reason, not a timeout.
+        why = (f"more than {SIG_DECIDE_CAP} signature entries name actor "
+               f"{claimed!r} with a key bound to it and none of the first "
+               f"{SIG_DECIDE_CAP} verifies — refusing to keep verifying "
+               "(signature entries are outside the hashed body, so their number "
+               "is not evidence of anything)")
+    elif not claiming:
+        why = (f"no signature entry claims the actor this record names "
+               f"({claimed!r})")
+    else:
+        # WHICH refusal it is needs the actor's other entries checked too — also
+        # capped, and free for any entry pass 1 already looked at.
+        valid = next((s for s in claiming[:SIG_DECIDE_CAP] if verifies(s)), None)
+        if valid is not None:
+            key = valid["key"]
+            why = f"key {key[:12]} is not bound to actor {claimed!r} in {TRUST}"
+        else:
+            key = claiming[0]["key"]
+            why = (f"the signature by {claimed!r} does NOT verify against key "
+                   f"{key[:12]} (OAIP's own Ed25519 check)")
+
+    # PASS 2 — THE NOTES: everything else on the record, reported and never fatal
+    # (§5 permits appended co-signatures). Past SIG_NOTE_CAP they are COUNTED
+    # instead of described: 10,000 note lines for one record is not a report a
+    # human can adjudicate, which is the only thing these notes are for (F2).
+    notes, more, more_actors = [], 0, set()
     for s in sigs:
+        if s is decided:
+            continue                    # this one IS the decision, not a note
+        if len(notes) >= SIG_NOTE_CAP:
+            more += 1
+            if isinstance(s, dict) and isinstance(s.get("actor"), str):
+                more_actors.add(s["actor"])
+            continue
         if not isinstance(s, dict):
             notes.append("a signature entry is not an object (ignored)")
             continue
@@ -524,34 +626,22 @@ def accepting_signature(wid, env, actors):
         if not (isinstance(a, str) and isinstance(k, str)):
             notes.append("a signature entry has no actor/key strings (ignored)")
             continue
-        valid, bound = signature_verifies(wid, s), k in actors.get(a, [])
-        if a == claimed:
-            by_claimed.append((valid, bound, k))
-            if valid and bound:
-                continue                    # this is the decision itself
-        if not valid:
+        if not verifies(s):
             notes.append(f"a signature by {a!r} does not verify and is EXCLUDED "
                          "(Warrant SPEC §5 permits appended co-signatures; a junk "
                          "one must not invalidate a good record)")
-        elif not bound:
+        elif k not in (actors.get(a) or []):
             notes.append(f"a VALID co-signature by {a!r} (key {k[:12]}) is not "
                          f"bound in {TRUST} — recorded, but it endorses rather "
                          "than decides")
         else:
             notes.append(f"a VALID, bound co-signature by {a!r} (key {k[:12]})")
-    for valid, bound, k in by_claimed:
-        if valid and bound:
-            return None, notes, k, claimed
-    if not by_claimed:
-        return (f"no signature entry claims the actor this record names "
-                f"({claimed!r})"), notes, None, claimed
-    valid_key = next((k for valid, _, k in by_claimed if valid), None)
-    if valid_key is not None:
-        return (f"key {valid_key[:12]} is not bound to actor {claimed!r} in "
-                f"{TRUST}"), notes, valid_key, claimed
-    return (f"the signature by {claimed!r} does NOT verify against key "
-            f"{by_claimed[0][2][:12]} (OAIP's own Ed25519 check)"), \
-        notes, by_claimed[0][2], claimed
+    if more:
+        notes.append(f"{more} further signature entries excluded from this report "
+                     f"({len(more_actors)} distinct actor id(s)) — co-signatures "
+                     "endorse; they cannot decide or un-decide this record, and "
+                     "nothing outside the hashed body is evidence")
+    return why, notes, key, claimed
 
 
 def store_report(settlement=True):
@@ -1528,6 +1618,19 @@ def read_warrant_store():
                           "Warrant store treats every records/*.json as a record)")
             continue
         try:
+            # SIZE BEFORE BYTES (F1). `sigs` is outside the hashed body, so a
+            # record can be padded without end and still match its own address;
+            # reading and parsing 100 MB of that is a denial of service the
+            # signature caps below cannot reach, because it happens first.
+            size = path.stat().st_size if path.is_file() else 0
+            if size > MAX_STORE_RECORD_BYTES:
+                errors.append(
+                    f"warrant {path.stem[:12]}: the record file is {size} bytes, "
+                    f"over the {MAX_STORE_RECORD_BYTES}-byte limit for a store "
+                    "record — an honest accept is well under a kilobyte, and the "
+                    "signature list is outside the hashed body, so a record can "
+                    "be padded without breaking its address. Refusing to read it")
+                continue
             doc = loads_ijson(path.read_bytes())
         except OSError as e:
             # A DIRECTORY named <hex64>.json is a legal record ADDRESS that is not
@@ -1602,8 +1705,16 @@ def signer_gate(report, actors, unbound_sigs):
 
     def assess(wid, env):
         why, notes, key, actor = accepting_signature(wid, env, actors)
-        notes += [f"Warrant reports: {m}" for m in per_record.get(wid, [])
-                  if any(k in m for k in _AMBIGUOUS_SIG)]
+        # Warrant reports one finding PER appended signature too, so this half of
+        # the notes floods with the record just as `accepting_signature`'s half
+        # did (F2): capped and counted the same way.
+        wsaid = [m for m in per_record.get(wid, [])
+                 if any(k in m for k in _AMBIGUOUS_SIG)]
+        notes += [f"Warrant reports: {m}" for m in wsaid[:SIG_NOTE_CAP]]
+        if len(wsaid) > SIG_NOTE_CAP:
+            notes.append(f"Warrant reports {len(wsaid) - SIG_NOTE_CAP} further "
+                         "excluded or unreadable signature(s) on this record, "
+                         "not listed individually")
         if why is None and unbound_sigs and key and (
                 wid[:12], key[:12], actor) in unbound_sigs:
             why = (f"Warrant's settlement grade reports THIS signature (key "

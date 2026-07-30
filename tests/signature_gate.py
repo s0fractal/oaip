@@ -63,6 +63,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -458,11 +459,117 @@ def part_d():
              all(c != cid for c, _ in edges(work)), edges(work))
 
 
+def flood_entries(env, n):
+    """`n` appended signature entries, each crafted to cost the verifier as much
+    as possible: a REAL point as `R` (so decompression succeeds) and a reduced
+    `S` (so the scalar multiplication actually runs). Junk entries that fail an
+    early check are cheap, and a test that used them would measure nothing."""
+    real = env["sigs"][0]
+    return [{"actor": f"griefer{i % 7}@other", "key": real["key"],
+             "sig": real["sig"][:64] + (i + 1).to_bytes(32, "little").hex()}
+            for i in range(n)]
+
+
+def part_e():
+    """F1/F2 (2026-07-30, FOURTH round): `sigs` is outside the hashed body, so
+    appending to it is free and unbounded, and OAIP verified every entry.
+
+    Measured before the caps, with 5,000 appended entries on ONE honest accept:
+    `oaip rebuild` 8.54 s against 0.35 s for the same store without them (and
+    0.28 s for `warrant verify` over the same file), the same again for
+    `oaip verify`, and 10,000 NOTE lines on stderr / 10,003 on stdout for that
+    one record — the ERR and `decision layer:` summary buried as the first and
+    last line of the dump.
+
+    The two properties this pins are in tension, which is why they are asserted
+    together: the work must be bounded, AND the appended junk must still not
+    un-decide the edge (C2-F1b)."""
+    n = 5000
+    with tempfile.TemporaryDirectory() as tmp:
+        work, run = make_repo(tmp, "flood")
+        r = run("do", "--intent", "real work", "--check", "test -f f.txt",
+                "--actor", "tester@local", "--", "sh", "-c", "echo hi > f.txt")
+        if "ACCEPTED" not in r.stdout:
+            case("setup(E): the one-shot flow accepted", False, r.stdout + r.stderr)
+            return
+        honest = edges(work)
+        p, env = real_accept(work)
+        wid = p.stem
+
+        # A REAL second endorser, kept across the flood: the bounded path must not
+        # be "stop looking", it must be "stop verifying what cannot decide".
+        pub, sig = ed25519_sign(bytes.fromhex("11" * 32), bytes.fromhex(wid))
+        env["sigs"].append({"actor": "cosigner@other", "key": pub.hex(),
+                            "sig": sig.hex()})
+        p.write_text(json.dumps(env))
+        t0 = time.time()
+        base = run("rebuild")
+        base_dt = time.time() - t0
+        case("baseline(E): the co-signed honest record rebuilds",
+             base.returncode == 0 and edges(work) == honest,
+             (base.stdout + base.stderr)[-300:])
+
+        env["sigs"] += flood_entries(env, n)
+        p.write_text(json.dumps(env))
+        case(f"setup(E): {n} entries appended and the record still matches its "
+             "own address (the flood is free, which is the whole problem)",
+             sha256(canon(env["body"])) == wid)
+
+        t0 = time.time()
+        r = run("rebuild")
+        dt = time.time() - t0
+        out = r.stdout + r.stderr
+        # A RELATIVE bound, so the check means the same thing on a slow machine:
+        # the flood must not multiply the work of the same store without it.
+        budget = max(base_dt * 3, base_dt + 3.0)
+        case(f"{n} appended signatures do not multiply rebuild's work "
+             f"({dt:.2f}s vs {base_dt:.2f}s baseline, budget {budget:.2f}s)",
+             dt < budget, f"took {dt:.2f}s")
+        case("the flooded record's acceptance edge SURVIVES (C2-F1b: appending "
+             "must not un-decide)", edges(work) == honest,
+             f"{edges(work)} vs {honest} | {out[-300:]}")
+        case("and the rebuild that keeps it exits 0", r.returncode == 0,
+             out[-300:])
+        case("the notes are COLLAPSED, not dumped: a human can still read the "
+             f"report ({len(out.splitlines())} lines)",
+             len(out.splitlines()) < 40, f"{len(out.splitlines())} lines")
+        case("and the collapse says how many entries and how many actors",
+             "further signature entries excluded" in out
+             and "distinct actor" in out, out[-500:])
+
+        t0 = time.time()
+        v = run("verify")
+        vdt = time.time() - t0
+        vout = v.stdout + v.stderr
+        case(f"`oaip verify` is bounded too ({vdt:.2f}s, budget {budget:.2f}s)",
+             vdt < budget, f"took {vdt:.2f}s")
+        case("`oaip verify` still passes the flooded-but-honest record",
+             v.returncode == 0, vout[-400:])
+        case(f"`oaip verify` prints a report, not a dump "
+             f"({len(vout.splitlines())} lines)", len(vout.splitlines()) < 40,
+             f"{len(vout.splitlines())} lines")
+
+        # The other end of the same lever: bytes, not entries. A record padded
+        # past the size limit is refused BY NAME, before it is parsed.
+        big = dict(env)
+        big["sigs"] = env["sigs"] + [{"actor": "pad@other", "key": "cd" * 32,
+                                      "sig": "ef" * 64, "pad": "A" * (5 << 20)}]
+        p.write_text(json.dumps(big))
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("a store record padded past the size limit is refused in a sentence",
+             r.returncode != 0 and "over the" in out and "byte limit" in out,
+             out[-400:])
+        case("and that refusal marks the projection untrusted",
+             (work / ".oaip" / "projection.untrusted").is_file())
+
+
 def main():
     part_a()
     part_b()
     part_c()
     part_d()
+    part_e()
     print("\nSIGNATURE-GATE: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1
 
