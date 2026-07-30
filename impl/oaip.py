@@ -66,7 +66,32 @@ else:
     WARRANT = [sys.executable, str(_cand)]
 # A sleeping Warrant CLI hung `rebuild` forever: WARRANT_CLI names an arbitrary
 # program, so every call to it is bounded (2026-07-30 review, F11).
-WARRANT_TIMEOUT = int(os.environ.get("OAIP_WARRANT_TIMEOUT") or 120)
+def _warrant_timeout():
+    """Seconds, from OAIP_WARRANT_TIMEOUT. A DIAGNOSIS, never a traceback.
+
+    `OAIP_WARRANT_TIMEOUT=notanint` raised ValueError at import time, so every
+    subcommand — `log`, `verify`, `init`, all of them — died with a traceback
+    pointing at a line of this file rather than at the variable the operator set
+    (C2-F2, 2026-07-30, third review round). An unusable setting is refused by
+    name; it is not silently replaced with the default either, since an operator
+    who set a bound meant to have one."""
+    raw = (os.environ.get("OAIP_WARRANT_TIMEOUT") or "").strip()
+    if not raw:
+        return 120
+    try:
+        v = int(raw)
+    except ValueError:
+        sys.exit(f"OAIP_WARRANT_TIMEOUT={raw!r} is not an integer number of "
+                 "seconds — unset it to use the default (120s), or give it a "
+                 "positive whole number.")
+    if v <= 0:
+        sys.exit(f"OAIP_WARRANT_TIMEOUT={raw!r} must be a POSITIVE number of "
+                 "seconds: a bound of zero or less would refuse every Warrant "
+                 "call before it began.")
+    return v
+
+
+WARRANT_TIMEOUT = _warrant_timeout()
 VERIFY_REPORT = "warrant.verify-report@v0"
 # The explicit claim→warrant link, carried in the signed `subject.note`. Matched
 # CASE-INSENSITIVELY: `note.startswith("oaip-claim:")` let any writer choose the
@@ -370,13 +395,55 @@ def note_convention_since():
     return ts, None
 
 
+def ensure_oaip_dir():
+    """The ledger directory, or a refusal that says what is in the way.
+
+    `OAIP.mkdir(exist_ok=True)` raised FileExistsError — a bare traceback — when
+    a plain FILE sat at `.oaip` (C1-F2, 2026-07-30, third review round). The
+    directory and symlink cases had been handled and the file case was missed,
+    which is the same defect class the whole branch keeps finding: a refusal is a
+    decision, a traceback is an accident. Note that on a case-insensitive
+    filesystem a file named `.OAIP` is this path."""
+    if OAIP.exists() and not OAIP.is_dir():
+        kind = "a symlink to a non-directory" if OAIP.is_symlink() else "a file"
+        sys.exit(f"refusing to use {OAIP}: it exists and is {kind}, not a "
+                 "directory. This is where the ledger, the Warrant store and "
+                 "this observer's SIGNING KEY live. Move or remove it (on a "
+                 "case-insensitive filesystem, check for `.OAIP` too), then run "
+                 "`oaip init`.")
+    try:
+        OAIP.mkdir(exist_ok=True)
+    except OSError as e:
+        sys.exit(f"cannot create the ledger directory {OAIP}: {e}")
+
+
+def ensure_oaip_dir_readable():
+    """The half of `ensure_oaip_dir` that never CREATES anything — for the read
+    paths, which must diagnose a blocked ledger without conjuring an empty one."""
+    if OAIP.exists() and not OAIP.is_dir():
+        ensure_oaip_dir()               # refuses, naming what is in the way
+
+
 def ensure_trust():
     """OAIP's keyring must exist before anything verifies: a missing trust config
     makes Warrant's settlement preflight fail closed, and an empty one is the
     honest starting point (no actor is bound until OAIP binds it)."""
-    OAIP.mkdir(exist_ok=True)
+    ensure_oaip_dir()
     if not TRUST.is_file():
-        TRUST.write_text(json.dumps({"actors": {}}, sort_keys=True) + "\n")
+        write_keyring({})
+
+
+def write_keyring(actors):
+    """Write the keyring, or refuse in words. A READ-ONLY `.oaip` made `oaip
+    bind` die with a PermissionError traceback instead of saying which file it
+    could not write and why that matters (2026-07-30, third review round)."""
+    try:
+        TRUST.write_text(json.dumps({"actors": actors}, sort_keys=True) + "\n")
+    except OSError as e:
+        sys.exit(f"cannot write the keyring {TRUST}: {e}. Nothing was bound — "
+                 "OAIP derives an acceptance edge only from a signer this file "
+                 "vouches for, so a keyring it cannot update is a refusal, not a "
+                 "warning. Check the permissions on the ledger directory.")
 
 
 def read_trust():
@@ -413,7 +480,7 @@ def bind_actor(actor: str, key: str):
     if key in actors.get(actor, []):
         return
     actors.setdefault(actor, []).append(key)
-    TRUST.write_text(json.dumps({"actors": actors}, sort_keys=True) + "\n")
+    write_keyring(actors)
 
 
 def accepting_signature(wid, env, actors):
@@ -874,7 +941,17 @@ def effects_between(before_tree: str, after_tree: str):
 
 
 # ---------- ledger (SQLite projection) ----------
-def db(path=None):
+def db(path=None, create=False):
+    # An uninitialised (or blocked) ledger is a DIAGNOSIS. `sqlite3.connect`
+    # raises a bare `OperationalError: unable to open database file` when the
+    # parent directory is missing or is not a directory, and that traceback was
+    # every command's answer to "there is no ledger here" — same defect class as
+    # the FileExistsError at `.oaip` (C1-F2).
+    if path is None and not create:
+        ensure_oaip_dir_readable()
+        if not DB.is_file():
+            sys.exit(f"no ledger at {DB} — run `oaip init` in this repository "
+                     "first")
     con = sqlite3.connect(path or DB)
     con.execute("PRAGMA foreign_keys=ON")
     # Wait for a writer instead of raising. A concurrent `accept` and `rebuild`
@@ -905,7 +982,7 @@ def store_lock():
     pathspecs already keep it out of every snapshot. On a platform without
     `fcntl` the lock degrades to nothing rather than failing; the UNIQUE
     constraint and the atomic rename still hold there."""
-    OAIP.mkdir(exist_ok=True)
+    ensure_oaip_dir()
     if fcntl is None:
         yield
         return
@@ -1010,8 +1087,8 @@ def cmd_init(_):
                  f"{OAIP} — through a symlink the key lands in the snapshot (and "
                  "in .git/objects) under the target's name instead. Remove the "
                  f"symlink and let `oaip init` create a real {OAIP} directory.")
-    OAIP.mkdir(exist_ok=True)
-    db().executescript(SCHEMA)
+    ensure_oaip_dir()
+    db(create=True).executescript(SCHEMA)
     wrun("--store", str(WSTORE), "init")
     if not WKEY.exists():
         r = wrun("keygen", "--out", str(WKEY))

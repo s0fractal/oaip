@@ -386,6 +386,69 @@ def main():
              and "warning" in r.stderr, f"rc={r.returncode} {r.stderr[:200]}")
 
     with tempfile.TemporaryDirectory() as tmp:
+        # --- 4d (C1-F2, third adversarial round): a plain FILE at the ledger
+        # path. The DIRECTORY case (a real `.oaip`) and the SYMLINK case were
+        # both handled; the file case was missed, so `OAIP.mkdir(exist_ok=True)`
+        # raised a bare FileExistsError traceback. A refusal is a decision.
+        d = Path(tmp) / "filepath"
+        d.mkdir()
+        subprocess.run(["git", "init", "-q", "."], cwd=d, capture_output=True)
+        oaip = lambda *a, **kw: subprocess.run(
+            [sys.executable, str(ROOT / "impl" / "oaip.py"), *a], cwd=d,
+            capture_output=True, text=True, **kw)
+        (d / ".oaip").write_text("not a ledger\n")
+        r = oaip("init")
+        out = r.stdout + r.stderr
+        case("a FILE at .oaip: init refuses instead of tracebacking",
+             r.returncode != 0 and "Traceback" not in r.stderr
+             and "not a directory" in out, f"rc={r.returncode} {out[-200:]}")
+        case("the refusal says what lives there, so it is not deleted lightly",
+             "SIGNING KEY" in out, out[-300:])
+        r = oaip("log")
+        case("...and a read command diagnoses it too, without a traceback",
+             r.returncode != 0 and "Traceback" not in r.stderr,
+             (r.stdout + r.stderr)[-200:])
+        (d / ".oaip").unlink()
+        # An uninitialised ledger was the same defect class: sqlite3 raised
+        # `unable to open database file` and the traceback was the answer to
+        # "there is no ledger here".
+        r = oaip("log")
+        case("no ledger at all: `log` says so instead of raising sqlite3",
+             r.returncode != 0 and "Traceback" not in r.stderr
+             and "oaip init" in (r.stdout + r.stderr),
+             (r.stdout + r.stderr)[-200:])
+        # A FILE named `.OAIP` is the same path on a case-insensitive filesystem
+        # (this project's own development platform), and a different one
+        # elsewhere; assert only where it is the same path.
+        (d / ".OAIP").write_text("not a ledger either\n")
+        if (d / ".oaip").exists():          # the filesystem folds case
+            r = oaip("init")
+            case("a FILE at .OAIP on a case-insensitive filesystem: refused too",
+                 r.returncode != 0 and "Traceback" not in r.stderr,
+                 (r.stdout + r.stderr)[-200:])
+        (d / ".OAIP").unlink()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- 10 (third adversarial round): a READ-ONLY ledger directory made
+        # `oaip bind` die with a PermissionError traceback. The keyring is what
+        # OAIP consults before deriving any acceptance edge, so a keyring it
+        # cannot update is a refusal that must be readable as one.
+        L = Repo(Path(tmp) / "ro")
+        trust = L.dir / ".oaip" / "trust.json"
+        trust.unlink(missing_ok=True)
+        os.chmod(L.dir / ".oaip", 0o500)
+        try:
+            r = L.run("bind", "--actor", "someone@local")
+            out = r.stdout + r.stderr
+            case("a read-only ledger: bind diagnoses instead of tracebacking",
+                 r.returncode != 0 and "Traceback" not in r.stderr
+                 and "trust.json" in out, f"rc={r.returncode} {out[-250:]}")
+            case("the diagnosis says nothing was bound",
+                 "Nothing was bound" in out, out[-250:])
+        finally:
+            os.chmod(L.dir / ".oaip", 0o700)
+
+    with tempfile.TemporaryDirectory() as tmp:
         # --- 9 (third adversarial round): `oaip bind` is the one command whose
         # whole purpose is to say WHICH key may sign as an actor, and it was the
         # least careful place in the codebase about it: any hex64 was accepted

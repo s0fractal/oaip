@@ -697,6 +697,33 @@ def main():
              r.returncode != 0 and time.time() - t0 < 45, f"{time.time()-t0:.0f}s "
              + out[-300:])
 
+        # C2-F2 (third adversarial round): the BOUND ITSELF was parsed with a
+        # bare `int()` at import time, so `OAIP_WARRANT_TIMEOUT=notanint` killed
+        # EVERY subcommand with a ValueError traceback pointing at a line of
+        # oaip.py rather than at the variable the operator set. A setting that
+        # cannot be used is refused by name.
+        def with_timeout(value, *argv):
+            return subprocess.run([sys.executable, "impl/oaip.py", *argv],
+                                  cwd=work, capture_output=True, text=True,
+                                  env=dict(os.environ,
+                                           OAIP_WARRANT_TIMEOUT=value))
+
+        for bad in ("notanint", "0", "-5", "12.5"):
+            rr = with_timeout(bad, "log")
+            out = rr.stdout + rr.stderr
+            case(f"OAIP_WARRANT_TIMEOUT={bad!r}: a diagnosis, not a traceback",
+                 rr.returncode != 0 and "Traceback" not in rr.stderr
+                 and "OAIP_WARRANT_TIMEOUT" in out,
+                 f"rc={rr.returncode} {out[-200:]}")
+        # The negative control: a usable value is not refused, and neither is an
+        # empty one (which means "unset", i.e. the 120s default).
+        for good in ("30", " "):
+            rr = with_timeout(good, "rebuild")
+            out = rr.stdout + rr.stderr
+            case(f"OAIP_WARRANT_TIMEOUT={good!r} is accepted",
+                 "OAIP_WARRANT_TIMEOUT" not in out
+                 and "Traceback" not in rr.stderr, f"rc={rr.returncode} {out[-200:]}")
+
         # And the honest store still rebuilds, with the real edge intact.
         r = run("rebuild")
         rows = [json.loads(x) for x in
