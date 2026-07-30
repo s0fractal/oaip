@@ -63,10 +63,24 @@ claims the name; a gate there is cheap.
    gh release create v0.1.0 --generate-notes
    ```
 3. The `publish` workflow builds, runs `twine check`, installs the wheel into a
-   fresh venv, runs `oaip --help` and the §1 conformance vectors **from /tmp**
-   (not from the checkout), and then runs `tools/check_release_surface.py`, which
-   fails the build if any subcommand or flag the docs name is missing from the
-   wheel. Only then does it publish via OIDC. Watch it:
+   fresh venv, and runs `tools/check_release_surface.py` against that install.
+   The gate fails the build if any subcommand or flag the docs name is missing
+   from the wheel — and, since 0.2.1, if any verb that CAN be executed offline
+   does not actually run: `conformance`, `records` and `trust-root` are invoked
+   with no arguments **from a fresh directory that is not the checkout**, and
+   must exit 0, print what they promise, and leave that directory empty. The
+   other ten verbs write, or need a Warrant CLI, or need an initialised ledger;
+   the gate names each one and its reason on every run, so "checked for
+   existence only" is stated rather than assumed.
+
+   That distinction is not theoretical. 0.2.0 passed the old gate and shipped:
+   it ran `oaip conformance <path into the checkout>`, so the default argument —
+   the relative path `examples/vectors.json`, which the wheel did not contain —
+   was never exercised, and `pip install oaip==0.2.0 && cd /tmp && oaip records`
+   raised `FileNotFoundError`. Finding a verb in `--help` is not finding that it
+   runs.
+
+   Only after the gate passes does the workflow publish via OIDC. Watch it:
 
    ```bash
    gh run watch

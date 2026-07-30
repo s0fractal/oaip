@@ -31,21 +31,36 @@ WHAT IT CHECKS
    `oaip <sub> --help` works for each.
 5. Every flag a documented invocation passes is a real option OF THAT
    SUBCOMMAND, taken from the subparser's own help.
-6. One real computation from outside the checkout: `oaip conformance` replays
-   the SPEC §1 canonicalization vectors and must print `OAIP-CONFORMANCE: ALL
-   PASS`. Parsing proves the surface exists; this proves the installed module
-   still computes.
+6. EVERY verb is classified, and the classification is itself checked. Each one
+   the CLI has must appear in `RUNNABLE` or in `NOT_RUNNABLE` with a reason; an
+   unclassified verb fails the gate. The `RUNNABLE` ones are then EXECUTED
+   against the artifact, from a fresh directory that is not the checkout, in
+   the documented form — **no arguments** — and must exit 0, print what they
+   promise, and leave that directory empty.
+
+   This is stronger than it was, because the weaker version shipped a defect.
+   Up to 0.2.0 step 6 ran `oaip conformance <absolute path to the checkout's
+   examples/vectors.json>`: one verb, handed the very file the artifact was
+   missing. It passed. Meanwhile `oaip records` and a bare `oaip conformance`
+   both defaulted to the relative path `examples/record-vectors.json`, so
+   `pip install oaip==0.2.0 && cd /tmp && oaip records` raised
+   FileNotFoundError. The gate found both verbs in `--help`, which is exactly
+   what "documented subcommand exists" can prove and no more.
 
 WHAT IT DOES NOT CHECK, AND WHY — read this before trusting a green run
 ----------------------------------------------------------------------
-* **The acceptance path is not exercised.** `oaip init`, `do`, `accept`,
-  `bind`, `rebuild` and `verify` all shell out to a **Warrant CLI**
+* **The acceptance path is not exercised.** Ten of the thirteen verbs are in
+  `NOT_RUNNABLE`, each with its reason, and the run prints all ten every time.
+  They divide into three kinds: those that shell out to a **Warrant CLI**
   (`$WARRANT_CLI`, or a sibling checkout) — a normative dependency that is NOT
-  a Python dependency of this package and is not present in a fresh venv. This
-  gate therefore proves those subcommands EXIST and accept their documented
-  flags; it does not prove they accept anything. The end-to-end acceptance and
-  refusal behaviour is covered by `tools/check.py`, from a checkout, with
-  Warrant installed. A green release-surface run is not a claim about §4.
+  a Python dependency of this package and is absent from a fresh venv; those
+  that WRITE (`rebuild` creates `.oaip/` in the working directory even with no
+  store present, which is measured, not assumed); and `log`, which is
+  read-only but has nothing to read outside a store and correctly exits 1.
+  For all ten this gate proves the subcommand EXISTS and accepts its documented
+  flags; it does not prove it works. End-to-end acceptance and refusal are
+  covered by `tools/check.py`, from a checkout, with Warrant installed. A green
+  release-surface run is not a claim about §4.
 * **Flag checking reads argparse's own option list, not argv semantics.** A
   documented flag must appear as an option of the subparser that documents it,
   which catches a removed or misplaced flag. It does not catch a documented
@@ -100,7 +115,52 @@ NOT_SUBCOMMANDS = {
 ARGPARSE_ERRORS = ("unrecognized arguments", "invalid choice",
                    "expected one argument", "the following arguments are required")
 
-CONFORMANCE_TAG = "OAIP-CONFORMANCE: ALL PASS"
+# --------------------------------------------------------------------------
+# EVERY VERB IS CLASSIFIED, AND THE CLASSIFICATION IS THE CHECK.
+#
+# Until 0.2.1 this gate proved a verb EXISTS in `--help` and, for exactly one
+# verb, that it computes — `oaip conformance <absolute path into the checkout>`.
+# Handing it the checkout's own file is what hid the defect: the computation was
+# fine, the DEFAULT was `examples/vectors.json`, and the gate never ran the
+# default. 0.2.0 shipped, and `pip install oaip && cd /tmp && oaip records`
+# traced back.
+#
+# So: every verb the CLI has must appear in one of the two tables below. RUNNABLE
+# is executed for real against the artifact from a directory that is not the
+# checkout, with NO arguments — the documented form a stranger types — and must
+# exit 0. NOT_RUNNABLE names a reason. A verb in neither table fails the gate
+# until someone classifies it, which makes every exclusion a decision on the
+# record instead of the thing nobody got round to.
+#
+# (verb, argv, expected substring or None)
+RUNNABLE = [
+    ("conformance", ["conformance"], "OAIP-CONFORMANCE: ALL PASS"),
+    ("records", ["records"], "OAIP-RECORDS: ALL PASS"),
+    # Read-only report of where the signing key and keyring would live. It
+    # RESOLVES the trust root and prints `(absent)`; it does not create it.
+    ("trust-root", ["trust-root"], None),
+]
+
+NOT_RUNNABLE = {
+    # Needs a Warrant CLI ($WARRANT_CLI or a sibling checkout), which a fresh
+    # venv does not have — Warrant is a normative dependency, not a Python one.
+    "init": "writes .oaip/ and needs a Warrant CLI to mint the signing key",
+    "accept": "shells out to $WARRANT_CLI to sign, and writes an acceptance",
+    "bind": "shells out to $WARRANT_CLI, and writes a binding record",
+    "do": "both: runs a caller-supplied command AND files a signed warrant",
+    "verify": "reads the decision layer through $WARRANT_CLI; exits 1 outside a "
+              "store, which is correct behaviour, not a clean exit",
+    # Mutating, with or without Warrant.
+    "intent": "writes an intent record; requires an initialised ledger",
+    "claim": "writes a claim record; requires an initialised ledger",
+    "run": "EXECUTES an arbitrary caller-supplied command and records it",
+    "rebuild": "writes: creates .oaip/ in the working directory (measured — it "
+               "does so even with no store present)",
+    # Read-only, but has nothing to read.
+    "log": "read-only, but requires an initialised ledger: outside a store it "
+           "exits 1 with `no ledger at .oaip/ledger.db`, which is the right "
+           "answer and not a clean exit. Covered end-to-end by tools/check.py",
+}
 
 # `oaip …` in prose stands for "some subcommand", not for a subcommand called
 # `…`. A placeholder in argv[0] means the line names no verb, so there is
@@ -318,6 +378,25 @@ def selftest():
         bare_words("the `flock` call and the `ts` field") == [],
         f"got {bare_words('the `flock` call and the `ts` field')}")
 
+    # The execution tables. A verb in both, or a "runnable" verb carrying an
+    # argument that reaches into this checkout, would restore the exact blind
+    # spot 0.2.0 shipped: a gate that measures the repo instead of the artifact.
+    run_names = [v for v, _a, _t in RUNNABLE]
+    chk("no verb is both runnable and excluded",
+        not (set(run_names) & set(NOT_RUNNABLE)),
+        f"both: {sorted(set(run_names) & set(NOT_RUNNABLE))}")
+    chk("no verb is listed as runnable twice", len(run_names) == len(set(run_names)))
+    chk("every exclusion carries a reason",
+        all(isinstance(r, str) and len(r) > 20 for r in NOT_RUNNABLE.values()),
+        f"thin: {[v for v, r in NOT_RUNNABLE.items() if len(r) <= 20]}")
+    chk("runnable verbs are invoked in the documented bare form, with no path "
+        "into this checkout",
+        all(a == [v] for v, a, _t in RUNNABLE),
+        f"argv beyond the verb: {[(v, a) for v, a, _t in RUNNABLE if a != [v]]}")
+    chk("the corpus verbs are executed, not merely looked up in --help",
+        {"conformance", "records"} <= set(run_names),
+        f"runnable: {run_names}")
+
     print("\nRELEASE-SURFACE-SELFTEST: " + ("ALL PASS" if all(ok) else "FAILURES")
           + f" ({sum(ok)}/{len(ok)})")
     return 0 if all(ok) else 1
@@ -497,18 +576,43 @@ def main():
                 f"prose — say which by adding it to NOT_SUBCOMMANDS with a "
                 f"reason")
 
-    # 6. One real computation, from outside the checkout.
-    vectors = ROOT / "examples" / "vectors.json"
-    if vectors.is_file():
-        rc, out, err = run(base + ["conformance", str(vectors)], workdir)
-        if rc != 0 or CONFORMANCE_TAG not in out:
-            tail = (out.strip().splitlines() or [""])[-1]
-            problems.append(f"`oaip conformance` from {workdir} exited {rc} "
-                            f"without {CONFORMANCE_TAG!r} (last line: {tail!r}) "
-                            f"— the installed module parses but does not compute")
-    else:
-        problems.append(f"missing {vectors}: the one check that proves the "
-                        f"installed module still computes cannot run")
+    # 6. EXECUTE every verb that can be executed, from outside the checkout,
+    #    in the documented form — no arguments, nothing from this repo handed
+    #    to it. Existence in `--help` is not the claim the docs make.
+    classified = {v for v, _a, _t in RUNNABLE} | set(NOT_RUNNABLE)
+    for verb in sorted(have - classified):
+        problems.append(
+            f"`oaip {verb}` exists but this gate does not say whether it can be "
+            f"executed against the artifact. Add it to RUNNABLE, or to "
+            f"NOT_RUNNABLE with the reason it cannot be — an unclassified verb "
+            f"is how `records` shipped untested")
+
+    ran = []
+    for verb, argv, tag in RUNNABLE:
+        if verb not in have:
+            problems.append(f"`oaip {verb}` is listed as executable but the CLI "
+                            f"has no such subcommand")
+            continue
+        # A FRESH directory per verb, so "it left nothing behind" is a fact
+        # about that verb and not about whichever ran first.
+        cell = tempfile.mkdtemp(prefix=f"oaip-run-{verb}-")
+        rc, out, err = run(base + argv, cell)
+        tail = ((out + err).strip().splitlines() or [""])[-1]
+        if rc != 0:
+            problems.append(f"`oaip {' '.join(argv)}` exited {rc} from {cell} — "
+                            f"a documented verb that does not run on a fresh "
+                            f"install (last line: {tail!r})")
+        elif tag and tag not in out:
+            problems.append(f"`oaip {' '.join(argv)}` exited 0 from {cell} but "
+                            f"never printed {tag!r} (last line: {tail!r}) — it "
+                            f"parses, it does not compute")
+        else:
+            ran.append(verb)
+        left = sorted(p.name for p in Path(cell).iterdir())
+        if left:
+            problems.append(f"`oaip {' '.join(argv)}` is classified as "
+                            f"non-mutating but wrote {left} into {cell}. Either "
+                            f"it changed, or it belongs in NOT_RUNNABLE")
 
     if problems:
         print(f"RELEASE SURFACE: FAIL — the documentation promises "
@@ -520,15 +624,16 @@ def main():
         return 1
 
     # Say what was NOT covered, every time, so a green line cannot be misread.
-    warrant_verbs = sorted(v for v in ("init", "do", "accept", "bind", "rebuild",
-                                       "verify") if v in documented)
     print(f"RELEASE SURFACE: ALL PASS ({checked} documented invocations across "
-          f"{len(DOCS)} docs accepted by {target}; conformance vectors replay "
-          f"from outside the checkout)")
-    print(f"note: {', '.join(warrant_verbs)} are checked for EXISTENCE only — "
-          f"they shell out to a Warrant CLI, which a fresh venv does not have. "
-          f"Acceptance behaviour is gated by tools/check.py, not here.",
-          file=sys.stderr)
+          f"{len(DOCS)} docs accepted by {target}; {len(ran)} verb(s) EXECUTED "
+          f"from outside the checkout: {', '.join(ran)})")
+    print(f"note: {len(NOT_RUNNABLE)} verb(s) are checked for EXISTENCE ONLY. "
+          f"This gate proves they parse their documented flags; it does not "
+          f"prove they work. Acceptance behaviour is gated by tools/check.py, "
+          f"from a checkout, with Warrant installed — not here:", file=sys.stderr)
+    for verb in sorted(NOT_RUNNABLE):
+        mark = "  " if verb in documented else "  (undocumented) "
+        print(f"{mark}{verb}: {NOT_RUNNABLE[verb]}", file=sys.stderr)
     return 0
 
 

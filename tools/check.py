@@ -59,6 +59,13 @@ CHECKS = [
     ("record-shape conformance (§10 vectors: valid shapes AND must-reject)",
      ["python3", "impl/oaip.py", "records", "examples/record-vectors.json"],
      None, "OAIP-RECORDS: ALL PASS"),
+    # Both checks above run `impl/oaip.py` with cwd = this checkout, which is
+    # the one directory where a default of `examples/vectors.json` resolves.
+    # 0.2.0 shipped to PyPI with exactly that default and traced back from
+    # anywhere else. No `needs`: stdlib only, offline, no Warrant.
+    ("the corpus verbs work from outside a checkout (the 0.2.0 PyPI defect)",
+     ["python3", "tests/installed_vectors.py"], None,
+     "INSTALLED-VECTORS: ALL PASS"),
     ("canonical layer integrity (forged artifacts, §5 truth)",
      ["python3", "tests/canonical_layer.py"], None,
      "CANONICAL-LAYER: ALL PASS"),

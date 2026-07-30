@@ -4,8 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oaip"
-# Tracks SPEC.md ("Specification v0.1"); the repo has no release tags yet.
-version = "0.2.0"
+# Tracks SPEC.md ("Specification v0.1"). Tags: v0.1.0, v0.2.0.
+# 0.2.1 is a defect release: 0.2.0 is on PyPI with `oaip conformance` and
+# `oaip records` raising FileNotFoundError anywhere but a checkout.
+version = "0.2.1"
 description = "Observed Action & Intent Protocol: a content-addressed causal graph of what humans, agents, and tools actually did — and on what observed basis you accepted the result."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -35,6 +37,22 @@ Specification = "https://github.com/s0fractal/oaip/blob/main/SPEC.md"
 
 # Flat impl/ layout preserved: impl/oaip.py installs as the top-level `oaip`
 # module, and the `oaip` console script points at its argparse main().
+#
+# `oaip_vectors` is `examples/` under a package name. It exists because 0.2.0
+# shipped `oaip conformance` and `oaip records` with a checkout-relative default
+# path, so both traced back on a fresh install (see impl/oaip.py, "WHERE THE
+# VECTOR CORPUS LIVES"). The vectors are the evidence those two verbs exist to
+# replay; a wheel that omits them ships the verbs and not the thing they verify.
+#
+# The mapping — rather than a copy under impl/ — keeps ONE source of truth:
+# `examples/vectors.json` is the path SPEC.md and llms.txt name, and it stays
+# the file the build reads. Only the two .json corpora are packaged; the demo
+# shell scripts in examples/ need a git checkout and a Warrant CLI, so shipping
+# them would promise something the wheel cannot do.
 [tool.setuptools]
-package-dir = { "" = "impl" }
+package-dir = { "" = "impl", "oaip_vectors" = "examples" }
 py-modules = ["oaip"]
+packages = ["oaip_vectors"]
+
+[tool.setuptools.package-data]
+oaip_vectors = ["vectors.json", "record-vectors.json"]
