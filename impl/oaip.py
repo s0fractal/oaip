@@ -462,8 +462,13 @@ def cmd_accept(a):
         f.unlink(missing_ok=True)
     if len(wid) != 64:
         sys.exit(f"warrant filing failed: {r.stdout} {r.stderr}")
+    # created_at is the warrant's OWN signed ts, read back from the store — not a
+    # second reading of the clock. The projection row must be re-derivable from
+    # the canonical layer alone (§5), and two clock reads can straddle a second
+    # boundary: a rebuild that disagrees by one second is not "the same graph".
+    wts = json.loads((WSTORE / "records" / f"{wid}.json").read_text())["body"]["ts"]
     con.execute("INSERT INTO warrants(claim_id,warrant_id,created_at) VALUES (?,?,?)",
-                (a.claim, wid, int(time.time())))
+                (a.claim, wid, wts))
     con.commit()
     print(f"ACCEPTED -> warrant {wid}\n  (signed, hash-addressed, cites the provenance as evidence "
           f"and the validation as a cmd@v1 check)")
@@ -510,8 +515,15 @@ def cmd_rebuild(_):
     was no way to attempt it, and the attempt would have failed -- the invocation,
     exit code, state snapshots and environment fingerprint lived only in rows.
 
-    Reads ONLY .oaip/artifacts. If it needs the database to rebuild the database,
-    the claim is circular and the check is worthless.
+    Reads ONLY the canonical layer -- .oaip/artifacts plus the Warrant store,
+    which is exactly what §5 names ("artifacts + warrants"). If it needs the
+    database to rebuild the database, the claim is circular and the check is
+    worthless. The Warrant store half was missing until later on 2026-07-30:
+    rebuild never repopulated the `warrants` table, so the claim→warrant
+    ACCEPTANCE edge -- the one fact this protocol exists to record -- survived
+    `do` and died at the first rebuild, and `oaip log` silently lost its
+    WARRANT line. "The same graph" minus its most important edge is not the
+    same graph.
     """
     # Read and validate the canonical layer BEFORE touching the projection. A
     # fail-closed check that deletes the database and then refuses to rebuild it
@@ -529,6 +541,32 @@ def cmd_rebuild(_):
             continue
         if isinstance(doc, dict) and isinstance(doc.get("oaip_record"), str):
             records.append(doc)
+
+    # The other half of the canonical layer: the Warrant store. cmd_accept links
+    # a warrant to a claim by filing the claim's SUBJECT blob as the warrant's
+    # subject, so the store itself carries the linkage: an `accept` record whose
+    # subject.hash equals a claim's subject hash IS that claim's acceptance.
+    # Re-derive the edge the same way. Read and integrity-check BEFORE touching
+    # the projection, for the same reason as above: a record whose body does not
+    # hash to its own filename is not that record, and rebuilding from it would
+    # launder a forged acceptance -- the worst possible fact to forge.
+    accepts = []                       # (subject_hash, warrant_id, ts)
+    wrec_dir = WSTORE / "records"
+    for path in sorted(wrec_dir.glob("*.json")) if wrec_dir.is_dir() else []:
+        try:
+            body = loads_ijson(path.read_bytes())["body"]
+        except (ValueError, KeyError, TypeError) as e:
+            bad.append(f"warrant {path.stem[:12]}: unreadable record: {e}")
+            continue
+        if sha256(canon(body)) != path.stem:
+            bad.append(f"warrant {path.stem[:12]}: body hashes to "
+                       f"{sha256(canon(body))[:12]} — record does not match "
+                       "its own address")
+            continue
+        if body.get("decision") == "accept":
+            accepts.append((body.get("subject", {}).get("hash"),
+                            path.stem, body.get("ts")))
+
     if bad:
         for e in bad:
             print("ERR ", e, file=sys.stderr)
@@ -578,6 +616,19 @@ def cmd_rebuild(_):
         else:
             continue
         counts[kind] = counts.get(kind, 0) + 1
+    # The claim→warrant edge, from the store records validated above. Sorted
+    # filename order is deterministic, so two rebuilds agree (same property the
+    # ts/id sort gives the artifact records).
+    subjects = {}
+    for d in records:
+        if d["oaip_record"] == "claim@v1" and d.get("subject"):
+            subjects.setdefault(d["subject"], []).append(d["id"])
+    counts["warrant@edge"] = 0
+    for subj_hash, wid, wts in accepts:
+        for cid in subjects.get(subj_hash, []):
+            con.execute("INSERT INTO warrants(claim_id,warrant_id,created_at)"
+                        " VALUES (?,?,?)", (cid, wid, wts))
+            counts["warrant@edge"] += 1
     # Re-register the artifacts themselves, so the index over the canonical layer
     # is complete rather than only covering what the records referenced.
     for path in sorted(ART.glob("*")):

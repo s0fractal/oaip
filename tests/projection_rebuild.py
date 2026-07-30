@@ -29,6 +29,13 @@ WHAT IT CHECKS
 5. The fields that were lost before are individually present, named one by one,
    so a future regression says which fact went missing rather than "counts
    differ".
+6. The claim→warrant ACCEPTANCE edge survives rebuild. §5 names the canonical
+   layer as "artifacts + warrants", and rebuild read only the artifacts: the
+   warrants table was never repopulated, so `oaip log` lost its WARRANT line —
+   the protocol's most important fact — at the first rebuild. This file was
+   complicit: TABLES omitted `warrants`, so the comparison could not see the
+   loss. Fixed 2026-07-30; the edge is re-derived from the Warrant store
+   (accept records name the claim's subject blob hash).
 """
 import json
 import os
@@ -40,7 +47,12 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TABLES = ("intents", "executions", "effects", "claims", "attributions")
+# `warrants` was deliberately absent from this tuple until 2026-07-30, which is
+# how the projection could silently lose the claim→warrant edge on rebuild —
+# the one fact this protocol exists to record. It is in the graph; it is in the
+# comparison.
+TABLES = ("intents", "executions", "effects", "claims", "attributions",
+          "warrants")
 ok = True
 
 
@@ -95,7 +107,21 @@ def main():
         db = work / ".oaip" / "ledger.db"
         before = snapshot(db)
         case("a live run produced a graph",
-             all(before[t] for t in ("intents", "executions", "effects", "claims")))
+             all(before[t] for t in ("intents", "executions", "effects",
+                                     "claims", "warrants")))
+
+        # The acceptance edge, named before rebuild so its loss is a regression
+        # in THIS fact, not a diff in a dictionary. `log`'s WARRANT line is the
+        # protocol's most important sentence; until 2026-07-30 `rebuild` never
+        # repopulated the warrants table, so the line survived `do` and died at
+        # the first rebuild.
+        log_before = run("log")
+        case("log shows the WARRANT line before rebuild",
+             "WARRANT" in log_before.stdout, log_before.stdout)
+        wr = json.loads(before["warrants"][0])
+        for field in ("claim_id", "warrant_id", "created_at"):
+            case(f"warrant.{field} is present before rebuild",
+                 wr.get(field) not in (None, ""))
 
         # The fields that vanished before. Named individually so a regression says
         # WHICH fact was lost, not that two dictionaries differ.
@@ -120,6 +146,15 @@ def main():
             case(f"execution.{field} survived the projection",
                  ex2.get(field) == ex.get(field),
                  f"before={ex.get(field)!r} after={ex2.get(field)!r}")
+
+        wr2 = json.loads(after["warrants"][0]) if after["warrants"] else {}
+        for field in ("claim_id", "warrant_id", "created_at"):
+            case(f"warrant.{field} survived the projection",
+                 wr2.get(field) == wr.get(field),
+                 f"before={wr.get(field)!r} after={wr2.get(field)!r}")
+        log_after = run("log")
+        case("log still shows the WARRANT line after rebuild",
+             "WARRANT" in log_after.stdout, log_after.stdout)
 
         run("rebuild")
         case("rebuilding twice is idempotent", snapshot(db) == after)

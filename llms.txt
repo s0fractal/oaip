@@ -97,9 +97,15 @@ better evidence of good faith than finding them hidden.
 - **No signing of OAIP records themselves.** Integrity comes from
   content-addressing plus the Warrant record at the decision layer; the artifacts
   are not individually signed.
-- **§5 rebuild covers the projection, not the Warrant store.** `oaip rebuild`
-  reconstructs the SQLite index from `.oaip/artifacts`; it does not re-derive the
-  decision layer, which is Warrant's own artifact.
+- **§5 rebuild reconstructs the projection, never the Warrant store.** `oaip
+  rebuild` reads both halves of the canonical layer — `.oaip/artifacts` plus the
+  Warrant store — and re-derives the claim→warrant acceptance edge from the
+  store's `accept` records (it did not until 2026-07-30: the `warrants` table was
+  never repopulated, so `oaip log` lost its WARRANT line at the first rebuild).
+  The store itself is canonical, signed, and is not — cannot be — rebuilt. The
+  edge is re-derived by subject hash, so two claim records with byte-identical
+  subjects (same predicate, execution and effects) cannot be told apart by
+  rebuild: an acceptance of one is projected onto both.
 
 ## Conformance vectors, including the negative half
 
