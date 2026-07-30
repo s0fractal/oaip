@@ -90,13 +90,35 @@ work an attacker can make it do, how much of its output a human can still read,
 and what happens to a refusal that raises instead of returning. Both halves of
 that result are recorded below, the favourable one included.
 
-- **SPEC §2.4 and the reference implementation disagree on field names.** §2.4
-  declares Execution fields `invocation`, `status`, `input_state`, `output_state`,
-  `environment`; `impl/oaip.py` stores `command`, `exit_code`, `before_tree`,
-  `after_tree`, `env_fp`. **A third-party implementer following the specification
-  would emit artifacts incompatible with the reference.** The in-toto converter
-  follows the implementation and says so in a comment. Aligning them is a format
-  decision that has not been made — not a converter side effect.
+- **CLOSED 2026-07-30 (was: the spec and the implementation disagreed on every
+  record type).** The divergence was total, not only the §2.4 case this file used
+  to admit: Intent, State (which did not exist in the implementation at all),
+  Execution, Attribution, Effect and ClaimCandidate all differed in fields and in
+  type tag, and the conformance vectors pinned only the canonicalization
+  function, so both halves reported ALL PASS throughout. The implementation was
+  moved to SPEC §2; four places where the SPEC was wrong were changed instead and
+  are named in the commit body (`invocation` is an array because a joined string
+  cannot reconstruct argv; three member names collided with type tags;
+  Effect/Attribution had no `id`; `ski@v1` is reserved rather than admitted in
+  claim 0.1). `examples/record-vectors.json` now pins the record SHAPES, positive
+  and negative, and `tools/intoto.py` follows the specification with no comment
+  explaining why it does not.
+
+  What is NOT closed by that: the vectors are checked by one implementation
+  against itself. A second implementation is what would make "conformant" mean
+  something, and there is still only one.
+- **The fingerprints are reproducible, and thin.** `env_fingerprint` and
+  `toolchain_fingerprint` were undefined — a second implementation could not
+  compute a StateID at all. They are now SHA-256 over `environment_probe` /
+  `toolchain_probe` records under the registered profile `posix-base@v1`, whose
+  scope is five environment variables (PATH, LANG, LC_ALL, TZ,
+  SOURCE_DATE_EPOCH) and one tool probe (`git --version`). SPEC §2.2.1 says in as
+  many words that any other variable can change what a command does without
+  changing this number: it is a discriminator, not evidence of environmental
+  equivalence. A verifier that cannot re-run the probes reports
+  `unreproducible`, which §2.2.4 forbids collapsing into `matched` — and the
+  reference implementation does not re-run them at all, so today every
+  fingerprint it reports is `unreproducible`.
 - **One implementation.** Warrant has three that agree on broken stores; OAIP has
   Python only. Until a second exists, "conformant" here means "agrees with
   itself". This is the reason the negative vectors below were written first: a
@@ -351,6 +373,28 @@ that result are recorded below, the favourable one included.
   handles.
 
 ## Conformance vectors, including the negative half
+
+There are TWO vector files, and the second one did not exist until 2026-07-30.
+`examples/vectors.json` pins how a record SERIALIZES;
+`examples/record-vectors.json` pins what a record IS. Passing only the first
+means two implementations agree about JSON, not about the protocol — which is
+exactly the state this repository was in while the reference implementation
+wrote a different record from SPEC §2 for every type in it.
+
+`examples/record-vectors.json` (SPEC §10): 33 records that MUST validate and 83
+documents that MUST NOT, each pinned with the OUTCOME it must produce — because
+`invalid`, `unsupported-version`, `unknown-type`, `legacy` and `not-a-record`
+are five outcomes and not two, and returning one for another is a real
+interoperability bug a boolean assertion would hide. The reject half is grouped
+by class: `shape` (35) is the group a canonicalization vector cannot reach —
+impeccable JCS I-JSON whose shape is wrong (an unregistered effect kind, a
+`killed` process carrying an exit code, an attribution claiming a certainty its
+method may not claim); `missing-member` (15), `wrong-type` (11),
+`unknown-member` (8, i.e. closed schemas), `type-tag` (11, version negotiation
+and the legacy tag) and `bytes` (3, refused at ingestion rather than at the
+shape layer). Confirmed meaningful by weakening the validator two ways: dropping
+the unknown-member test scores 108/116, and accepting every object scores
+47/116.
 
 `examples/vectors.json` carries two kinds:
 
