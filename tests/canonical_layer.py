@@ -196,6 +196,48 @@ def main():
              (v2.stdout + v2.stderr)[-300:])
     with_ledger(bad_shape)
 
+    # --- SPEC §6.2's fail-closed clause: a record this reader UNDERSTANDS that
+    # cites one it does NOT. Reachable only across versions — inside one ledger
+    # the address is the bytes, so a cited record cannot be swapped for an
+    # unreadable one. The real shape of it is a v0.2 writer emitting a
+    # still-v0.1 execution that cites a v0.2 State.
+    def cites_the_unreadable(L):
+        import hashlib
+        arts = L.dir / ".oaip" / "artifacts"
+
+        def put(obj):
+            raw = json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False).encode()
+            h = hashlib.sha256(raw).hexdigest()
+            (arts / h).write_bytes(raw)
+            return h
+
+        future_state = put({"state": "9.9", "repo_commit": None,
+                            "worktree_tree": "0" * 40,
+                            "env_fingerprint": "0" * 64,
+                            "toolchain_fingerprint": "0" * 64})
+        # On its own, a record from the future is reported and changes nothing.
+        r0 = L.run("rebuild")
+        case("a lone unreadable record does not refuse the whole store",
+             r0.returncode == 0
+             and "unsupported-version" in (r0.stdout + r0.stderr),
+             (r0.stdout + r0.stderr)[-300:])
+
+        put({"execution": "0.1", "id": "1784000000009-ffff0009",
+             "intent_id": None,
+             "executor": {"actor": "a@h", "runtime": "exec@v1"},
+             "input_state": future_state, "output_state": future_state,
+             "invocation": ["true"], "environment": "0" * 64,
+             "status": "exited", "exit_code": 0, "output": None,
+             "ts": 1784000000})
+        r = L.run("rebuild")
+        out = r.stdout + r.stderr
+        case("a VALID record citing an unreadable one fails closed (§6.2)",
+             r.returncode != 0 and "fails closed" in out, out[-500:])
+        case("...and the refusal names both records",
+             future_state[:12] in out, out[-500:])
+    with_ledger(cites_the_unreadable)
+
     # --- the P0 itself: content edited in place, address left alone.
     def forged_command(L):
         p, d = L.records("execution")[0]

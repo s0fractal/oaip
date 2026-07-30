@@ -1295,6 +1295,35 @@ VALIDATORS = {
 }
 
 
+def hash_citations(doc, rtype):
+    """Every hex64 address a valid record CITES (SPEC §6.2).
+
+    Only content addresses: an event id names a record whose own address this
+    reader does not know, so a citation by id cannot be resolved against the
+    unreadable set and is deliberately not guessed at here."""
+    out = set()
+
+    def add(*vals):
+        for v in vals:
+            if isinstance(v, str) and HEX64.match(v):
+                out.add(v)
+            elif isinstance(v, list):
+                add(*v)
+
+    if rtype == "execution":
+        add(doc["input_state"], doc["output_state"], doc["output"])
+    elif rtype == "claim":
+        add(doc["subject"], doc["evidence"], doc["validation"]["check"],
+            doc["validation"]["transcript"])
+    elif rtype == "intent":
+        add(doc["acceptance_refs"])
+    elif rtype == "attribution":
+        add(doc["support"])
+    elif rtype == "artifact":
+        add(doc["hash"])
+    return out
+
+
 def validate_record(doc):
     """SPEC §6.2 -> (outcome, type, version, detail).
 
@@ -2665,6 +2694,29 @@ def _rebuild(a):
             # forward-compatible writer becomes indistinguishable from an
             # attacker.
             unread.append((path.name, outcome, t, ver, detail))
+
+    # SPEC §6.2, the fail-closed clause: where a record this reader UNDERSTANDS
+    # cites one it does not, the derivation that needed the citation MUST fail.
+    # It must not proceed as though the citation were absent or satisfied — a
+    # claim whose subject is a record from the future is not a claim with a
+    # missing subject, it is a claim about something this reader cannot see, and
+    # projecting it with a NULL in that column asserts the opposite.
+    #
+    # This is reachable only across versions: within one ledger an address IS
+    # the bytes, so the cited record cannot be swapped for an unreadable one.
+    # The real case is a v0.2 writer emitting a still-v0.1 claim that cites a
+    # v0.2 State, read here.
+    unread_addr = {name for name, _o, _t, _v, _d in unread}
+    if unread_addr:
+        for d in records:
+            bad = sorted(hash_citations(d, rec_type[id(d)]) & unread_addr)
+            if bad:
+                art_bad.append(
+                    f"{rec_addr[id(d)][:12]}: this {rec_type[id(d)]} cites "
+                    f"{', '.join(b[:12] for b in bad)}, which this reader "
+                    "cannot read (§6.2: a citation to an unreadable record "
+                    "fails closed — deriving anything from it would assert the "
+                    "citation was absent or satisfied, and it is neither)")
 
     # The other half of the canonical layer: the Warrant store.
     accepts, wrec_files, store_errs = read_warrant_store()
