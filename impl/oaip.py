@@ -3891,10 +3891,89 @@ def cmd_verify(_):
                    or (report and report["errors"])) else 0)
 
 
+# ---------------------------------------------------------------------------
+# WHERE THE VECTOR CORPUS LIVES
+#
+# `conformance` and `records` are the two verbs that let a stranger ask whether
+# THIS build agrees with SPEC §1 and §10. Up to and including 0.2.0 both
+# defaulted to the literal relative path `examples/vectors.json`, which resolves
+# only when the process happens to be standing in a checkout. `pip install
+# oaip==0.2.0 && cd /tmp && oaip records` therefore produced a
+# FileNotFoundError traceback: a documented verb, on a fresh install, from every
+# directory but one. That shipped to PyPI.
+#
+# The corpus is now IN the distribution — `oaip_vectors` is `examples/` under a
+# package name (same files, one source of truth; see pyproject.toml), so the
+# self-check computes from site-packages, from a checkout, and from an unpacked
+# sdist alike. A protocol package that cannot check its own conformance where it
+# is installed is not much of a protocol package.
+#
+# The checkout is deliberately AUTHORITATIVE where one exists: if this module
+# has a sibling `examples/` directory, that directory IS the corpus, and a file
+# missing from it is a hard error rather than a quiet fall-through to whatever
+# happens to be installed. A checkout that self-verifies against vectors it does
+# not contain would be the same class of lie as the bug above.
+# ---------------------------------------------------------------------------
+VECTORS_PKG = "oaip_vectors"
+CHECKOUT_VECTORS = Path(__file__).resolve().parent.parent / "examples"
+
+
+def vector_source(name):
+    """The corpus file `name`, as something with `.read_text()`.
+
+    Checkout/sdist first and exclusively; installed package data otherwise.
+    Exits with a sentence rather than a traceback when neither answers."""
+    if CHECKOUT_VECTORS.is_dir():
+        p = CHECKOUT_VECTORS / name
+        if not p.is_file():
+            raise SystemExit(
+                f"missing vector corpus: {p}\n"
+                f"This checkout has an examples/ directory, so it — not any "
+                f"installed copy — is what `oaip` must be measured against. "
+                f"Restore the file or pass an explicit path.")
+        return p
+    # Installed: the corpus ships beside the module. This plain path check is
+    # first because `oaip_vectors` is a namespace package (examples/ has no
+    # __init__.py, and putting one there would be a Python file in a directory
+    # of shell demos), and `importlib.resources.files()` only learned to answer
+    # for namespace packages in 3.12 — while this package supports 3.9.
+    sibling = Path(__file__).resolve().parent / VECTORS_PKG / name
+    if sibling.is_file():
+        return sibling
+    # A loader that is not a directory at all (zipapp, a bundler). Last resort,
+    # and best-effort: any failure here is reported as "not found", not raised.
+    try:
+        from importlib.resources import files
+        res = files(VECTORS_PKG) / name
+        if res.is_file():
+            return res
+        detail = f"{VECTORS_PKG} resolves but does not contain {name}"
+    except Exception as e:                                    # noqa: BLE001
+        detail = f"{sibling} absent, and {VECTORS_PKG} did not resolve ({e})"
+    raise SystemExit(
+        f"cannot locate the {name} vector corpus.\n"
+        f"  no checkout at: {CHECKOUT_VECTORS}\n"
+        f"  package data:   {detail}\n"
+        f"This build cannot check its own conformance. Reinstall oaip, or pass "
+        f"the path to a corpus explicitly.")
+
+
+def read_vectors(arg, name):
+    """Parse the corpus the caller asked for, or the one this build ships."""
+    if arg is None:
+        return json.loads(vector_source(name).read_text(encoding="utf-8"))
+    p = Path(arg)
+    if not p.is_file():
+        # Loud, and about the path the caller actually named: an explicit
+        # argument is never silently replaced by the shipped corpus.
+        raise SystemExit(f"no such vector file: {p}")
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
 def cmd_conformance(a):
     """SPEC §1: every OAIP record MUST canonicalize (JCS, Warrant §4) to the pinned
     bytes and identity. Recompute canon over each vector and compare byte-exact."""
-    doc = json.loads(Path(a.vectors).read_text(encoding="utf-8"))
+    doc = read_vectors(a.vectors, "vectors.json")
     ok = 0
     total = 0
     for v in doc["records"]:
@@ -3937,7 +4016,7 @@ def cmd_records(a):
     valid": `unsupported-version` and `unknown-type` are distinct from
     `invalid`, and an implementation that returns one for the other has a real
     interoperability bug (§6.2) that a boolean assertion would hide."""
-    doc = json.loads(Path(a.vectors).read_text(encoding="utf-8"))
+    doc = read_vectors(a.vectors, "record-vectors.json")
     ok = total = 0
     for v in doc["accept"]:
         total += 1
@@ -4042,10 +4121,23 @@ def main():
     pt.add_argument("--to", metavar="PATH",
                     help="migrate to PATH instead of the default location")
     pt.set_defaults(fn=cmd_trust_root)
-    pf = sub.add_parser("conformance"); pf.add_argument("vectors", nargs="?", default="examples/vectors.json"); pf.set_defaults(fn=cmd_conformance)
+    # `vectors` defaults to None, NOT to `examples/…`: a relative path as a
+    # default is a promise that only holds in one directory on earth, and 0.2.0
+    # shipped it. `vector_source()` decides — checkout first, shipped corpus
+    # otherwise — so these two verbs run wherever the package is installed.
+    pf = sub.add_parser("conformance", help="canonicalization vectors (SPEC §1) "
+                        "— replays the corpus this build ships")
+    pf.add_argument("vectors", nargs="?", default=None,
+                    help="a vector file to replay instead of the one this "
+                         "build ships (default: examples/vectors.json in a "
+                         "checkout, else the installed corpus)")
+    pf.set_defaults(fn=cmd_conformance)
     pv = sub.add_parser("records", help="record-SHAPE conformance vectors "
                         "(SPEC §10) — what a record is, not how it serializes")
-    pv.add_argument("vectors", nargs="?", default="examples/record-vectors.json")
+    pv.add_argument("vectors", nargs="?", default=None,
+                    help="a vector file to replay instead of the one this "
+                         "build ships (default: examples/record-vectors.json "
+                         "in a checkout, else the installed corpus)")
     pv.set_defaults(fn=cmd_records)
     a = ap.parse_args()
     # BEFORE any subcommand: every path that signs, vouches, or believes a
