@@ -39,6 +39,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -65,6 +66,21 @@ else:
 # ---------- content-addressed helpers ----------
 def sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
+
+
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def warrant_cli_available() -> bool:
+    """True when the WARRANT argv names something that can actually run.
+    Mirrors tools/check.py: either the program is on PATH / at its path, and —
+    for the `python3 …/warrant.py` form — the script file exists."""
+    prog = WARRANT[0]
+    if not (shutil.which(prog) or Path(prog).exists()):
+        return False
+    if len(WARRANT) >= 2 and WARRANT[1].endswith(".py"):
+        return Path(WARRANT[1]).is_file()
+    return True
 
 
 # ---------- strict I-JSON ingestion (SPEC §1) ----------
@@ -483,10 +499,20 @@ def cmd_accept(a):
     checkfile.write_text(check_cmd + "\n")
     transcript_file = OAIP / "transcript.tmp"
     transcript_file.write_bytes((ART / transcript_hash).read_bytes())
+    # The subject blob is the claim's SUBJECT, and two claims can share one:
+    # {predicate, execution, effects} excludes the check command and verdict, so
+    # `--check true` and `--check false` over the same execution collide. A
+    # rebuild that re-derived the acceptance edge by subject hash alone projected
+    # this one signed warrant onto the FAILED claim too (2026-07-30 adversarial
+    # review; §5 violation). So the linkage is made EXPLICIT at accept time: the
+    # accepted claim's id rides in subject.note, INSIDE the signed body — rebuild
+    # follows it instead of guessing by subject hash. Legacy records without the
+    # note fall back to subject-hash matching restricted to supported claims.
     r = w("accept", "--subject", subj, "--under", pol,
           "--check", str(checkfile), "--verdict", "pass",
           "--transcript", str(transcript_file),
           "--reason", f"claim: {predicate}",
+          "--note", f"oaip-claim:{a.claim}",
           "--actor", a.actor, "--key", str(WKEY))
     wid = r.stdout.strip()
     for f in (subj_file, checkfile, transcript_file):
@@ -573,21 +599,49 @@ def cmd_rebuild(_):
         if isinstance(doc, dict) and isinstance(doc.get("oaip_record"), str):
             records.append(doc)
 
-    # The other half of the canonical layer: the Warrant store. cmd_accept links
-    # a warrant to a claim by filing the claim's SUBJECT blob as the warrant's
-    # subject, so the store itself carries the linkage: an `accept` record whose
-    # subject.hash equals a claim's subject hash IS that claim's acceptance.
-    # Re-derive the edge the same way. Read and integrity-check BEFORE touching
-    # the projection, for the same reason as above: a record whose body does not
-    # hash to its own filename is not that record, and rebuilding from it would
-    # launder a forged acceptance -- the worst possible fact to forge.
-    accepts = []                       # (subject_hash, warrant_id, ts)
+    # The other half of the canonical layer: the Warrant store. Read and
+    # integrity-check BEFORE touching the projection, for the same reason as
+    # above: a record whose body does not hash to its own filename is not that
+    # record, and rebuilding from it would launder a forged acceptance -- the
+    # worst possible fact to forge.
+    #
+    # ADDRESS-MATCHING IS NOT VERIFICATION (2026-07-30 adversarial review).
+    # `sha256(canon(body)) == filename` is satisfied BY CONSTRUCTION by anyone
+    # who can write a file: a hand-written body with decision:"accept", a real
+    # claim's subject hash and junk sigs, filed at its own valid address, made
+    # this function print warrant=1 for a claim whose check had FAILED — an
+    # unsigned acceptance laundered into the projection, contradicting the very
+    # invariant cmd_accept signs for. So before ANY acceptance edge is derived,
+    # the store is verified by the Warrant CLI (signatures included) — the same
+    # normative dependency cmd_verify already shells out to. Fail closed both
+    # ways: a store that does not verify refuses the rebuild, and a store that
+    # CANNOT be verified (no runnable Warrant CLI) refuses too, rather than
+    # silently deriving edges no one checked. Rebuild is thereby never weaker
+    # than the live cmd_accept path, which files through the same CLI.
+    accepts = []                       # (subject_hash, warrant_id, ts, note)
     wrec_dir = WSTORE / "records"
-    for path in sorted(wrec_dir.glob("*.json")) if wrec_dir.is_dir() else []:
+    wrec_files = sorted(wrec_dir.glob("*.json")) if wrec_dir.is_dir() else []
+    for path in wrec_files:
+        if not HEX64.match(path.stem):
+            # Not forged — not a record at all. A stray notes.json used to be
+            # reported as "does not match its own address", misdiagnosing a
+            # benign file as a forgery. Say what it is, precisely.
+            bad.append(f"warrant store: stray file {path.name} in records/ — "
+                       "its name is not a record address; remove it (the "
+                       "Warrant store treats every records/*.json as a record)")
+            continue
         try:
-            body = loads_ijson(path.read_bytes())["body"]
-        except (ValueError, KeyError, TypeError) as e:
+            doc = loads_ijson(path.read_bytes())
+        except ValueError as e:
             bad.append(f"warrant {path.stem[:12]}: unreadable record: {e}")
+            continue
+        body = doc.get("body") if isinstance(doc, dict) else None
+        if not isinstance(body, dict):
+            # A crafted non-dict body at a valid address used to crash this
+            # function with an AttributeError; a refusal is a decision, a
+            # traceback is an accident.
+            bad.append(f"warrant {path.stem[:12]}: envelope has no body object "
+                       "— not a warrant record")
             continue
         if sha256(canon(body)) != path.stem:
             bad.append(f"warrant {path.stem[:12]}: body hashes to "
@@ -595,8 +649,24 @@ def cmd_rebuild(_):
                        "its own address")
             continue
         if body.get("decision") == "accept":
-            accepts.append((body.get("subject", {}).get("hash"),
-                            path.stem, body.get("ts")))
+            subj = body.get("subject") if isinstance(body.get("subject"), dict) else {}
+            accepts.append((subj.get("hash"), path.stem, body.get("ts"),
+                            subj.get("note") or ""))
+
+    if wrec_files:
+        if not warrant_cli_available():
+            bad.append("warrant store: records exist but no runnable Warrant "
+                       "CLI is configured (set WARRANT_CLI) — refusing to "
+                       "derive acceptance edges from records whose signatures "
+                       "nothing verified")
+        else:
+            r = subprocess.run(WARRANT + ["--store", str(WSTORE), "verify"],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                tail = (r.stdout + r.stderr).strip().splitlines()
+                bad.append("warrant store: `warrant verify` FAILED — an "
+                           "unverified acceptance must not become an edge"
+                           + (f" ({tail[-1]})" if tail else ""))
 
     if bad:
         for e in bad:
@@ -647,19 +717,60 @@ def cmd_rebuild(_):
         else:
             continue
         counts[kind] = counts.get(kind, 0) + 1
-    # The claim→warrant edge, from the store records validated above. Sorted
-    # filename order is deterministic, so two rebuilds agree (same property the
-    # ts/id sort gives the artifact records).
-    subjects = {}
+    # The claim→warrant edge, from the store records validated AND verified
+    # above. Sorted filename order is deterministic, so two rebuilds agree
+    # (same property the ts/id sort gives the artifact records).
+    #
+    # THE LINK IS EXPLICIT, NOT GUESSED (2026-07-30 adversarial review). The
+    # claim subject {predicate, execution, effects} excludes the check command
+    # and the verdict, so a `--check true` claim and a `--check false` claim
+    # over the same execution have IDENTICAL subject hashes — and deriving the
+    # edge by subject hash projected one real signed acceptance onto the FAILED
+    # claim too, changing the graph across rebuild (§5 MUST violation). New
+    # accepts carry the accepted claim's id in subject.note ("oaip-claim:<id>",
+    # inside the signed body); rebuild follows that. Legacy accepts without the
+    # note fall back to subject-hash matching restricted to supported claims —
+    # never weaker than cmd_accept, which refuses unsupported claims.
+    claims_by_id = {d["id"]: d for d in records
+                    if d["oaip_record"] == "claim@v1" and d.get("id")}
+    supported_by_subject = {}
     for d in records:
-        if d["oaip_record"] == "claim@v1" and d.get("subject"):
-            subjects.setdefault(d["subject"], []).append(d["id"])
+        if (d["oaip_record"] == "claim@v1" and d.get("subject")
+                and d.get("supported")):
+            supported_by_subject.setdefault(d["subject"], []).append(d["id"])
     counts["warrant@edge"] = 0
-    for subj_hash, wid, wts in accepts:
-        for cid in subjects.get(subj_hash, []):
-            con.execute("INSERT INTO warrants(claim_id,warrant_id,created_at)"
-                        " VALUES (?,?,?)", (cid, wid, wts))
-            counts["warrant@edge"] += 1
+    NOTE_PREFIX = "oaip-claim:"
+
+    def edge(cid, wid, wts):
+        con.execute("INSERT INTO warrants(claim_id,warrant_id,created_at)"
+                    " VALUES (?,?,?)", (cid, wid, wts))
+        counts["warrant@edge"] += 1
+
+    for subj_hash, wid, wts, note in accepts:
+        if note.startswith(NOTE_PREFIX):
+            cid = note[len(NOTE_PREFIX):]
+            c = claims_by_id.get(cid)
+            if c is None:
+                print(f"WARN  accept {wid[:12]} names claim {cid} — no such "
+                      "claim record in the canonical layer; edge not derived",
+                      file=sys.stderr)
+            elif c.get("subject") != subj_hash:
+                print(f"WARN  accept {wid[:12]} names claim {cid} but the "
+                      "warrant's subject is not that claim's subject; edge "
+                      "not derived", file=sys.stderr)
+            elif not c.get("supported"):
+                print(f"WARN  accept {wid[:12]} names claim {cid} whose own "
+                      "check FAILED; cmd_accept would refuse it, so rebuild "
+                      "refuses the edge", file=sys.stderr)
+            else:
+                edge(cid, wid, wts)
+        else:                           # legacy record: no explicit link
+            cids = supported_by_subject.get(subj_hash, [])
+            if not cids:
+                print(f"WARN  accept {wid[:12]} matches no supported claim by "
+                      "subject hash; edge not derived", file=sys.stderr)
+            for cid in cids:
+                edge(cid, wid, wts)
     # Re-register the artifacts themselves, so the index over the canonical layer
     # is complete rather than only covering what the records referenced.
     for path in sorted(ART.glob("*")):

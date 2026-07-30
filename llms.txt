@@ -102,10 +102,29 @@ better evidence of good faith than finding them hidden.
   Warrant store — and re-derives the claim→warrant acceptance edge from the
   store's `accept` records (it did not until 2026-07-30: the `warrants` table was
   never repopulated, so `oaip log` lost its WARRANT line at the first rebuild).
-  The store itself is canonical, signed, and is not — cannot be — rebuilt. The
-  edge is re-derived by subject hash, so two claim records with byte-identical
-  subjects (same predicate, execution and effects) cannot be told apart by
-  rebuild: an acceptance of one is projected onto both.
+  The store itself is canonical, signed, and is not — cannot be — rebuilt.
+  A same-day fresh-context adversarial review (a Claude-family reviewer — not an
+  independent gate, and not adopted by any warrant) broke the first version of
+  that derivation twice, and both holes are closed and regression-tested:
+  address-matching alone accepted a hand-written `accept` with junk signatures
+  (rebuild now has the Warrant CLI verify the store *before* deriving any edge,
+  and fails closed — including when no Warrant CLI can run); and deriving by
+  subject hash projected one signed acceptance onto a claim whose check FAILED,
+  because the subject excludes the check and verdict, so `--check true` and
+  `--check false` over one execution collide. Accepts now carry the accepted
+  claim's id in the signed `subject.note` (`oaip-claim:<id>`), and rebuild
+  follows that link. Remaining, stated honestly: *legacy* accepts without the
+  note fall back to subject-hash matching restricted to supported claims — two
+  SUPPORTED claims with byte-identical subjects still cannot be told apart for
+  those old records.
+- **The same review broke the snapshot's `.oaip` exclusion twice** (nested
+  ledgers leaked the signing key; cwd-relative pathspecs both leaked a
+  HEAD-tracked root ledger and silently narrowed the "full worktree" snapshot to
+  the cwd subtree). Fixed with repo-rooted, depth-agnostic pathspecs
+  (`:/`, `:(top,exclude,glob)**/.oaip/**`), regression-tested from root and
+  subdirectory. The earlier docstring claim that the exclusion "holds in every
+  repo regardless of user configuration" was refuted as written; what is claimed
+  now is exactly what `tests/key_custody.py` executes.
 
 ## Conformance vectors, including the negative half
 
