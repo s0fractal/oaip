@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oaip"
+# Tracks SPEC.md ("Specification v0.1"); the repo has no release tags yet.
+version = "0.1.0"
+description = "Observed Action & Intent Protocol: a content-addressed causal graph of what humans, agents, and tools actually did — and on what observed basis you accepted the result."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "s0fractal" }]
+keywords = ["provenance", "agents", "content-addressed", "warrant", "validation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Version Control",
+]
+# stdlib only by design (argparse/hashlib/json/os/shutil/sqlite3/subprocess/
+# sys/time/uuid/pathlib). Warrant is a normative dependency but is invoked as
+# an external CLI (WARRANT_CLI / sibling checkout), not a Python import.
+dependencies = []
+
+[project.scripts]
+oaip = "oaip:main"
+
+[project.urls]
+Homepage = "https://github.com/s0fractal/oaip"
+Repository = "https://github.com/s0fractal/oaip"
+Specification = "https://github.com/s0fractal/oaip/blob/main/SPEC.md"
+
+# Flat impl/ layout preserved: impl/oaip.py installs as the top-level `oaip`
+# module, and the `oaip` console script points at its argparse main().
+[tool.setuptools]
+package-dir = { "" = "impl" }
+py-modules = ["oaip"]
