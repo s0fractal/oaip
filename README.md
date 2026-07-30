@@ -34,6 +34,7 @@ python3 $oaip init         # ledger + a local Warrant store, and a signing key
 python3 $oaip do --intent "make login reject expired tokens" \
         --predicate auth.rejects-expired \
         --check "python3 tests/test_auth.py" \
+        --allow-check-effects \
         --actor you@host \
         -- your-agent-command
 
@@ -50,6 +51,16 @@ exits 0 but the check **fails**, `do` refuses and files nothing — that refusal
 is the whole point (SPEC §4). The four verbs (`intent` / `run` / `claim` /
 `accept`) are also available separately when you want to inspect each step;
 `examples/auth-demo.sh` walks them, including the refusal case.
+
+`--allow-check-effects` is there because the check above really does write to
+your repository: `python3 tests/test_auth.py` leaves `__pycache__/`. The
+execution's after-state was snapshotted **before** the check ran, so without the
+flag OAIP refuses the claim rather than sign a decision whose effect list omits
+those writes; with it, the claim cites what the check changed as evidence. Drop
+the flag if your check is read-only — and read SPEC §8.5 SA-13 before reading
+either behaviour as confinement: the check runs unconfined on your host
+(`oaip-host-shell@v1`, §7.3), and this observes what it did rather than
+preventing it.
 
 ## What it gets right by construction
 

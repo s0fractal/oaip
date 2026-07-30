@@ -1,27 +1,35 @@
 #!/usr/bin/env python3
 """Does the signed record say what actually happened when the check ran?
 
-THE DEFECT THIS FILE PINS (external audit by Codex, 2026-07-31, reproduced
-locally before it was touched)
--------------------------------------------------------------------------
-**A runtime tag that promised a profile OAIP never provided.** `oaip claim`
-ran the validation check with `subprocess.run(check, shell=True)` — the host
-shell, the caller's uid, the observed workspace, no isolation of any kind — and
-then recorded `validation.runtime = "cmd@v1"`, which **Warrant SPEC §3 defines
-as execution in an isolated container**. That tag was passed unchanged into the
-signed Warrant record. The record was not wrong about a detail; it named an
-execution profile that did not exist.
+THE TWO DEFECTS THIS FILE PINS (external audit by Codex, 2026-07-31; both
+reproduced locally before either was touched)
+--------------------------------------------------------------------------
+1. **A runtime tag that promised a profile OAIP never provided.** `oaip claim`
+   ran the validation check with `subprocess.run(check, shell=True)` — the host
+   shell, the caller's uid, the observed workspace, no isolation of any kind —
+   and then recorded `validation.runtime = "cmd@v1"`, which **Warrant SPEC §3
+   defines as execution in an isolated container**. That tag was passed
+   unchanged into the signed Warrant record. The record was not wrong about a
+   detail; it named an execution profile that did not exist.
 
-This is not shell injection — the check is user-supplied and running it is the
-point. It is a provenance defect: the record promises something that did not
+2. **The check's own side effects were outside the observation.** The
+   Execution's output state is snapshotted when the observed command returns,
+   so anything the check writes lands after the last observation. The
+   reproduction: a check of `touch check-escaped-container` created that file in
+   the observed workspace, and the signed decision recorded `effects=0`.
+
+Neither is shell injection — the check is user-supplied and running it is the
+point. Both are provenance defects: the record promises something that did not
 happen.
 
 WHAT THE CASES BELOW ARE, AND ARE NOT
 -------------------------------------
-They pin the RECORD, not the sandbox. OAIP still runs the check on the host,
-with everything that implies; nothing here is evidence of confinement. What is
-pinned is that the record names the profile that actually ran, and that nothing
-hands Warrant a tag whose meaning Warrant defines differently.
+They pin the RECORD, not a sandbox. OAIP still runs the check on the host, with
+everything that implies. Case B4 asserts that the sentinel file really is on
+disk after the refusal, so that no reader takes this file for evidence of
+confinement. What is pinned is that the record names the profile that ran, that
+nothing hands Warrant a tag whose meaning Warrant defines differently, and that
+a check which mutates the workspace cannot produce a record that omits it.
 """
 import atexit
 import json
@@ -41,6 +49,7 @@ import oaip as O                                              # noqa: E402
 # implementation what it calls itself agrees with the implementation by
 # construction; SPEC §7.3 is the thing this file is measuring against.
 HOST_SHELL = "oaip-host-shell@v1"
+SENTINEL = "check-escaped-container"
 
 ok = True
 
@@ -188,8 +197,98 @@ def part_a():
     with_ledger(cases)
 
 
+# --------------------------------------------------- B. the observation hole
+def part_b():
+    print("\n--- B. a check that mutates the workspace (the reproduction) ---")
+
+    def refuses(L):
+        eid = L.execution("true")
+        r = L.run("claim", "--execution", eid, "--predicate",
+                  "workspace.unchanged", "--check", f"touch {SENTINEL}")
+        out = r.stdout + r.stderr
+        case("B1: a check that mutates the observed workspace is REFUSED",
+             r.returncode != 0, out[-400:])
+        case("B2: the refusal names the path the check changed",
+             SENTINEL in out, out[-400:])
+        case("B3: and no claim record was written",
+             L.records("claim") == [] and L.claim_rows() == [])
+        # Stated as a case rather than a comment: this fix OBSERVES, it does
+        # not confine. The file is really there.
+        case("B4: the side effect itself was NOT prevented — the sentinel is "
+             "on disk (this is detection, not confinement)",
+             (L.dir / SENTINEL).exists())
+    with_ledger(refuses)
+
+    def records_them(L):
+        eid = L.execution("true")
+        r = L.run("claim", "--execution", eid, "--predicate",
+                  "workspace.unchanged", "--check", f"touch {SENTINEL}",
+                  "--allow-check-effects")
+        case("B5: with --allow-check-effects the claim is filed",
+             r.returncode == 0 and "claim " in r.stdout,
+             (r.stdout + r.stderr)[-300:])
+        claims = L.records("claim")
+        cited = []
+        for h in (claims[0]["evidence"] if claims else []):
+            try:
+                cited.append(json.loads(L.artifact(h)))
+            except Exception:
+                pass
+        eff = [d for d in cited
+               if isinstance(d, dict) and "check_effects" in d]
+        case("B6: the claim CITES the check's own effects as evidence — no "
+             "record of this run can read as effects=0",
+             len(eff) == 1
+             and [e["target"] for e in eff[0]["check_effects"]] == [SENTINEL]
+             and [e["kind"] for e in eff[0]["check_effects"]] == ["file.create"],
+             json.dumps(eff)[:300])
+        # Defensive: a RED run must keep measuring the cases after this
+        # one. A test that tracebacks where the implementation is broken
+        # reports one failure and hides the rest.
+        cid = (r.stdout.split() + ["", ""])[1]
+        a = L.run("accept", "--claim", cid, "--actor", "tester@local")
+        case("B7: the acceptance carries that evidence into the signed record",
+             "ACCEPTED" in a.stdout
+             and any(set(claims[0]["evidence"]) <= set(w["body"]["evidence"])
+                     for w in L.warrants()
+                     if w.get("body", {}).get("decision") == "accept"),
+             (a.stdout + a.stderr)[-300:])
+        # The trap this guards: §6.2 fails closed when a record CITES an
+        # artifact this reader cannot read. A check-effects artifact shaped
+        # like a record ("<tag>": "<version>") would classify as `unknown-type`
+        # and every claim citing it would refuse to rebuild.
+        case("B8: the check-effects artifact is not-a-record, so §6.2's "
+             "fail-closed citation rule does not fire on it",
+             len(eff) == 1        # never vacuous: `all([])` is True
+             and all(O.classify_record(d)[0] == "not-a-record"
+                     for d in eff))
+        b = L.run("rebuild")
+        case("B9: ...and the ledger still rebuilds, edge intact",
+             b.returncode == 0 and "warrant-edge=1" in (b.stdout + b.stderr),
+             (b.stdout + b.stderr)[-300:])
+    with_ledger(records_them)
+
+    def control(L):
+        """The negative control. A check that changes nothing must not acquire
+        an effects artifact, or B6 would pass on a ledger where nothing ran."""
+        eid = L.execution("true")
+        r = L.run("claim", "--execution", eid, "--predicate", "p",
+                  "--check", "true")
+        claims = L.records("claim")
+        case("B10: a check that mutates nothing files a claim with no "
+             "check-effects evidence",
+             r.returncode == 0 and len(claims) == 1
+             and claims[0]["evidence"] == sorted(claims[0]["evidence"])
+             and not any("check_effects" in json.loads(L.artifact(h))
+                         for h in claims[0]["evidence"]
+                         if L.artifact(h)[:1] == b"{"),
+             (r.stdout + r.stderr)[-300:])
+    with_ledger(control)
+
+
 def main():
     part_a()
+    part_b()
     print("\nVALIDATION-RUNTIME: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1
 

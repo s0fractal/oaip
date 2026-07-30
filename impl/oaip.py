@@ -2814,7 +2814,55 @@ def cmd_claim(a):
     # the environment — which is why the record says `oaip-host-shell@v1` and
     # not `cmd@v1` (§7.3). Nothing here confines the check; the tag stops the
     # record from claiming otherwise.
+    #
+    # OBSERVE THE CHECK'S OWN WINDOW (§2.7). The Execution's output state was
+    # snapshotted when `oaip run` returned — before this command existed — so
+    # anything the check writes lands AFTER the last observation. Measured on
+    # the unfixed tree: a check of `touch check-escaped-container` created that
+    # file in the observed workspace and the signed decision still recorded
+    # `effects=0` (external audit by Codex, 2026-07-31, reproduced locally).
+    #
+    # The window is taken here rather than from the Execution's after-state on
+    # purpose: between `oaip run` and `oaip claim` a human may have edited the
+    # workspace, and attributing THAT to the check would be a second false
+    # attribution answering the first.
+    before_check = workspace_snapshot()
     chk = subprocess.run(a.check, shell=True, capture_output=True, text=True)
+    after_check = workspace_snapshot()
+    check_effects = sorted(effects_between(before_check, after_check),
+                           key=lambda e: (e["target"], e["kind"]))
+    check_effects_hash = None
+    if check_effects:
+        # Stored whichever way this ends, so the observation survives the
+        # refusal: a refusal that leaves no evidence of what it saw teaches the
+        # operator to re-run with the flag and nothing else.
+        #
+        # DELIBERATELY NOT SHAPED LIKE A RECORD. §1.1 classifies any object with
+        # a `<tagname>: "<version>"` member as a record type, and §6.2 fails
+        # closed when a record CITES an artifact this reader cannot read — so a
+        # `{"check_effects": "0.1", ...}` artifact would classify as
+        # `unknown-type` and every claim citing it would refuse to rebuild. No
+        # member here can ever hold a version-shaped string (§7.4).
+        doc = {"check_effects": check_effects, "before_tree": before_check,
+               "after_tree": after_check}
+        check_effects_hash = put_artifact(canon(doc), "check-effects")
+        changed = ", ".join(f"{e['kind']} {e['target']}"
+                            for e in check_effects[:10])
+        if not getattr(a, "allow_check_effects", False):
+            sys.exit(
+                "refusing to file this claim: the validation check MUTATED the "
+                f"observed workspace ({len(check_effects)}): {changed}"
+                + (", …" if len(check_effects) > 10 else "")
+                + f"\n  observed effects recorded as artifact "
+                  f"{check_effects_hash[:12]}; no claim was written.\n"
+                  "  The Execution's output state was snapshotted before this "
+                  "check ran, so filing the claim would have produced a signed "
+                  "decision whose effect list omits every change above (SPEC "
+                  "§2.7).\n"
+                  "  Either make the check read-only, or re-run with "
+                  "`--allow-check-effects` to file a claim that CITES these "
+                  "effects as evidence. The mutation itself already happened: "
+                  "this observes, it does not confine (SPEC §8.5 SA-13).")
     transcript_hash = put_artifact((chk.stdout + chk.stderr).encode(),
                                    "check-transcript")
     verdict = "pass" if chk.returncode == 0 else "fail"
@@ -2837,7 +2885,12 @@ def cmd_claim(a):
     subject_hash = put_artifact(canon(subject),
                                 artifact_kind("claim_subject"))  # JCS, §1
     cid = kid()
-    evidence = sorted({h for h in (ex[0],) if isinstance(h, str)})
+    # The check's own effects ride in `evidence` (§2.7): the array is open, so
+    # this needs no format change, and it means no record of a mutating check
+    # can be read as though nothing changed. `sorted` over a set is the §2.7
+    # rule (ascending, no duplicates), not tidiness.
+    evidence = sorted({h for h in (ex[0], check_effects_hash)
+                       if isinstance(h, str)})
     ts = int(time.time())
     proposed_by = getattr(a, "actor", None) or default_actor()
     store_record({"claim": "0.1", "id": cid, "subject": subject_hash,
@@ -3112,9 +3165,10 @@ def cmd_do(a):
     i = cmd_intent(Namespace(description=a.intent, parent=None, actor=a.actor,
                              constraint=None, acceptance_ref=None))
     eid = cmd_run(Namespace(intent=i, command=a.command, actor=a.actor))
-    cid, supported = cmd_claim(Namespace(execution=eid, actor=a.actor,
-                                         predicate=(a.predicate or a.intent),
-                                         check=a.check))
+    cid, supported = cmd_claim(Namespace(
+        execution=eid, actor=a.actor, predicate=(a.predicate or a.intent),
+        check=a.check,
+        allow_check_effects=getattr(a, "allow_check_effects", False)))
     if supported:
         cmd_accept(Namespace(claim=cid, actor=a.actor))
     else:
@@ -4290,6 +4344,8 @@ def main():
     pc = sub.add_parser("claim"); pc.add_argument("--execution", required=True); pc.add_argument("--predicate", required=True); pc.add_argument("--check", required=True)
     pc.add_argument("--actor", help="who proposes the claim (§2.7 proposed_by; "
                     "UNAUTHENTICATED per §8). Default: this OS user@host")
+    pc.add_argument("--allow-check-effects", action="store_true",
+                    help="file the claim even though the validation check MUTATED the observed workspace, CITING what it changed as evidence (§2.7). Without it such a claim is refused: the Execution's output state was snapshotted before the check ran, so the decision would omit those changes. It observes; it does not confine")
     pc.set_defaults(fn=cmd_claim)
     pa = sub.add_parser("accept"); pa.add_argument("--claim", required=True); pa.add_argument("--actor", required=True); pa.set_defaults(fn=cmd_accept)
     pb = sub.add_parser("bind", help="vouch that a key may sign as an actor "
@@ -4305,6 +4361,8 @@ def main():
     pd = sub.add_parser("do", help="one-shot: intent -> run -> validate -> accept-if-pass")
     pd.add_argument("--intent", required=True); pd.add_argument("--check", required=True)
     pd.add_argument("--predicate"); pd.add_argument("--actor", required=True)
+    pd.add_argument("--allow-check-effects", action="store_true",
+                    help="file the claim even though the validation check MUTATED the observed workspace, CITING what it changed as evidence (§2.7). Without it such a claim is refused: the Execution's output state was snapshotted before the check ran, so the decision would omit those changes. It observes; it does not confine")
     pd.add_argument("command", nargs=argparse.REMAINDER); pd.set_defaults(fn=cmd_do)
     sub.add_parser("log").set_defaults(fn=cmd_log)
     prb = sub.add_parser("rebuild",
