@@ -130,8 +130,8 @@ is executed by `tests/privilege_separation.py`):
   freely. Nothing stops them, and SPEC §8.2 says so rather than describing a
   control that does not exist.
 - **The check the claim is judged by still runs against post-agent state.** An
-  agent that rewrites its own test passes honestly. That hole is open (SPEC
-  §8.5).
+  agent that rewrites its own test passes honestly. That hole is open and is
+  stated as a boundary of the threat model, not a to-do (SPEC §8.5, SA-1).
 
 Existing ledgers with an in-workspace key keep working, say so on every accept,
 and move with one command: `oaip trust-root --migrate`.

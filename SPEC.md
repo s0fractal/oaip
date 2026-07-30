@@ -829,7 +829,7 @@ a derived edge that nobody decided is neither.
 
 | Capability | Can forge an acceptance? | What they CAN do | Mechanism that stops them |
 |---|---|---|---|
-| **(a) The observed agent** — write access to the workspace, i.e. everything under the repository including `.oaip/`, running as the observer's uid *if unconfined* | **Not by workspace write alone** (default deployment). **Yes** if it also runs unconfined as the observer's uid | Write/delete artifacts and store records; plant a keyring at `.oaip/trust.json`; rewrite `.oaip/store.json`; edit the file a validation check tests **before the check runs**; cause refusals at will | Trust root (key + keyring) outside the workspace (§8.4 profile B) — the planted keyring is never read; in-process Ed25519 verification over the WarrantID OAIP recomputes; keyring binding; the signed `oaip-claim:<id>` link (§3). **Nothing stops the check-target rewrite** — see §8.5(1) |
+| **(a) The observed agent** — write access to the workspace, i.e. everything under the repository including `.oaip/`, running as the observer's uid *if unconfined* | **Not by workspace write alone** (default deployment). **Yes** if it also runs unconfined as the observer's uid | Write/delete artifacts and store records; plant a keyring at `.oaip/trust.json`; rewrite `.oaip/store.json`; edit the file a validation check tests **before the check runs**; cause refusals at will | Trust root (key + keyring) outside the workspace (§8.4 profile B) — the planted keyring is never read; in-process Ed25519 verification over the WarrantID OAIP recomputes; keyring binding; the signed `oaip-claim:<id>` link (§3). **Nothing stops the check-target rewrite** — see §8.5 SA-1 |
 | **(b) A party with write access to the TRUST ROOT** | **Yes, completely** | Bind their own key to any actor, or read the key and sign directly | Nothing. This is the trust root's definition: whoever holds it decides. Mode bits (§8.3(4)) exclude *other accounts on the host*, not this party |
 | **(c) A party who controls the environment or PATH** | **Yes** | Set `OAIP_TRUST_ROOT`/`XDG_CONFIG_HOME` to a keyring they wrote; replace `git` or `sh` and lie about the snapshot; replace `$WARRANT_CLI` | Nothing for the trust root or the toolchain. `$WARRANT_CLI` alone is closed: signature validity is decided in process, so a hostile CLI can make OAIP **refuse** but not believe. The `posix-base@v1` probes (§2.2.1) record `PATH` but neither `OAIP_TRUST_ROOT` nor `XDG_CONFIG_HOME`, and they are a discriminator, not a barrier. The environment is part of the TCB and OAIP says so rather than pretending otherwise |
 | **(d) A party with read-only access to the workspace** | **No** | Read every record, claim, transcript and the projection; correlate what an agent did | Nothing needs to: no OAIP record is secret. The signing key is not in the workspace (profile B) and is not readable by anyone else on the host (§8.3(4)) |
@@ -890,51 +890,150 @@ Profiles C and D need an operating-system boundary OAIP cannot create from
 inside a single stdlib process; they are named here so a deployment can be
 described honestly rather than implied.
 
-### 8.5 What remains open
+### 8.5 Security assumptions and non-goals
 
-1. **The validation check runs after the agent's command, against post-agent
-   workspace state, through the shell.** An agent that rewrites the test it will
-   be judged by passes honestly. §2.7 stores the check by hash, so a reader can
-   fetch and re-run exactly the bytes that ran — that makes the check auditable,
-   not un-rewritable. This is the largest remaining hole in the §4 gate and no
-   mechanism here addresses it: it needs the check to run from a state the agent
-   did not produce (a pinned revision, a separate checkout, a container), which
-   is a deployment decision, not a format one.
-2. **No OAIP record is signed** (§8.1). Anyone who can write `.oaip/artifacts`
-   can add a `claim` record — or an `execution`, or an `attribution` — and only
-   the acceptance side is pinned to a signed note. Content-addressing means such
-   a record cannot silently *replace* another; nothing makes filing one cost
-   anything.
-3. **No key rotation, no revocation, no expiry.** A bound key is bound until the
-   keyring is edited by hand.
-4. **Availability is not protected.** A party with store write access can delete
-   records or force refusals (including by rewriting the trust-root pointer);
-   every such loss is reported loudly and non-zero, which is the whole of the
-   defence.
-5. **The environment is trusted.** `git`, `sh`, the Python interpreter and
-   `$WARRANT_CLI`'s *availability* are inside the TCB; only `$WARRANT_CLI`'s
-   *verdict* has been removed from it. Recording five of the environment's
-   variables in a fingerprint (§2.2.1) describes that TCB; it does not shrink it.
-6. **Actor identity is unauthenticated free text**, at the CLI (`--actor`) and in
-   the records (§8.1). The keyring binds a key to an actor id; nothing binds an
-   actor id to a person.
-7. **Legacy records admit a weaker link** (§6.4). An acceptance filed before this
-   store required the `oaip-claim:<id>` note names no claim, and
-   `oaip rebuild --allow-legacy-links` will guess one by subject hash — which
-   §2.8 says cannot distinguish two claims with opposite verdicts. The fallback
-   is gated twice (an operator flag, and a record older than the moment
-   `oaip init` stamped this store), but the second gate reads the accept's own
-   signed `ts`, which whoever holds the signing key chooses. Legacy records also
-   carry no `State`, so nothing about the environment they ran in can be
-   re-checked: the only available fingerprint outcome is `unreproducible`.
+The boundary of the threat model above, in the form a standards reader expects.
+Every item is one of two things:
 
-An agent that runs unconfined as the observer's uid shares the filesystem with
-both the signing key and the validation check's target, and can therefore defeat
-§4 operationally whatever §4 says semantically. Profile B moves the key out of
-the *workspace*, which is the boundary an agent confined to the workspace cannot
-cross; it does not move it out of the *user*. Full privilege separation between
-the observer and the observed is profiles C and D, and this version does not
-implement them.
+- a **scoped assumption** (`SA-n`) — a condition the §4 gate requires of its
+  deployment and that OAIP does not itself establish. Stating it is what makes
+  §8.1's guarantee precise; omitting it would make that guarantee false.
+- an **explicit non-goal** (`NG-n`) — a property deliberately not provided, with
+  the reason it is out of scope rather than merely absent.
+
+Inside the boundary, a failure is a **defect** and is in scope for a report. An
+item stated here is **not** a defect — but a demonstration that reality is *worse
+than the item states* is, and four rounds of adversarial review produced exactly
+that, repeatedly. This section states limits; it does not claim they are the only
+ones. `§11` carries the scope non-goals, `llms.txt` carries the defect history
+and the release state, and a limit found in neither and true is a defect in this
+section.
+
+#### Scoped assumptions
+
+**SA-1. The validation check is assumed to run from a state the agent did not
+produce.** The check runs *after* the agent's command, against post-agent
+workspace state, through the shell. **An agent that rewrites the test it will be
+judged by passes honestly.** §2.7 stores the check by hash, so a reader can fetch
+and re-run exactly the bytes that ran — that makes the check auditable, not
+un-rewritable. This is the largest remaining hole in the §4 gate and no mechanism
+in §8.3 addresses it: closing it needs the check to run from a state the agent
+did not produce (a pinned revision, a separate checkout, a container), which is a
+deployment decision, not a format one.
+
+**SA-2. The environment is assumed to be trusted.** `git`, `sh`, the Python
+interpreter and `$WARRANT_CLI`'s *availability* are inside the TCB; only
+`$WARRANT_CLI`'s *verdict* has been removed from it. Recording five of the
+environment's variables in a fingerprint (§2.2.1) **describes** that TCB; it does
+not shrink it. A party who controls the environment or `PATH` can forge an
+acceptance completely (§8.2 row (c)), and nothing here stops them.
+
+**SA-3. An actor id is assumed to be bound to a person out of band.** Actor
+identity is unauthenticated free text, at the CLI (`--actor`) and in the records
+(§8.1). The keyring binds a key to an actor id; **nothing binds an actor id to a
+person.**
+
+**SA-4. A bound key is assumed valid until the keyring is edited by hand.** There
+is no key rotation, no revocation and no expiry.
+
+**SA-5. The observer's uid is assumed not to be shared with the observed agent.**
+An agent running unconfined as the observer's uid shares the filesystem with both
+the signing key and the validation check's target, and can therefore defeat §4
+operationally whatever §4 says semantically. Profile B (§8.4) moves the key out
+of the *workspace* — the boundary an agent confined to the workspace cannot
+cross — and **does not** move it out of the *user*. Full privilege separation
+between observer and observed is profiles C and D, and this version does not
+implement them. A party with write access to the trust root forges acceptances
+completely and by definition (§8.2 row (b)).
+
+**SA-6. Legacy records are assumed to be pre-convention, on evidence the filer
+partly controls.** An acceptance filed before this store required the
+`oaip-claim:<id>` note names no claim, and `oaip rebuild --allow-legacy-links`
+will guess one by subject hash — which §2.8 says cannot distinguish two claims
+with opposite verdicts over one execution. The fallback is gated twice (an
+operator flag, and a record older than the moment `oaip init` stamped this
+store), but the second gate reads the accept's own signed `ts`, **which whoever
+holds the signing key chooses.** Legacy records also carry no `State`, so nothing
+about the environment they ran in can be re-checked: the only available
+fingerprint outcome is `unreproducible`.
+
+**SA-7. "Conformant" is assumed on one implementation's agreement with itself.**
+There is one implementation (Python). The conformance vectors of §10 are checked
+by that implementation against itself, and a second implementation is what would
+make "conformant" mean something. This is why §10 requires the negative half: a
+second implementation agreeing only on well-formed records would prove nothing.
+
+**SA-8. A `State` fingerprint is assumed to discriminate, not to establish
+equivalence.** `env_fingerprint` and `toolchain_fingerprint` are SHA-256 over the
+`posix-base@v1` probes, whose scope is five environment variables and one tool
+probe (§2.2.1). **Any other variable can change what a command does without
+changing this number.** A `mismatched` outcome does not distinguish "the same
+host, changed since" from "a different host entirely" — no record carries a host
+identity, so no implementation can tell those apart (§2.2.4). It is also **not a
+security control**: neither `OAIP_TRUST_ROOT` nor `XDG_CONFIG_HOME` is in the
+profile, and a party who can change the environment can change what the probes
+report of it (SA-2).
+
+**SA-9. Attribution is assumed to be exclusive-window causality.** §2.6 provides
+for uncertain causality — a weaker method MUST carry a lower `confidence_ppm` and
+its own registered `method` — and the method registry (§7.6) is closed with
+exactly one entry, capped at 999999 rather than at certainty. So a
+File-Watcher-style guess is not merely unimplemented: it cannot be recorded at
+all until someone registers it. The hard case is specified as an extension point
+and is not implemented.
+
+**SA-10. The snapshot's ledger exclusion is assumed sound, and is fundamentally
+by name.** It has been broken four times by review — a nested ledger, cwd-relative
+pathspecs, a case-sensitive match on a case-insensitive filesystem, and a
+symlinked ledger. The pathspecs are now repo-rooted, depth-agnostic and
+case-insensitive, `init` refuses a symlinked ledger, and the snapshot excludes a
+symlink's target. **This is not a claim that no arrangement of a git repository
+can defeat it** — four arrangements already did, and the mechanism is still
+matching by name. A hardlinked file, a `core.excludesFile` interaction, and a
+ledger reached through a symlinked *parent* directory have not been tested.
+
+The exclusion also costs observation, which is a limit and not only a protection:
+`icase` drops **any** path whose component case-folds to `.oaip`, at any depth, on
+any filesystem, whoever created it. A user's own `src/.Oaip/config.yml` is
+therefore never in a snapshot and no effect over it is ever attributed. The
+snapshot now names every excluded path that is not a ledger; the exclusion itself
+stays, because leaving things out is the safe direction for a signing key.
+
+#### Explicit non-goals
+
+**NG-1. Signing OAIP records themselves.** No OAIP record is signed (§8.1).
+Anyone who can write `.oaip/artifacts` can add a `claim` record — or an
+`execution`, or an `attribution` — and only the acceptance side is pinned to a
+signed note. Content-addressing means such a record cannot silently *replace*
+another; **nothing makes filing one cost anything.** Out of scope because
+integrity of the decision is what §8.1 protects, and an observation that is wrong
+is a bad record rather than a forged decision.
+
+**NG-2. Availability.** A party with store write access can delete records or
+force refusals — including by rewriting the trust-root pointer, and including by
+placing more than `SIG_DECIDE_CAP` signature entries that name the record's actor
+under a bound key ahead of the real one, or by padding a record past
+`MAX_STORE_RECORD_BYTES`. Each of those is a real griefing surface and each is
+**fail-closed**: `oaip rebuild` exits non-zero and names the lost edge with the
+reason it was refused. Out of scope because that party can already delete the
+record outright, which is equally loud and equally destructive. Appending cannot
+un-decide anything — the honest signature is reached first.
+
+**NG-3. Confidentiality.** No OAIP record is secret (§8.2 row (d)). A party with
+read-only workspace access can read every record, claim, transcript and the
+projection, and correlate what an agent did. Nothing needs to stop them; the
+signing key is what is protected, and under profile B it is not in the workspace.
+
+**NG-4. A normative threat model.** §8 states a threat model and states it as
+**informative about the record format**: nothing in §8 changes whether a document
+is `valid`, `invalid`, `unsupported-version` or `unknown-type` — §1.1 and §6.2
+decide that alone. A deployment can give up every property in §8 without emitting
+a single invalid record, which is exactly why the properties are written down.
+
+The remaining non-goals are matters of scope rather than of security and are
+listed once, in **§11**: semantic-entity extraction, an `Observation` stream, a
+Reaction runtime, federation and jurisdictions, and any opinion on whether an
+intent was satisfied or which policy has authority.
 
 ## 9. Relationship to prior art (normative context)
 
@@ -1051,7 +1150,7 @@ plus the Warrant reference CLI for the bridge.
 It implements legacy-read mode (§6.4) for stores written before the record
 formats above were pinned: those records are read under the legacy rules,
 marked as legacy wherever they reach the projection or a report, and never
-rewritten — with the consequences §8.5(7) records.
+rewritten — with the consequences §8.5 SA-6 records.
 
 ## 13. References
 
