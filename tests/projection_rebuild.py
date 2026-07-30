@@ -126,8 +126,8 @@ def trust_root(work):
 # (2026-07-30, second adversarial round). The tuple is now every table the
 # schema defines, and `schema_tables_are_all_compared` below refuses to let a
 # future table be added to the schema and forgotten here.
-TABLES = ("intents", "executions", "effects", "claims", "attributions",
-          "warrants", "artifacts")
+TABLES = ("intents", "states", "executions", "effects", "claims",
+          "attributions", "warrants", "artifacts")
 ok = True
 
 
@@ -140,9 +140,12 @@ def case(name, cond, detail=""):
 def snapshot(db):
     """Every row of every table, as comparable text.
 
-    `effects.id` is an AUTOINCREMENT surrogate and `attributions.effect_id` points
-    at it, so both are dropped: a rebuild is allowed to renumber rows it never
-    promised to preserve. Everything a record actually asserts is compared.
+    Nothing is dropped any more. `effects.id` used to be an AUTOINCREMENT
+    surrogate (and `attributions.effect_id` pointed at it), so both had to be
+    excluded from the comparison — a rebuild was allowed to renumber rows it
+    never promised to preserve. §2.5/§2.6 give Effect and Attribution real
+    record ids, so those two columns are now facts the canonical layer asserts
+    and the comparison holds them too.
     """
     con = sqlite3.connect(db)
     con.row_factory = sqlite3.Row
@@ -150,12 +153,7 @@ def snapshot(db):
     for t in TABLES:
         rows = []
         for r in con.execute(f"SELECT * FROM {t}"):
-            d = dict(r)
-            if t == "effects":
-                d.pop("id", None)
-            if t == "attributions":
-                d.pop("effect_id", None)
-            rows.append(json.dumps(d, sort_keys=True))
+            rows.append(json.dumps(dict(r), sort_keys=True))
         out[t] = sorted(rows)
     con.close()
     return out
@@ -220,8 +218,10 @@ def main():
         # the defect, and a diff of two dictionaries would not say which fact went.
         kinds_before = {json.loads(r)["hash"]: json.loads(r)["kind"]
                         for r in before["artifacts"]}
-        for want in ("record:intent", "record:execution", "record:claim",
-                     "claim-subject"):
+        for want in ("record:intent", "record:state", "record:execution",
+                     "record:effect", "record:attribution", "record:claim",
+                     "claim-subject", "environment-probe", "toolchain-probe",
+                     "check", "stdout"):
             case(f"artifacts carry kind {want!r} before rebuild",
                  want in kinds_before.values(), sorted(set(kinds_before.values())))
 
@@ -241,8 +241,9 @@ def main():
         # The fields that vanished before. Named individually so a regression says
         # WHICH fact was lost, not that two dictionaries differ.
         ex = json.loads(before["executions"][0])
-        for field in ("command", "exit_code", "before_tree", "after_tree",
-                      "env_fp", "stdout_hash", "intent_id"):
+        for field in ("invocation", "status", "exit_code", "input_state",
+                      "output_state", "environment", "output", "intent_id",
+                      "actor", "runtime"):
             case(f"execution.{field} is present before rebuild",
                  ex.get(field) not in (None, ""))
 
@@ -256,8 +257,9 @@ def main():
                  f"\n      before={before[t][:1]}\n      after ={after[t][:1]}")
 
         ex2 = json.loads(after["executions"][0]) if after["executions"] else {}
-        for field in ("command", "exit_code", "before_tree", "after_tree",
-                      "env_fp", "stdout_hash", "intent_id"):
+        for field in ("invocation", "status", "exit_code", "input_state",
+                      "output_state", "environment", "output", "intent_id",
+                      "actor", "runtime"):
             case(f"execution.{field} survived the projection",
                  ex2.get(field) == ex.get(field),
                  f"before={ex.get(field)!r} after={ex2.get(field)!r}")
@@ -417,7 +419,7 @@ def main():
                 doc = json.loads(p.read_text())
             except ValueError:
                 continue
-            if isinstance(doc, dict) and doc.get("oaip_record") == "claim@v1":
+            if isinstance(doc, dict) and doc.get("claim") == "0.1":
                 p.unlink()
         r = run("rebuild")
         out = r.stdout + r.stderr

@@ -143,9 +143,9 @@ class Repo:
         """One real snapshot, extracted from a real `oaip run`."""
         r = self.run("run", "--intent", "x", "--", "sh", "-c", cmd, sub=sub)
         for tok in r.stdout.split():
-            if tok.startswith("after="):
+            if tok.startswith("after_tree="):
                 return tok.split("=", 1)[1]
-        raise SystemExit(f"setup failed: no after= in {r.stdout!r} {r.stderr!r}")
+        raise SystemExit(f"setup failed: no after_tree= in {r.stdout!r} {r.stderr!r}")
 
     def key_blob(self, key=".oaip/dev.key"):
         """The git blob id the key WOULD have — without writing it anywhere."""
@@ -307,7 +307,7 @@ def main():
             key.write_text("5" * 63 + "1\n")
         r = oaip("run", "--intent", "x", "--", "sh", "-c", "echo hi > f.txt")
         tree = next((t.split("=", 1)[1] for t in r.stdout.split()
-                     if t.startswith("after=")), "")
+                     if t.startswith("after_tree=")), "")
         paths = subprocess.run(["git", "ls-tree", "-r", "--name-only",
                                 "--full-tree", tree], cwd=d,
                                capture_output=True, text=True).stdout.splitlines()
@@ -367,7 +367,7 @@ def main():
         r = L.run("run", "--intent", "x", "--", "sh", "-c",
                   "echo escaped > ../outside.txt", sub="sub")
         after = next((t.split("=", 1)[1] for t in r.stdout.split()
-                      if t.startswith("after=")), "")
+                      if t.startswith("after_tree=")), "")
         case("a mutation OUTSIDE the cwd is still observed (effects != 0)",
              "effects=0" not in r.stdout and "effects=" in r.stdout, r.stdout)
         case("the snapshot tree is the full worktree, not the cwd subtree",
@@ -424,7 +424,7 @@ def main():
         (L.dir / "src" / "kept.txt").write_text("observed\n")
         r = L.run("run", "--intent", "x", "--", "sh", "-c", "echo hi > f.txt")
         tree = next((t.split("=", 1)[1] for t in r.stdout.split()
-                     if t.startswith("after=")), "")
+                     if t.startswith("after_tree=")), "")
         paths = L.tree_paths(tree)
         case("a user path that merely case-folds to .oaip is still excluded",
              "src/.Oaip/config.yml" not in paths, paths)

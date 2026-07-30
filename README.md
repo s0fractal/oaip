@@ -65,6 +65,17 @@ is the whole point (SPEC §4). The four verbs (`intent` / `run` / `claim` /
 - **It reuses, doesn't reinvent.** Warrant SPEC §4 canonicalization *verbatim*;
   accepted claims are Warrant records; Σ-GLYPH `ski@v1` is the forward path for
   portable checks. OAIP adds exactly one layer: a clean input to the decision layer.
+- **The record formats are pinned by vectors, not by the implementation.**
+  `examples/vectors.json` pins how a record serializes and
+  `examples/record-vectors.json` pins what a record *is* — positive shapes and,
+  more usefully, the shapes that MUST be refused. Until 2026-07-30 only the first
+  existed, and the reference implementation wrote a different record from SPEC §2
+  for every type in it while reporting conformance; `llms.txt` tells that story.
+  (SPEC §10)
+- **It says what it is not.** SPEC §9 maps every record onto W3C PROV and onto
+  in-toto/SLSA, states where IETF SCITT begins and OAIP stops, and names the two
+  things OAIP actually adds — the acceptance boundary and uncertain attribution.
+  If those two are not what you need, §9 says so and points elsewhere.
 
 ## Where it fits
 
@@ -128,7 +139,9 @@ and move with one command: `oaip trust-root --migrate`.
 ## Status
 
 `v0.1` DRAFT — see [`SPEC.md`](SPEC.md). Reference implementation in
-[`impl/oaip.py`](impl/oaip.py) (stdlib + the Warrant CLI). The wedge is
+[`impl/oaip.py`](impl/oaip.py) (stdlib + the Warrant CLI), which as of
+2026-07-30 emits the records SPEC §2 declares; ledgers written before that are
+read under §6.4 legacy mode and marked, never rewritten. The wedge is
 **provable agent-action acceptance for regulated / multi-agent development**, not
 a general dev tool; for a solo human in an IDE, git is enough.
 

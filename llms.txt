@@ -98,40 +98,92 @@ work an attacker can make it do, how much of its output a human can still read,
 and what happens to a refusal that raises instead of returning. Both halves of
 that result are recorded below, the favourable one included.
 
-- **Nothing has ever been published, and the publish path is untested.** There
-  are no tags and no PyPI releases. `.github/workflows/publish.yml` builds the
-  wheel, installs it into a fresh venv, and runs
-  `tools/check_release_surface.py` against it before the publish step — but
-  Trusted Publishing (OIDC) exists only inside GitHub Actions, so the token
-  exchange and PyPI's acceptance of the pending publisher have never executed.
-  See [PUBLISHING.md](PUBLISHING.md), and do the TestPyPI dry run first.
+- **Version 0.1.0 of this package IS published, and that is the only thing the
+  publish path has ever done.** This entry used to read "nothing has ever been
+  published"; that stopped being true on 2026-07-30, and correcting an
+  understatement is as much this file's job as correcting an overstatement — the
+  reader who follows a stale "untested" is misled in the same way, just in the
+  flattering direction. The `v0.1.0` tag (`cac2b6b`) and
+  the GitHub Release drove `.github/workflows/publish.yml` once: the build job
+  built the wheel, installed it into a fresh venv and ran
+  `tools/check_release_surface.py` against it, and the `pypi` job then uploaded
+  **that same artifact** through Trusted Publishing (OIDC, no stored token).
+  `oaip-0.1.0-py3-none-any.whl` and `oaip-0.1.0.tar.gz` are on PyPI. What that
+  does NOT establish, and the reason to read [PUBLISHING.md](PUBLISHING.md)
+  before the next one: nobody has installed the published files FROM PyPI and
+  run anything against them (the gate ran on the bytes before upload); the
+  TestPyPI dry run was skipped, not performed; and **the published 0.1.0
+  predates both of the changes below it** — it is the pre-relocation trust root
+  and the pre-alignment record formats. `pip install oaip` today does not give
+  you the implementation this file describes, and `pyproject.toml` still says
+  `0.1.0`, so the next release needs a version bump before the workflow will
+  accept the tag.
 - **`pip install oaip` gives you no decision layer.** Warrant is a normative
   dependency (§1, §3) invoked as an external CLI, not a Python import, so a
   fresh venv has `oaip` and nothing to accept with. The release gate therefore
   checks that `init` / `do` / `accept` / `bind` / `rebuild` / `verify` **exist**
   and accept their documented flags; it does not exercise acceptance. §4 is
   gated by `tools/check.py` in CI, from a checkout, against a pinned Warrant.
-- **SPEC §2.4 and the reference implementation disagree on field names.** §2.4
-  declares Execution fields `invocation`, `status`, `input_state`, `output_state`,
-  `environment`; `impl/oaip.py` stores `command`, `exit_code`, `before_tree`,
-  `after_tree`, `env_fp`. **A third-party implementer following the specification
-  would emit artifacts incompatible with the reference.** The in-toto converter
-  follows the implementation and says so in a comment. Aligning them is a format
-  decision that has not been made — not a converter side effect.
+- **CLOSED 2026-07-30 (was: the spec and the implementation disagreed on every
+  record type).** The divergence was total, not only the §2.4 case this file used
+  to admit: Intent, State (which did not exist in the implementation at all),
+  Execution, Attribution, Effect and ClaimCandidate all differed in fields and in
+  type tag, and the conformance vectors pinned only the canonicalization
+  function, so both halves reported ALL PASS throughout. The implementation was
+  moved to SPEC §2; four places where the SPEC was wrong were changed instead and
+  are named in the commit body (`invocation` is an array because a joined string
+  cannot reconstruct argv; three member names collided with type tags;
+  Effect/Attribution had no `id`; `ski@v1` is reserved rather than admitted in
+  claim 0.1). `examples/record-vectors.json` now pins the record SHAPES, positive
+  and negative, and `tools/intoto.py` follows the specification with no comment
+  explaining why it does not.
+
+  What is NOT closed by that: the vectors are checked by one implementation
+  against itself. A second implementation is what would make "conformant" mean
+  something, and there is still only one. And the record work and the trust-root
+  work (below) were done independently: SPEC §8's capability matrix was written
+  against the older record shapes and has been re-checked against these, but
+  re-reading is not the same evidence as a test.
+- **The fingerprints are reproducible, and thin.** `env_fingerprint` and
+  `toolchain_fingerprint` were undefined — a second implementation could not
+  compute a StateID at all. They are now SHA-256 over `environment_probe` /
+  `toolchain_probe` records under the registered profile `posix-base@v1`, whose
+  scope is five environment variables (PATH, LANG, LC_ALL, TZ,
+  SOURCE_DATE_EPOCH) and one tool probe (`git --version`). SPEC §2.2.1 says in as
+  many words that any other variable can change what a command does without
+  changing this number: it is a discriminator, not evidence of environmental
+  equivalence. A verifier that cannot re-run the probes reports
+  `unreproducible`, which §2.2.4 forbids collapsing into `matched`. `oaip
+  verify` re-runs the probes and prints the three-way count; on the host that
+  wrote the records they match, a State the current environment no longer
+  reproduces is `mismatched` and NOT an error (environments change; a State says
+  what was observed then), and a pre-0.1 execution is `unreproducible` because
+  it carries no State at all. What `mismatched` does NOT tell you, and
+  SPEC §2.2.4 now says so instead of implying otherwise: whether it is the same
+  host changed since, or a different host entirely. No record carries a host
+  identity, so no implementation can tell those apart; a consumer that needs the
+  distinction has to establish it by some means outside this protocol. It is also
+  **not a security control**: neither `OAIP_TRUST_ROOT` nor `XDG_CONFIG_HOME` is
+  in the profile, and a party who can change the environment can change what the
+  probes report of it (SPEC §8.1, §8.2 row (c)).
 - **One implementation.** Warrant has three that agree on broken stores; OAIP has
   Python only. Until a second exists, "conformant" here means "agrees with
   itself". This is the reason the negative vectors below were written first: a
   second implementation that agreed only on well-formed records would prove
   nothing.
-- **Attribution is exclusive-window only.** §2 requires that a weaker method (it
-  names a File-Watcher-only guess) carry a lower `confidence_ppm` *and its own
-  `method`* — so the format provides for uncertain causality. The reference
-  implementation only ever wraps the command, i.e. it emits the one method it can
-  claim honestly and never exercises the low-confidence path. The hard case is
-  specified, not implemented.
+- **Attribution is exclusive-window only.** §2.6 requires that a weaker method
+  carry a lower `confidence_ppm` *and its own registered `method`* — so the
+  format provides for uncertain causality. Since 2026-07-30 the methods are a
+  closed registry (§7.6) with exactly one entry, capped at 999999 rather than at
+  certainty, so a File-Watcher-style guess is not merely unimplemented: it cannot
+  be recorded at all until someone registers it. The reference implementation
+  only ever wraps the command, i.e. it emits the one method it can claim honestly
+  and never exercises the low-confidence path. The hard case is specified as an
+  extension point, not implemented.
 - **No signing of OAIP records themselves.** Integrity comes from
   content-addressing plus the Warrant record at the decision layer; the artifacts
-  are not individually signed. In particular a `claim@v1` record is unsigned, so
+  are not individually signed. In particular a `claim` record (`{"claim": "0.1"}`
+  since the format alignment; `claim@v1` in pre-0.1 stores) is unsigned, so
   "which claim exists" is a property of the artifact directory, not of anyone's
   key — which is why the acceptance link is pinned inside the *signed* warrant
   body rather than inferred from the claim side.
@@ -321,9 +373,14 @@ that result are recorded below, the favourable one included.
       `XDG_CONFIG_HOME`, `PATH` for `git`/`sh`. The environment is inside the
       trusted base and SPEC §8.2 lists it as such.
     - **File modes are enforced now and were not before** (this was a gap nobody
-      had written down): the key must be 0600, the keyring 0600, the directory
-      0700, or OAIP refuses to sign, to bind, and to rebuild, naming the `chmod`.
-      Measured before the check existed: `chmod 644 .oaip/dev.key` and `oaip
+      had written down). Stated as the code actually tests it, not as the modes
+      it writes: the key must have NO group/other bits at all, and the keyring
+      and the trust-root directory must not be group/other **writable** — a
+      readable keyring is public keys and harmless, a writable one vouches for
+      whoever rewrote it. `init` creates them 0600/0600/0700; a fault makes OAIP
+      refuse to sign, to bind, and to rebuild, naming the `chmod` (`verify`
+      reports it alongside its other findings). Measured before the check
+      existed: `chmod 644 .oaip/dev.key` and `oaip
       accept` printed `ACCEPTED -> warrant 68e9fdc1…` with no remark. Mode bits
       exclude other ACCOUNTS on a shared host; they say nothing about a same-uid
       process.
@@ -384,9 +441,9 @@ that result are recorded below, the favourable one included.
   of a signature in `.oaip/warrants/records/`). Naming the key is the operator's
   assertion, not OAIP's discovery, which is why it is not done automatically.
 - **What the second review round did NOT close.** Beyond the binding gap above:
-  a `claim@v1` artifact is unsigned and unauthenticated, so anyone who can write
-  `.oaip/artifacts` can add a claim record — the acceptance side is now pinned to
-  a signed note, but the claim side is not. And the check `.oaip/store.json` uses
+  a claim artifact is unsigned and unauthenticated, whatever its format version,
+  so anyone who can write `.oaip/artifacts` can add a claim record — the
+  acceptance side is now pinned to a signed note, but the claim side is not. And the check `.oaip/store.json` uses
   to separate "legacy" from "should have carried a link" rests on a signed `ts`,
   which someone holding the ledger's key could choose.
 - **`verify` and `rebuild` now audit the same accepts** — which they did not
@@ -410,6 +467,28 @@ that result are recorded below, the favourable one included.
   handles.
 
 ## Conformance vectors, including the negative half
+
+There are TWO vector files, and the second one did not exist until 2026-07-30.
+`examples/vectors.json` pins how a record SERIALIZES;
+`examples/record-vectors.json` pins what a record IS. Passing only the first
+means two implementations agree about JSON, not about the protocol — which is
+exactly the state this repository was in while the reference implementation
+wrote a different record from SPEC §2 for every type in it.
+
+`examples/record-vectors.json` (SPEC §10): 33 records that MUST validate and 83
+documents that MUST NOT, each pinned with the OUTCOME it must produce — because
+`invalid`, `unsupported-version`, `unknown-type`, `legacy` and `not-a-record`
+are five outcomes and not two, and returning one for another is a real
+interoperability bug a boolean assertion would hide. The reject half is grouped
+by class: `shape` (35) is the group a canonicalization vector cannot reach —
+impeccable JCS I-JSON whose shape is wrong (an unregistered effect kind, a
+`killed` process carrying an exit code, an attribution claiming a certainty its
+method may not claim); `missing-member` (15), `wrong-type` (11),
+`unknown-member` (8, i.e. closed schemas), `type-tag` (11, version negotiation
+and the legacy tag) and `bytes` (3, refused at ingestion rather than at the
+shape layer). Confirmed meaningful by weakening the validator two ways: dropping
+the unknown-member test scores 108/116, and accepting every object scores
+47/116.
 
 `examples/vectors.json` carries two kinds:
 

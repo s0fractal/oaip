@@ -51,12 +51,28 @@ CHECKS = [
     ("canonicalization conformance (§1 vectors: byte-exact AND must-reject)",
      ["python3", "impl/oaip.py", "conformance", "examples/vectors.json"], None,
      "OAIP-CONFORMANCE: ALL PASS"),
+    # The other half of "conformance", and the half that did not exist until
+    # 2026-07-30: the vectors above pin the SERIALIZER, these pin what a record
+    # IS. While only the first existed, the reference implementation wrote a
+    # different record from SPEC §2 for every type in the specification and
+    # reported ALL PASS the whole time.
+    ("record-shape conformance (§10 vectors: valid shapes AND must-reject)",
+     ["python3", "impl/oaip.py", "records", "examples/record-vectors.json"],
+     None, "OAIP-RECORDS: ALL PASS"),
     ("canonical layer integrity (forged artifacts, §5 truth)",
      ["python3", "tests/canonical_layer.py"], None,
      "CANONICAL-LAYER: ALL PASS"),
     ("projection is disposable (§5 MUST: delete, rebuild, identical graph)",
      ["python3", "tests/projection_rebuild.py"], None,
      "PROJECTION-REBUILD: ALL PASS"),
+    # `needs` the CLI: the fixture is the PREVIOUS RELEASE of impl/oaip.py, and
+    # it files a real signed warrant. What the check is for is that the
+    # ACCEPTANCE EDGE survives the record-format change, and without a Warrant
+    # CLI there is no acceptance to survive — an UNRUN here is honest; a
+    # half-run that still printed its ALL PASS line would not be.
+    ("pre-0.1 stores still read (§6.4 legacy mode, against the previous release)",
+     ["python3", "tests/legacy_store.py"], "warrant-cli",
+     "LEGACY-STORE: ALL PASS"),
     # No `needs`: the custody property is about git objects, not about Warrant —
     # the test plants a sentinel key when no Warrant CLI generated a real one.
     ("key custody (the snapshot must not embed .oaip / the signing key)",

@@ -219,13 +219,17 @@ def forge_acceptance(work, run, actor="tester@local", keyring=None):
     """The observed agent's forgery, executed with nothing but workspace write.
 
     It generates its own key, files a real, cryptographically valid `accept` into
-    the workspace's Warrant store naming a real supported claim, and vouches for
-    its own key in `keyring` (the file OAIP consults). Every step is something a
-    process with the workspace as its cwd can do. Returns (warrant id, claim id).
+    the workspace's Warrant store naming a real claim whose validation passed,
+    and vouches for its own key in `keyring` (the file OAIP consults). Every step
+    is something a process with the workspace as its cwd can do. Returns
+    (warrant id, claim id).
     """
     con = sqlite3.connect(work / ".oaip" / "ledger.db")
+    # `verdict='pass'`, not the projection's old `supported=1`: the column moved
+    # to the record's own vocabulary (SPEC §2.7) when the formats were aligned,
+    # and this file was written against the previous schema.
     cid, subj = con.execute("SELECT id, subject_hash FROM claims "
-                            "WHERE supported=1").fetchone()
+                            "WHERE verdict='pass'").fetchone()
     con.close()
     attacker = work / "attacker.key"
     kg = subprocess.run(wcli() + ["keygen", "--out", str(attacker)],

