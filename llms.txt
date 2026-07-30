@@ -76,6 +76,14 @@ link was drawn).
 Listed because a reviewer will find them anyway, and finding them listed is
 better evidence of good faith than finding them hidden.
 
+Two rounds of fresh-context adversarial review (a Claude-family reviewer — **not
+an independent gate, and nothing here is adopted by any warrant**) have now
+broken this repository's defences repeatedly, and the second round's central
+finding was that the first round's *fixes* had only narrowed the defects while
+this file described them as closed. So the entries below say what is **enforced**
+and by **whose** rule, separately from what is merely reported — and where a
+property is not enforced at all, that is written down rather than implied away.
+
 - **SPEC §2.4 and the reference implementation disagree on field names.** §2.4
   declares Execution fields `invocation`, `status`, `input_state`, `output_state`,
   `environment`; `impl/oaip.py` stores `command`, `exit_code`, `before_tree`,
@@ -160,19 +168,46 @@ better evidence of good faith than finding them hidden.
     `.oaip/`", it does not make acceptance unforgeable. There is no out-of-band
     trust root, no key rotation, and no revocation. Two SUPPORTED claims with
     byte-identical subjects still cannot be told apart for legacy records.
-- **The snapshot's `.oaip` exclusion has been broken three times by review**
-  (nested ledgers leaked the signing key; cwd-relative pathspecs both leaked a
-  HEAD-tracked root ledger and silently narrowed the "full worktree" snapshot to
-  the cwd subtree; and the pathspec matched case-SENSITIVELY, so on the
-  case-INSENSITIVE filesystem this project is developed on the key leaked as
-  `.OAIP/dev.key` — and `tests/key_custody.py`'s own detector was
-  case-sensitive in the same way, so it could not see that). The pathspecs are
-  now repo-rooted, depth-agnostic and case-insensitive
-  (`:/`, `:(top,exclude,glob,icase)**/.oaip/**`). What is claimed is exactly
-  what `tests/key_custody.py` executes: root and nested ledgers, from root and
-  from a subdirectory, tracked and untracked, `.oaip` and `.OAIP`. It is not a
-  claim that no future arrangement of a git repository can defeat it — three
-  arrangements already did.
+- **The snapshot's `.oaip` exclusion has been broken four times by review**, and
+  every break was a different way of giving the ledger a name the exclusion did
+  not match:
+  1. a NESTED ledger (`sub/.oaip/dev.key`, from `oaip init` in a subdirectory)
+     was added like any other file;
+  2. the pathspecs were cwd-RELATIVE, which both leaked a HEAD-tracked root
+     ledger when run from a subdirectory and silently narrowed the "full
+     worktree" snapshot to the cwd subtree;
+  3. the pathspec matched case-SENSITIVELY, so on the case-INSENSITIVE filesystem
+     this project is developed on the key leaked as `.OAIP/dev.key` — and
+     `tests/key_custody.py`'s own detector was case-sensitive in exactly the same
+     way, so it could not see that;
+  4. a SYMLINKED ledger (`ln -s ledgerstore .oaip`) put the key back in
+     `.git/objects` under the target's name, and `oaip init` followed the symlink
+     silently.
+
+  The pathspecs are now repo-rooted, depth-agnostic and case-insensitive
+  (`:/`, `:(top,exclude,glob,icase)**/.oaip/**`); `init` refuses a symlinked
+  ledger, and the snapshot excludes a symlink's target as well and says so
+  loudly. What is claimed is exactly what `tests/key_custody.py` executes: root
+  and nested ledgers, from root and from a subdirectory, tracked and untracked,
+  `.oaip` and `.OAIP`, real directory and symlink. **It is not a claim that no
+  arrangement of a git repository can defeat it — four arrangements already did,
+  and the exclusion is still fundamentally by name.** A hardlinked file, a
+  `core.excludesFile` interaction, or a ledger reached through a symlinked
+  *parent* directory have not been tested.
+- **Migration: a store created before this keyring existed will lose its
+  acceptance edges at the next rebuild**, because nothing vouches for the key
+  that signed its accepts. That is fail-closed on purpose, and the recovery is
+  one explicit command: `oaip bind --actor <id> --key <hex64>` (the `key` field
+  of a signature in `.oaip/warrants/records/`). Naming the key is the operator's
+  assertion, not OAIP's discovery, which is why it is not done automatically.
+- **What the second review round did NOT close.** Beyond the binding gap above:
+  a `claim@v1` artifact is unsigned and unauthenticated, so anyone who can write
+  `.oaip/artifacts` can add a claim record — the acceptance side is now pinned to
+  a signed note, but the claim side is not. `oaip verify` polices the signer of
+  accepts that carry an `oaip-claim:` note and deliberately says nothing about
+  other decisions in the same store. And the check `.oaip/store.json` uses to
+  separate "legacy" from "should have carried a link" rests on a signed `ts`,
+  which someone holding the ledger's key could choose.
 
 ## Conformance vectors, including the negative half
 
@@ -215,6 +250,23 @@ The recurring class is **checking something adjacent to the evidence**:
   tampered cases — which is why `tests/canonical_layer.py` tampers in every case,
   and why its own fix was verified by reverting it (17 of 20 cases fail against
   the pre-fix implementation).
+
+And the more specific class, which has now cost this repository three separate
+facts: **a test whose detector shares the bug's blind spot.**
+
+- `TABLES` in `tests/projection_rebuild.py` omitted `warrants`, so the projection
+  could lose the claim→warrant acceptance edge on rebuild and the comparison
+  reported "identical". Fixed — and then `TABLES` still omitted `artifacts`, so
+  rebuild could rewrite every artifact's `kind` to `"rebuilt"` on a clean honest
+  store and the comparison reported "identical" again. The tuple is now checked
+  against `sqlite_master`, so the next table cannot be added and forgotten.
+- `oaip_paths_in()` in `tests/key_custody.py` matched `".oaip"` case-sensitively —
+  the same blind spot as the pathspec it was testing — so it could not see the key
+  leaking as `.OAIP/dev.key` on the very filesystem this project is developed on.
+
+The lesson that generalises: after fixing a leak, revert the fix and check that
+the test fails. Every case added in the two review rounds above was confirmed RED
+that way, and the observed failure text is in the commit that fixed it.
 - A commit message claimed the CI wiring was fixed; it had wired one of two new
   tests, because the workflow listed steps by hand. CI now runs `tools/check.py`
   and the membership lives in one place.

@@ -37,7 +37,10 @@ python3 $oaip do --intent "make login reject expired tokens" \
         -- your-agent-command
 
 python3 $oaip log        # intent → execution → effects → claim → warrant
-python3 $oaip verify     # the Warrant store verifies
+python3 $oaip verify     # artifacts match their addresses; the store verifies;
+                         # and every OAIP acceptance was signed by a key bound
+                         # to the actor it claims (see llms.txt for what that
+                         # does and does not establish)
 ```
 
 If the validation check passes, `do` files a signed Warrant. If the command
