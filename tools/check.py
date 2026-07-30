@@ -29,10 +29,12 @@ USAGE
     python3 tools/check.py --list          # what would run, and what it needs
 """
 import argparse
+import atexit
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -129,6 +131,20 @@ def main():
     env = dict(os.environ)
     if "WARRANT_CLI" not in env and (WARRANT_IMPL / "warrant.py").is_file():
         env["WARRANT_CLI"] = f"{sys.executable} {WARRANT_IMPL / 'warrant.py'}"
+    # THE SUITE MUST NOT WRITE INTO THE OPERATOR'S OWN CONFIG. Since 2026-07-30
+    # a ledger's signing key and keyring live in a TRUST ROOT outside the
+    # workspace, defaulting to `$XDG_CONFIG_HOME/oaip/roots/<ledger>` — so every
+    # throwaway ledger a check creates would otherwise leave a directory (and a
+    # real Ed25519 key) in `~/.config/oaip`, named after a temporary path that no
+    # longer exists. Measured: one full run left 44 of them. A throwaway
+    # XDG_CONFIG_HOME per run keeps the suite hermetic; it is deliberately not
+    # exported when the operator has already set one, since that is a deployment
+    # choice and this tool does not overrule it.
+    tmp_xdg = None
+    if "XDG_CONFIG_HOME" not in env:
+        tmp_xdg = tempfile.mkdtemp(prefix="oaip-check-xdg-")
+        env["XDG_CONFIG_HOME"] = tmp_xdg
+        atexit.register(lambda: shutil.rmtree(tmp_xdg, ignore_errors=True))
 
     failed, unrun, passed = [], [], 0
     for name, argv, needs, expect in CHECKS:

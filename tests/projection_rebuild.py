@@ -89,6 +89,31 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# THE TRUST ROOT IS NO LONGER IN THE WORKSPACE (O4, 2026-07-30), so every ledger
+# this file creates keeps its key and keyring under a THROWAWAY
+# XDG_CONFIG_HOME. Set in the environment rather than passed per-run, so that
+# every subprocess inherits it — including the ones that rebuild the environment
+# from scratch — and so no test run writes into the operator's own ~/.config.
+import atexit as _atexit                                          # noqa: E402
+import shutil as _shutil                                          # noqa: E402
+import tempfile as _tempfile                                      # noqa: E402
+_XDG = _tempfile.mkdtemp(prefix="oaip-test-xdg-")
+os.environ["XDG_CONFIG_HOME"] = _XDG
+_atexit.register(lambda: _shutil.rmtree(_XDG, ignore_errors=True))
+
+
+def trust_root(work):
+    """Where this ledger's key and keyring actually live — asked of the tool,
+    not recomputed here, so the test cannot disagree with the implementation
+    about the one path the whole property is about."""
+    r = subprocess.run([sys.executable, str(ROOT / "impl" / "oaip.py"),
+                        "trust-root", "--path"], cwd=work,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"cannot resolve the trust root in {work}: "
+                         f"{r.stdout}{r.stderr}")
+    return Path(r.stdout.strip())
 # `warrants` was deliberately absent from this tuple until 2026-07-30, which is
 # how the projection could silently lose the claim→warrant edge on rebuild —
 # the one fact this protocol exists to record. It is in the graph; it is in the
@@ -467,7 +492,8 @@ def main():
                 wcli + ["--store", ".oaip/warrants", "accept",
                         "--subject", subs[cid_a], "--under", ".oaip/policy.txt",
                         "--reason", reason, *extra,
-                        "--actor", "tester@local", "--key", ".oaip/dev.key"],
+                        "--actor", "tester@local",
+                    "--key", str(trust_root(work) / "dev.key")],
                 cwd=work, capture_output=True, text=True)
             out = rr.stdout.strip().splitlines()
             return out[-1] if out else ""
@@ -555,7 +581,8 @@ def main():
         rr = subprocess.run(
             wcli + ["--store", ".oaip/warrants", "accept", "--subject", subj,
                     "--under", ".oaip/policy.txt", "--reason", "no note at all",
-                    "--actor", "tester@local", "--key", ".oaip/dev.key"],
+                    "--actor", "tester@local",
+                    "--key", str(trust_root(work) / "dev.key")],
             cwd=work, capture_output=True, text=True)
         nowid = (rr.stdout.strip().splitlines() or [""])[-1]
         if len(nowid) != 64:

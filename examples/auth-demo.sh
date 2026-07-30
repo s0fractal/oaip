@@ -8,6 +8,13 @@ OAIP="python3 $(cd "$(dirname "$0")/.." && pwd)/impl/oaip.py"
 oaip() { $OAIP "$@"; }
 
 DEMO=$(mktemp -d)
+# This ledger's signing key and keyring live in a TRUST ROOT *outside* the
+# workspace — that is the point: the observed command must not be able to read
+# the key that signs its acceptances or rewrite the keyring that decides whose
+# acceptances count. A throwaway one, so the demo leaves nothing in the reader's
+# own ~/.config (and note it must NOT be under $DEMO, which is the workspace).
+DEMO_TRUST=$(mktemp -d)
+export XDG_CONFIG_HOME="$DEMO_TRUST"
 cd "$DEMO"
 git init -q && git config user.email demo@oaip && git config user.name demo
 cat > auth.py <<'PY'
@@ -60,3 +67,4 @@ echo "### ledger"; oaip log | sed 's/^/  /'
 echo "### the Warrant store verifies"; oaip verify | sed 's/^/  /'
 echo
 echo "demo workspace: $DEMO"
+echo "trust root (key + keyring, outside it): $(oaip trust-root --path)"
