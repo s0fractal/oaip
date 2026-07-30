@@ -133,21 +133,40 @@ property is not enforced at all, that is written down rather than implied away.
     construction by anyone who can write a file. It establishes nothing about who
     decided; a hand-written `accept` with junk signatures passed it.
   - *`warrant verify` exiting 0* is also not enough, twice over.
-    `WARRANT_CLI=/usr/bin/true` exits 0 having verified nothing, so the call is
-    now an identity probe: the program must emit a parseable
-    `warrant.verify-report@v0`, and every call to it is timeout-bounded.
+    `WARRANT_CLI=/usr/bin/true` exits 0 having verified nothing, so OAIP requires
+    a parseable `warrant.verify-report@v0` and bounds every call in time.
     And a **cryptographically valid signature by a key nobody vouches for still
     exits 0** — Warrant SPEC §5 puts key↔actor binding out of scope and §5.1
     makes bound/unbound "a report". `warrant keygen` + one `accept` therefore
     forged an acceptance for a claim nobody accepted, under any actor id.
-  - *Binding* is what is enforced now, and it is **OAIP's own rule, not
-    Warrant's**: an acceptance edge is derived only if every signature on the
-    record names a key bound to the actor it claims in `.oaip/trust.json`, which
-    only `oaip accept` and `oaip bind` ever write. `oaip verify` reports an
+  - *A shape check on that report is NOT an identity check*, and a commit on this
+    branch wrongly called it one. The third review round wrote a four-line stub
+    that prints a clean `warrant.verify-report@v0` and, with a forged accept
+    naming this ledger's real public key and `"sig": "abab…"` (no secret needed),
+    got `oaip rebuild` to exit 0, derive the edge, and `oaip log` to print
+    "(signed decision)" — via `$WARRANT_CLI` **and** by planting the stub at the
+    unpinned default path `~/Projects/warrant/impl/warrant.py`.
+  - *Ed25519 verification is now OAIP's own, in process* (`ed25519_verify`, RFC
+    8032, stdlib integer arithmetic, verify-only — no secret is ever handled).
+    Every signature on an accept must verify against the WarrantID **OAIP
+    recomputed from the record's own bytes** before any edge is derived. That is
+    why no program named by `$WARRANT_CLI` can manufacture an acceptance any
+    more; Warrant is still consulted and its errors still refuse a rebuild — a
+    delegate may veto, it may not vouch.
+  - *Binding* is enforced alongside it, and it is **OAIP's own rule, not
+    Warrant's**: an acceptance edge is derived only if the signature is valid AND
+    names a key bound to the actor it claims in `.oaip/trust.json`, which only
+    `oaip accept` and `oaip bind` ever write. `oaip verify` reports an
     unbound signer on an OAIP acceptance as an error. What OAIP cannot do:
     Warrant's `--trust-config` grade reports the same finding but by
     specification never fails on it, and its machine-readable report omits the
     finding entirely in quiet mode — so it is used as corroboration only.
+  - *A refused rebuild withdraws the projection's authority.* The refusal leaves
+    the projection's bytes alone (fail-closed must not mean destroy-first), but
+    writes `.oaip/projection.untrusted`, and `oaip log` / `oaip verify` then
+    refuse it until a rebuild succeeds. Before that, a projection built once from
+    a poisoned store kept printing "(signed decision)" forever, because every
+    later honest rebuild refused and changed nothing.
   - *Which claim* was accepted is read from the signed `subject.note`
     (`oaip-claim:<id>`), not guessed from the subject hash: the subject
     `{predicate, execution, effects}` excludes the check command and verdict, so
@@ -163,11 +182,21 @@ property is not enforced at all, that is written down rather than implied away.
     `.oaip/store.json` — a criterion the filer of a record cannot choose. In a
     store created by a current `oaip init` there are no eligible records at all.
   - **Still outside OAIP's control:** `.oaip/trust.json` lives beside
-    `.oaip/dev.key`, so anyone who can write the ledger directory can write the
-    keyring — the binding raises the bar from "can run `keygen`" to "can write
-    `.oaip/`", it does not make acceptance unforgeable. There is no out-of-band
-    trust root, no key rotation, and no revocation. Two SUPPORTED claims with
-    byte-identical subjects still cannot be told apart for legacy records.
+    `.oaip/dev.key`, so **anyone who can write `.oaip/`** can write the keyring
+    *and* the signing key — the binding raises the bar from "can run `keygen`" to
+    "can write `.oaip/`", it does not make acceptance unforgeable. Until the
+    third review round the boundary was wider than that: it was "can write
+    `.oaip/`, **or can influence what `$WARRANT_CLI` resolves to**" — the
+    environment variable, or the unpinned sibling checkout at
+    `~/Projects/warrant/impl/warrant.py`, neither of which is inside `.oaip/`.
+    That half is closed: signature validity is decided in process now, so a
+    hostile `$WARRANT_CLI` can make OAIP refuse (by reporting errors, or by not
+    being a Warrant verifier at all) but cannot make it derive an edge. What it
+    can still hide is everything OAIP does *not* recompute — Warrant's schema,
+    blob-reference and DAG/policy findings — so a stub silently costs
+    corroboration on those. There is no out-of-band trust root, no key rotation,
+    and no revocation. Two SUPPORTED claims with byte-identical subjects still
+    cannot be told apart for legacy records.
 - **The snapshot's `.oaip` exclusion has been broken four times by review**, and
   every break was a different way of giving the ledger a name the exclusion did
   not match:

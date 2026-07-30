@@ -75,6 +75,7 @@ NOTE_PREFIX = "oaip-claim:"
 STOREMETA = OAIP / "store.json"     # store-format version, written once by `init`
 STORE_FORMAT = "oaip-store@v1"
 LOCK = OAIP / "lock"                # serialises projection-mutating commands
+UNTRUSTED = OAIP / "projection.untrusted"   # set when a rebuild REFUSED to run
 try:
     import fcntl
 except ImportError:                 # non-POSIX: no advisory locking available
@@ -89,13 +90,173 @@ def sha256(b: bytes) -> str:
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
+# ---------- Ed25519 VERIFICATION, done by OAIP itself (RFC 8032) ----------
+# WHY THIS IS HERE AND NOT DELEGATED (2026-07-30, THIRD adversarial round, C2-F1a)
+# --------------------------------------------------------------------------
+# Until this function existed, cryptographic signature validity was decided in
+# exactly ONE place: a subprocess named by `$WARRANT_CLI`, or — with no env var
+# set at all — an unpinned sibling checkout at `$HOME/Projects/warrant/impl/
+# warrant.py`. The gate on that subprocess checked the SHAPE of the JSON it
+# printed, not the identity of the program, and OAIP's own binding rule only
+# asked which key was NAMED, never whether that key had signed anything. So this
+# four-line program was a complete forgery kit:
+#
+#     # fakewarrant.py
+#     import json
+#     print(json.dumps({"report": "warrant.verify-report@v0",
+#                       "grade": "settlement", "ok": True, "records": 2,
+#                       "errors": 0, "warnings": 0, "findings": []}))
+#
+# With an accept record whose `sigs[0]` NAMES this ledger's real public key and
+# carries `"sig": "abab…"` (garbage — no secret needed), the real Warrant CLI
+# refused (rc=1), and `WARRANT_CLI="python3 fakewarrant.py" oaip rebuild` exited
+# 0, derived the acceptance edge, and `oaip log` printed "(signed decision)".
+# Reproduced again with NO environment variable, by planting the same stub at
+# the unpinned default path.
+#
+# Pinning the CLI by content hash, or challenging it with a known-bad record,
+# would have narrowed that; it would not have removed it. A verifier that is a
+# separate program is a verifier someone else can supply. Ed25519 VERIFICATION
+# needs no secret and no dependency — it is ~60 lines of integer arithmetic over
+# stdlib `hashlib` — so OAIP does it here, in process, before deriving any edge.
+# OAIP stays stdlib-only (SPEC/`README`), and Warrant remains the normative
+# decision layer: it is still consulted, and it can still make OAIP refuse. It
+# can no longer make OAIP believe.
+#
+# Pinned against the RFC 8032 §7.1 test vectors and against real
+# `cryptography`-produced signatures in tests/signature_gate.py.
+_ED_P = (1 << 255) - 19
+_ED_L = (1 << 252) + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_SQRT_M1 = pow(2, (_ED_P - 1) // 4, _ED_P)
+# SPEC §5 of Warrant: small-order and non-canonically-encoded public keys are
+# rejected, because such a key lets an ALL-ZERO signature verify for a large
+# fraction of messages — an attacker mints a "valid signature" attributing a
+# decision to any actor id without knowing a secret. Copied from Warrant's own
+# list so the two implementations refuse the same keys.
+_ED_SMALL_ORDER = {bytes.fromhex(h) for h in (
+    "0100000000000000000000000000000000000000000000000000000000000000",
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+    "0000000000000000000000000000000000000000000000000000000000000080",
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+    "0100000000000000000000000000000000000000000000000000000000000080",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+)}
+
+
+def weak_ed25519_pubkey(raw: bytes) -> bool:
+    """True for a key a conforming verifier MUST reject (Warrant SPEC §5)."""
+    if len(raw) != 32 or raw in _ED_SMALL_ORDER:
+        return True
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)    # drop the sign bit
+    return y >= _ED_P                                        # non-canonical y
+
+
+def _ed_recover_x(y, sign):
+    if y >= _ED_P:
+        return None                     # non-canonical encoding
+    xx = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P) % _ED_P
+    x = pow(xx, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - xx) % _ED_P != 0:
+        x = x * _ED_SQRT_M1 % _ED_P
+    if (x * x - xx) % _ED_P != 0:
+        return None                     # not on the curve
+    if x == 0 and sign:
+        return None                     # non-canonical encoding of x = 0
+    return _ED_P - x if x & 1 != sign else x
+
+
+def _ed_decompress(b):
+    """A 32-byte little-endian point encoding → extended coordinates, or None."""
+    if len(b) != 32:
+        return None
+    y = int.from_bytes(b, "little")
+    sign, y = y >> 255, y & ((1 << 255) - 1)
+    x = _ed_recover_x(y, sign)
+    return None if x is None else (x, y, 1, x * y % _ED_P)
+
+
+def _ed_add(P, Q):
+    A = (P[1] - P[0]) * (Q[1] - Q[0]) % _ED_P
+    B = (P[1] + P[0]) * (Q[1] + Q[0]) % _ED_P
+    C = 2 * P[3] * Q[3] * _ED_D % _ED_P
+    D = 2 * P[2] * Q[2] % _ED_P
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % _ED_P, G * H % _ED_P, F * G % _ED_P, E * H % _ED_P)
+
+
+def _ed_mul(s, P):
+    Q = (0, 1, 1, 0)
+    while s > 0:
+        if s & 1:
+            Q = _ed_add(Q, P)
+        P = _ed_add(P, P)
+        s >>= 1
+    return Q
+
+
+_ED_GY = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+_ED_G = (_ed_recover_x(_ED_GY, 0), _ED_GY, 1,
+         _ed_recover_x(_ED_GY, 0) * _ED_GY % _ED_P)
+
+
+def ed25519_verify(pub: bytes, msg: bytes, sig: bytes) -> bool:
+    """RFC 8032 Ed25519 verification. Verify-only: no secret ever touches this.
+
+    Strict in the directions that matter for a decision layer: a small-order or
+    non-canonical public key is refused, `S` must be reduced (no malleability),
+    and `R` must be a canonical point encoding. Refusing more than Warrant does
+    can only cost OAIP an edge it would otherwise derive; accepting more could
+    cost the protocol its central fact."""
+    if len(pub) != 32 or len(sig) != 64 or weak_ed25519_pubkey(pub):
+        return False
+    A = _ed_decompress(pub)
+    R = _ed_decompress(sig[:32])
+    if A is None or R is None:
+        return False
+    S = int.from_bytes(sig[32:], "little")
+    if S >= _ED_L:
+        return False
+    k = int.from_bytes(hashlib.sha512(sig[:32] + pub + msg).digest(),
+                       "little") % _ED_L
+    lhs, rhs = _ed_mul(S, _ED_G), _ed_add(R, _ed_mul(k, A))
+    return ((lhs[0] * rhs[2] - rhs[0] * lhs[2]) % _ED_P == 0
+            and (lhs[1] * rhs[2] - rhs[1] * lhs[2]) % _ED_P == 0)
+
+
+def signature_verifies(wid: str, s) -> bool:
+    """Does signature entry `s` verify over WarrantID `wid`, per OAIP itself?
+
+    Warrant signs the RAW 32 BYTES of the WarrantID (`sk.sign(bytes.fromhex(
+    wid))`, warrant.py `sign_envelope`), and the WarrantID is sha256 over the
+    canonical body — which `read_warrant_store` has already recomputed from the
+    file. So this check is anchored in bytes OAIP hashed itself, not in anything
+    a store, an env var or a subprocess said."""
+    if not isinstance(s, dict):
+        return False
+    key, sig = s.get("key"), s.get("sig")
+    if not (isinstance(key, str) and isinstance(sig, str) and HEX64.match(wid)):
+        return False
+    try:
+        pub, raw = bytes.fromhex(key), bytes.fromhex(sig)
+    except ValueError:
+        return False
+    return ed25519_verify(pub, bytes.fromhex(wid), raw)
+
+
 def warrant_cli_available() -> bool:
     """True when the WARRANT argv names something that can actually run.
     Mirrors tools/check.py: either the program is on PATH / at its path, and —
     for the `python3 …/warrant.py` form — the script file exists.
 
-    NOT an identity check: `WARRANT_CLI=/usr/bin/true` satisfies this. See
-    `store_report`, which is the gate that actually asks *what program is this*."""
+    NOT an identity check: `WARRANT_CLI=/usr/bin/true` satisfies this, and so
+    does any stub that prints a clean report (see `store_report`). Nothing here
+    or in `store_report` establishes WHICH program ran; what makes that
+    survivable is that OAIP verifies signatures itself (`ed25519_verify`)."""
     prog = WARRANT[0]
     if not (shutil.which(prog) or Path(prog).exists()):
         return False
@@ -231,16 +392,20 @@ def bind_actor(actor: str, key: str):
     TRUST.write_text(json.dumps({"actors": actors}, sort_keys=True) + "\n")
 
 
-def unbound_signers(env, actors):
+def unaccounted_signatures(wid, env, actors):
     """Which of this record's signatures fail to establish who signed it.
 
     Returns a list of human-readable reasons; empty means EVERY signature entry
-    names a key this keyring binds to the actor that entry claims. "Every", not
-    "some", on purpose: Warrant's §5 lets anyone with store write access append
-    co-signatures, and a record could carry a bound-but-invalid signature next to
-    an unbound-but-valid one. Requiring all of them, together with a Warrant
-    verification that reported no excluded signature and no error, leaves no
-    signature on the record that OAIP has not accounted for."""
+    both VERIFIES (OAIP's own Ed25519 check, over the WarrantID OAIP recomputed)
+    and names a key this keyring binds to the actor that entry claims. "Every",
+    not "some", on purpose: Warrant's §5 lets anyone with store write access
+    append co-signatures, and a record could carry a bound-but-invalid signature
+    next to an unbound-but-valid one.
+
+    The cryptographic half used to be delegated entirely to the Warrant CLI, so
+    a stub program that printed a clean report made a record with `"sig":
+    "abab…"` — bytes no key produced — pass this function on the strength of
+    NAMING a bound key (2026-07-30, third adversarial round, C2-F1a)."""
     reasons = []
     sigs = env.get("sigs")
     if not isinstance(sigs, list) or not sigs:
@@ -252,6 +417,9 @@ def unbound_signers(env, actors):
         a, k = s.get("actor"), s.get("key")
         if not (isinstance(a, str) and isinstance(k, str)):
             reasons.append("a signature entry has no actor/key strings")
+        elif not signature_verifies(wid, s):
+            reasons.append(f"the signature by {a!r} does NOT verify against "
+                           f"key {k[:12]} (OAIP's own Ed25519 check)")
         elif k not in actors.get(a, []):
             reasons.append(f"key {k[:12]} is not bound to actor {a!r} in {TRUST}")
     return reasons
@@ -260,14 +428,20 @@ def unbound_signers(env, actors):
 def store_report(settlement=True):
     """(report, error) — the Warrant CLI's `warrant.verify-report@v0` object.
 
-    THIS IS ALSO THE CLI IDENTITY PROBE (2026-07-30 review, F9). The previous
-    gate was "some program exited 0", so `WARRANT_CLI=/usr/bin/true` re-opened
-    the original forgery in full: rebuild derived every acceptance edge from a
-    store nothing had verified, and printed "(signed decision)". Exiting 0 is not
-    evidence of having verified anything. A program that cannot produce a
-    parseable report NAMING ITSELF (`"report": "warrant.verify-report@v0"`, with
-    integer counts and a findings list) is not a Warrant verifier as far as OAIP
-    is concerned, and OAIP refuses rather than trusting the exit code."""
+    WHAT THIS IS, AND WHAT IT IS NOT. It is a SHAPE check on a JSON document, and
+    a commit on this branch wrongly called it "the CLI identity probe" — a claim
+    the third adversarial round refuted in four lines (see `ed25519_verify`): a
+    stub that prints a well-formed clean report satisfies it completely. The
+    honest description is narrower. `WARRANT_CLI=/usr/bin/true` exits 0 having
+    verified nothing, and OAIP must not read an exit status as a verification, so
+    a program that cannot even produce a parseable `warrant.verify-report@v0` is
+    refused (F9). That rules out an *accident* — a mis-set variable, a wrapper
+    that swallows output — not an adversary.
+
+    What makes an adversary's stub useless is that OAIP no longer BELIEVES this
+    report about signatures: `unaccounted_signatures` verifies Ed25519 in
+    process. This report can still make OAIP REFUSE (errors here are fatal to a
+    rebuild), which is the safe direction for a delegated check."""
     if not warrant_cli_available():
         return None, ("no runnable Warrant CLI is configured (set WARRANT_CLI) "
                       "— refusing to reason about signatures nothing verified")
@@ -672,6 +846,58 @@ def store_lock():
             fh.close()
 
 
+def mark_untrusted(reasons):
+    """Withdraw the CURRENT projection's authority, without destroying it.
+
+    THE DEFECT THIS CLOSES (2026-07-30, third adversarial round, C2-F1a). A
+    rebuild that refuses leaves the previous projection in place — deliberately,
+    because fail-closed must not mean destroy-first. But "in place" was also
+    "still authoritative": after a projection had been built from a store the
+    canonical layer no longer supports (or with a stub verifier), every honest
+    rebuild afterwards refused (rc=1) and `oaip log` went on printing "(signed
+    decision)" for the forged acceptance, indefinitely. A refusal that leaves a
+    known-bad projection readable as truth has refused nothing.
+
+    So the bytes stay — they are evidence, and a diagnosis may need them — and
+    the AUTHORITY goes: `oaip log` and `oaip verify` refuse until a rebuild
+    succeeds, and a successful rebuild removes this marker itself."""
+    if not DB.exists():
+        return
+    try:
+        UNTRUSTED.write_text(json.dumps(
+            {"at": int(time.time()), "reasons": [str(r) for r in reasons]},
+            sort_keys=True) + "\n")
+    except OSError as e:                # cannot mark it: say so, never silently
+        print(f"warning: cannot write {UNTRUSTED} ({e}); the projection at {DB} "
+              "may assert facts this canonical layer does not support",
+              file=sys.stderr)
+
+
+def untrusted_reason():
+    """Why the projection is not to be believed, or None."""
+    if not UNTRUSTED.is_file():
+        return None
+    try:
+        doc = loads_ijson(UNTRUSTED.read_bytes())
+        reasons = doc.get("reasons") if isinstance(doc, dict) else None
+        if isinstance(reasons, list) and reasons:
+            return "; ".join(str(r) for r in reasons[:3])
+    except (ValueError, OSError):
+        pass
+    return "a rebuild refused this canonical layer (reason unreadable)"
+
+
+def require_trusted_projection():
+    why = untrusted_reason()
+    if why is None:
+        return
+    sys.exit(f"refusing to report the projection at {DB}: a rebuild REFUSED "
+             f"this canonical layer, so what the projection asserts is no longer "
+             f"known to be derivable from it — {why}. Fix the canonical layer and "
+             f"run `oaip rebuild` (the marker is {UNTRUSTED}; the projection "
+             "itself has been left untouched for inspection).")
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS intents(
   id TEXT PRIMARY KEY, description TEXT NOT NULL, parent_id TEXT, created_at INTEGER);
@@ -985,6 +1211,8 @@ def cmd_do(a):
 
 
 def cmd_log(_):
+    # A projection a rebuild refused is not a report; it is a suspect (C2-F1a).
+    require_trusted_projection()
     con = db()
     for i in con.execute("SELECT id,description FROM intents ORDER BY id"):
         print(f"INTENT {i[0]}  {i[1]}")
@@ -1085,9 +1313,10 @@ def signer_gate(report, actors, unbound_prefixes):
         — otherwise OAIP cannot tell which of several signatures was the valid
         one, and a bound-but-junk entry could stand next to an unbound-but-valid
         one (§5 lets anyone with store write access append co-signatures);
-      * every signature entry names a key bound to the actor it claims in
-        `.oaip/trust.json` — the ENFORCED rule, OAIP's own, because Warrant has
-        none to enforce; and
+      * every signature entry VERIFIES under OAIP's own Ed25519 check and names
+        a key bound to the actor it claims in `.oaip/trust.json` — the ENFORCED
+        rule, OAIP's own, because Warrant has none to enforce and because a
+        delegated verifier is a verifier someone else can supply (C2-F1a); and
       * Warrant's settlement grade does not itself call the record unbound
         against that same keyring file — corroboration, not the primary check.
     """
@@ -1098,7 +1327,7 @@ def signer_gate(report, actors, unbound_prefixes):
                if any(k in m for k in _AMBIGUOUS_SIG)]
         if amb:
             return f"Warrant excluded or could not read a signature on it ({amb[0]})"
-        reasons = unbound_signers(env, actors)
+        reasons = unaccounted_signatures(wid, env, actors)
         if reasons:
             return reasons[0]
         if unbound_prefixes and wid[:12] in unbound_prefixes:
@@ -1165,16 +1394,20 @@ def _rebuild(a):
     # THE PREVIOUS ONE WAS BROKEN BY REVIEW (2026-07-30, two rounds):
     #   1. address-matching (above) — satisfied BY CONSTRUCTION by anyone who can
     #      write a file, so it establishes nothing about who decided.
-    #   2. `warrant verify` exiting 0 — broken two ways: `WARRANT_CLI=/usr/bin/true`
-    #      exits 0 having verified nothing (so the call is now an IDENTITY PROBE:
-    #      the program must emit a parseable `warrant.verify-report@v0`), and a
-    #      cryptographically valid signature by a key nobody vouches for still
-    #      exits 0, because Warrant reports an unbound key↔actor binding as a WARN
-    #      by SPECIFICATION (§5, §5.1).
-    #   3. BINDING (this layer): the signer must be a key bound to the actor it
-    #      claims in OAIP's own keyring, `.oaip/trust.json`, which only
-    #      `cmd_accept`/`oaip bind` ever write. An accept signed by an unknown key
-    #      gets NO EDGE, whatever Warrant's exit status says.
+    #   2. `warrant verify` — a corroborating delegate, never the decider. It was
+    #      broken as a decider two ways: `WARRANT_CLI=/usr/bin/true` exits 0
+    #      having verified nothing, and a cryptographically valid signature by a
+    #      key nobody vouches for also exits 0, because Warrant reports an unbound
+    #      key↔actor binding as a WARN by SPECIFICATION (§5, §5.1). Requiring a
+    #      parseable `warrant.verify-report@v0` ruled out the accident; a stub
+    #      that prints one defeated it entirely (third round, C2-F1a). Errors
+    #      reported here still refuse a rebuild — a delegate may veto.
+    #   3. SIGNATURE + BINDING (this layer, OAIP's own, in process): every
+    #      signature must verify under `ed25519_verify` over the WarrantID OAIP
+    #      recomputed, AND name a key bound to the actor it claims in
+    #      `.oaip/trust.json`, which only `cmd_accept`/`oaip bind` ever write. An
+    #      accept signed by an unknown key — or by no key at all — gets NO EDGE,
+    #      whatever any subprocess says.
     report, unbound_prefixes, actors = None, None, {}
     if wrec_files:
         report, rerr = store_report()
@@ -1201,9 +1434,12 @@ def _rebuild(a):
                         else "",
                         f"{len(store_bad)} fault(s) in the decision layer "
                         f"({WSTORE})" if store_bad else "") if p)
+        mark_untrusted(art_bad + store_bad)
         sys.exit(f"refusing to rebuild: {where} — the projection would assert "
-                 "facts the canonical layer does not support (the existing "
-                 "projection has been left untouched)")
+                 "facts the canonical layer does not support. The existing "
+                 f"projection is left on disk but MARKED UNTRUSTED ({UNTRUSTED}): "
+                 "`oaip log` and `oaip verify` will refuse it until a rebuild "
+                 "succeeds.")
 
     # BUILD UNDER A TEMPORARY NAME, THEN RENAME (F10). The old code deleted
     # `ledger.db` and rebuilt in place, so between those two moments there was no
@@ -1405,6 +1641,7 @@ def _rebuild(a):
     con.commit()
     con.close()
     os.replace(tmp_db, DB)          # atomic: never a moment with no projection
+    UNTRUSTED.unlink(missing_ok=True)   # this projection WAS derived; it stands
     print("rebuilt projection from the canonical layer: "
           + ", ".join(f"{k.split('@')[0]}={v}" for k, v in sorted(counts.items())))
 
@@ -1474,6 +1711,23 @@ def cmd_verify(_):
     print(f"canonical layer: {len(errs)} error(s)" if errs
           else "canonical layer: every artifact matches its address")
 
+    # The projection is a THIRD thing, named as itself: a fault here is neither
+    # the canonical layer's nor the decision layer's, and this file has already
+    # been wrong once by reporting one layer's health as another's.
+    proj_errs = []
+    why = untrusted_reason()
+    if why is not None:
+        # The projection outlived a refusal, so it may still assert facts this
+        # canonical layer does not support. Reporting it as healthy is how a
+        # forged edge stayed readable as "(signed decision)" forever (C2-F1a).
+        proj_errs.append(f"projection {DB}: MARKED UNTRUSTED — a rebuild refused "
+                         "this canonical layer, and the projection predates that "
+                         f"refusal ({why}). Rebuild before believing it.")
+    for e in proj_errs:
+        print("ERR ", e)
+    print(f"projection:      {len(proj_errs)} error(s)" if proj_errs
+          else "projection:      derived (no refused rebuild since)")
+
     accepts, wrec_files, store_errs = read_warrant_store()
     report, rerr = store_report() if wrec_files else (None, None)
     for e in store_errs:
@@ -1503,7 +1757,7 @@ def cmd_verify(_):
               + ("" if report["errors"] == 0 else "  [Warrant]"))
     elif not wrec_files:
         print("decision layer:  (empty store)")
-    sys.exit(1 if (errs or dec_errs
+    sys.exit(1 if (errs or dec_errs or proj_errs
                    or (report and report["errors"])) else 0)
 
 

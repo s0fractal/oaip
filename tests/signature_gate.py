@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""Who decided? OAIP must answer that itself, from bytes, in process.
+
+THE DEFECT (2026-07-30, THIRD adversarial round, C2-F1a)
+-------------------------------------------------------
+Cryptographic signature validity was decided in exactly ONE place: a subprocess
+named by `$WARRANT_CLI` — or, with no environment variable set at all, an
+unpinned sibling checkout at `$HOME/Projects/warrant/impl/warrant.py`. OAIP's own
+rule (`unbound_signers`) only asked which key a signature entry NAMED; whether
+that key had signed anything was the subprocess's business. And the gate on the
+subprocess (`store_report`) checked the SHAPE of the JSON it printed, not the
+identity of the program — a commit on this branch called that "the CLI identity
+probe", which it never was.
+
+So four lines defeated the whole acceptance path:
+
+    # fakewarrant.py
+    import json
+    print(json.dumps({"report": "warrant.verify-report@v0", "grade":
+                      "settlement", "ok": True, "records": 2, "errors": 0,
+                      "warnings": 0, "findings": []}))
+
+with a forged accept whose `sigs[0]` names this ledger's REAL public key and
+carries `"sig": "abab…"` — garbage, no secret needed. Measured before the fix:
+the real Warrant CLI refused (rc=1), and
+`WARRANT_CLI="python3 fakewarrant.py" oaip rebuild` exited 0, derived the
+acceptance edge, `oaip log` printed "(signed decision)", `oaip verify` printed
+0 errors. Reproduced with NO environment variable by planting the same stub at
+the unpinned default path (case B2 below does this against a fake $HOME; it must
+never touch the operator's real checkout).
+
+THE FIX: OAIP VERIFIES ED25519 ITSELF (`impl/oaip.py: ed25519_verify`)
+----------------------------------------------------------------------
+Verification needs no secret and no dependency — ~60 lines of integer arithmetic
+over stdlib `hashlib` — so the central check is no longer delegated. Warrant
+remains the normative decision layer and is still consulted; a stub can still
+make OAIP REFUSE (that direction is safe), and can no longer make it believe.
+Part A pins the verifier against RFC 8032 §7.1 and against forgery classes;
+Part B pins the end-to-end behaviour through both routes to the stub.
+
+AND: A REFUSAL MUST NOT LEAVE A KNOWN-BAD PROJECTION READABLE (same finding)
+---------------------------------------------------------------------------
+The forgery was also STICKY. Once a projection asserted it, every honest rebuild
+afterwards refused (rc=1) and left that projection in place — so `oaip log` went
+on printing "(signed decision)" indefinitely, and the refusal protected nothing.
+A refused rebuild now marks the projection untrusted (case B3): the bytes stay,
+the authority goes, and a successful rebuild restores it.
+
+CO-SIGNATURES (C2-F1b)
+----------------------
+Warrant SPEC §5 lets anyone with store write access append a co-signature, and
+deliberately will not let one invalidate an otherwise-good record. OAIP demanded
+that EVERY signature be bound, so one appended, cryptographically VALID co-sig by
+a second endorser silently DELETED the acceptance edge and `oaip rebuild` still
+exited 0. Part C pins the opposite: the claimed actor's signature must be valid
+and bound, extra signatures are reported, and the edge survives.
+"""
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "impl"))
+import oaip as O                                              # noqa: E402
+
+ok = True
+
+STUB = ("import json\n"
+        'print(json.dumps({"report":"warrant.verify-report@v0",'
+        '"grade":"settlement","ok":True,"records":2,"errors":0,'
+        '"warnings":0,"findings":[]}))\n')
+
+
+def case(name, cond, detail=""):
+    global ok
+    print(("OK   " if cond else "FAIL "), name, detail if not cond else "")
+    ok &= bool(cond)
+
+
+def canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def sha256(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def wcli():
+    return (os.environ.get("WARRANT_CLI")
+            or f"{sys.executable} "
+               f"{Path.home() / 'Projects/warrant/impl/warrant.py'}").split()
+
+
+def make_repo(tmp, name="w"):
+    work = Path(tmp) / name
+    work.mkdir()
+    shutil.copytree(ROOT / "impl", work / "impl")
+    subprocess.run(["git", "init", "-q", "."], cwd=work, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-q", "--allow-empty", "-m", "init"],
+                   cwd=work, check=True)
+
+    def run(*a, env=None):
+        return subprocess.run([sys.executable, "impl/oaip.py", *a], cwd=work,
+                              capture_output=True, text=True,
+                              env=dict(os.environ, **(env or {})))
+    run("init")
+    return work, run
+
+
+def edges(work):
+    db = work / ".oaip" / "ledger.db"
+    if not db.is_file():
+        return []
+    con = sqlite3.connect(db)
+    rows = list(con.execute("SELECT claim_id, warrant_id FROM warrants"))
+    con.close()
+    return rows
+
+
+def real_accept(work):
+    """(path, envelope) of the accept `oaip do` filed."""
+    for p in sorted((work / ".oaip" / "warrants" / "records").glob("*.json")):
+        env = json.loads(p.read_text())
+        if env["body"].get("decision") == "accept":
+            return p, env
+    raise SystemExit("setup: no accept record in the store")
+
+
+def part_a():
+    # --- A. the verifier itself. RFC 8032 §7.1 first: a verifier that cannot
+    # agree with the standard's own vectors is not evidence about anything below.
+    vectors = [
+        # (secret-derived public key, message, signature) — RFC 8032 §7.1
+        ("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+         "",
+         "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555f"
+         "b8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+        ("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+         "72",
+         "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da08"
+         "5ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+        ("fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+         "af82",
+         "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18"
+         "ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"),
+    ]
+    for pub, msg, sig in vectors:
+        case(f"RFC 8032 §7.1 vector (msg={msg or '<empty>'}) verifies",
+             O.ed25519_verify(bytes.fromhex(pub), bytes.fromhex(msg),
+                              bytes.fromhex(sig)))
+    pub, msg, sig = (bytes.fromhex(vectors[1][0]), bytes.fromhex(vectors[1][1]),
+                     bytes.fromhex(vectors[1][2]))
+    case("a flipped message byte does not verify",
+         not O.ed25519_verify(pub, bytes([msg[0] ^ 1]), sig))
+    case("a flipped signature byte does not verify",
+         not O.ed25519_verify(pub, msg, sig[:-1] + bytes([sig[-1] ^ 1])))
+    case("another key does not verify the same signature",
+         not O.ed25519_verify(bytes.fromhex(vectors[0][0]), msg, sig))
+    case("`sig` of the wrong length does not verify",
+         not O.ed25519_verify(pub, msg, sig[:-1]))
+    # Malleability: S + L is the same scalar mod L, and an unreduced S must be
+    # refused rather than accepted as a second valid signature.
+    s_plus_l = int.from_bytes(sig[32:], "little") + O._ED_L
+    if s_plus_l < (1 << 256):
+        case("a non-reduced S (S + L) does not verify",
+             not O.ed25519_verify(pub, msg,
+                                  sig[:32] + s_plus_l.to_bytes(32, "little")))
+    # A small-order key makes an all-zero signature verify for many messages in a
+    # lenient verifier: that is a forgery without a secret (Warrant SPEC §5).
+    case("a small-order public key is refused outright",
+         all(not O.ed25519_verify(k, b"anything", b"\x00" * 64)
+             for k in list(O._ED_SMALL_ORDER)[:4]))
+    case("`signature_verifies` refuses non-hex and non-object entries",
+         not O.signature_verifies("aa" * 32, {"key": "zz", "sig": "zz"})
+         and not O.signature_verifies("aa" * 32, "not an object")
+         and not O.signature_verifies("aa" * 32, {"key": "aa" * 32}))
+
+    # A REAL Warrant signature, produced by the reference CLI (which uses
+    # `cryptography`), must verify here. Parity in the accepting direction is
+    # what makes the refusals above meaningful rather than a broken verifier.
+    with tempfile.TemporaryDirectory() as tmp:
+        work, run = make_repo(tmp, "parity")
+        r = run("do", "--intent", "sign something real", "--check", "true",
+                "--actor", "tester@local", "--", "sh", "-c", "echo hi > f.txt")
+        if "ACCEPTED" not in r.stdout:
+            case("setup(A): the one-shot flow accepted", False, r.stdout + r.stderr)
+            return
+        p, env = real_accept(work)
+        s = env["sigs"][0]
+        case("a REAL warrant signature verifies under OAIP's own Ed25519 check",
+             O.signature_verifies(p.stem, s), f"{p.stem[:12]} {s}")
+        case("the signed message is the WarrantID OAIP recomputes itself",
+             p.stem == sha256(canon(env["body"])))
+        bad = dict(s, sig="ab" * 64)
+        case("the same entry with garbage `sig` does NOT verify",
+             not O.signature_verifies(p.stem, bad))
+
+
+def forge(work, key_hex, actor="tester@local", sig="ab" * 64):
+    """A NEW accept record at its own valid address, naming a real bound key,
+    signed with bytes no key produced. This is the whole forgery kit."""
+    _, env = real_accept(work)
+    body = dict(env["body"])
+    body["ts"] = body["ts"] + 1
+    wid = sha256(canon(body))
+    (work / ".oaip" / "warrants" / "records" / f"{wid}.json").write_text(
+        json.dumps({"body": body,
+                    "sigs": [{"actor": actor, "key": key_hex, "sig": sig}]}))
+    return wid
+
+
+def part_b():
+    with tempfile.TemporaryDirectory() as tmp:
+        work, run = make_repo(tmp, "stub")
+        r = run("do", "--intent", "real work", "--check", "test -f f.txt",
+                "--actor", "tester@local", "--", "sh", "-c", "echo hi > f.txt")
+        if "ACCEPTED" not in r.stdout:
+            case("setup(B): the one-shot flow accepted", False, r.stdout + r.stderr)
+            return
+        honest = edges(work)
+        pub = (work / ".oaip" / "dev.key.pub").read_text().strip()
+        fwid = forge(work, pub)
+
+        # The negative control, both halves. The forgery satisfies EVERY gate
+        # that does not do cryptography: it hashes to its own address, and it
+        # names a key this ledger's own keyring binds to the actor it claims.
+        case("negative control: the forgery satisfies address-matching",
+             (work / ".oaip" / "warrants" / "records"
+              / f"{fwid}.json").is_file())
+        trust = json.loads((work / ".oaip" / "trust.json").read_text())
+        case("negative control: the forgery NAMES a bound key of the real actor",
+             pub in trust["actors"].get("tester@local", []), trust)
+
+        # And the real CLI refuses it, which is why an attacker wants another one.
+        r = run("rebuild")
+        case("with the REAL Warrant CLI, rebuild refuses this store",
+             r.returncode != 0, (r.stdout + r.stderr)[-300:])
+
+        # --- B1: the stub named by $WARRANT_CLI.
+        stub = work / "fakewarrant.py"
+        stub.write_text(STUB)
+        r = run("rebuild", env={"WARRANT_CLI": f"{sys.executable} {stub}"})
+        out = r.stdout + r.stderr
+        case("stub CLI via $WARRANT_CLI: no acceptance edge is derived from the "
+             "forgery", all(w != fwid for _, w in edges(work)),
+             f"{edges(work)} {out[-300:]}")
+        case("stub CLI via $WARRANT_CLI: the refusal names the SIGNATURE, not "
+             "the exit code", "does NOT verify" in out, out[-400:])
+        case("stub CLI via $WARRANT_CLI: the honest edge is untouched",
+             edges(work) == honest, f"{edges(work)} vs {honest}")
+        log = run("log", env={"WARRANT_CLI": f"{sys.executable} {stub}"})
+        case("stub CLI via $WARRANT_CLI: `oaip log` prints no forged "
+             "(signed decision)", fwid[:16] not in log.stdout, log.stdout)
+        v = run("verify", env={"WARRANT_CLI": f"{sys.executable} {stub}"})
+        case("stub CLI via $WARRANT_CLI: `oaip verify` FAILS on the forgery",
+             v.returncode != 0 and fwid[:12] in (v.stdout + v.stderr),
+             (v.stdout + v.stderr)[-400:])
+
+        # --- B2: NO environment variable at all. The default path is unpinned
+        # (`$HOME/Projects/warrant/impl/warrant.py`), so planting the stub there
+        # is the same attack with nothing to notice. Run against a FAKE $HOME:
+        # this test must never write into the operator's real checkout.
+        fake_home = work / "fakehome"
+        (fake_home / "Projects" / "warrant" / "impl").mkdir(parents=True)
+        (fake_home / "Projects" / "warrant" / "impl" / "warrant.py").write_text(STUB)
+        env = {k: v for k, v in os.environ.items() if k != "WARRANT_CLI"}
+        env["HOME"] = str(fake_home)
+        r = subprocess.run([sys.executable, "impl/oaip.py", "rebuild"], cwd=work,
+                           capture_output=True, text=True, env=env)
+        out = r.stdout + r.stderr
+        case("stub planted at the UNPINNED DEFAULT PATH (no env var): no edge "
+             "from the forgery", all(w != fwid for _, w in edges(work)),
+             f"{edges(work)} {out[-300:]}")
+        case("stub at the default path: the refusal names the signature",
+             "does NOT verify" in out, out[-400:])
+
+        # --- B3: STICKINESS. A refusal must not leave a projection that keeps
+        # asserting what the canonical layer no longer supports.
+        r = run("rebuild")
+        case("the honest CLI still refuses the poisoned store", r.returncode != 0,
+             (r.stdout + r.stderr)[-200:])
+        case("a refused rebuild leaves the projection bytes in place "
+             "(fail-closed is not destroy-first)",
+             (work / ".oaip" / "ledger.db").is_file() and edges(work) == honest,
+             edges(work))
+        log = run("log")
+        case("after a refused rebuild `oaip log` REFUSES to report the "
+             "projection", log.returncode != 0 and "WARRANT" not in log.stdout,
+             (log.stdout + log.stderr)[-300:])
+        case("and it says why, naming the marker",
+             "UNTRUSTED" in (log.stdout + log.stderr).upper()
+             and "rebuild" in (log.stdout + log.stderr),
+             (log.stdout + log.stderr)[-300:])
+        v = run("verify")
+        case("`oaip verify` reports the projection as untrusted, and fails",
+             v.returncode != 0 and "MARKED UNTRUSTED" in (v.stdout + v.stderr),
+             (v.stdout + v.stderr)[-400:])
+
+        # Remove the forgery: the store is honest again, so a rebuild succeeds
+        # and the projection's authority comes back with it.
+        (work / ".oaip" / "warrants" / "records" / f"{fwid}.json").unlink()
+        r = run("rebuild")
+        case("with the forgery removed, rebuild succeeds again",
+             r.returncode == 0, (r.stdout + r.stderr)[-300:])
+        log = run("log")
+        case("a successful rebuild restores the projection's authority",
+             log.returncode == 0 and "WARRANT" in log.stdout,
+             (log.stdout + log.stderr)[-300:])
+        case("and the honest edge is exactly what it was", edges(work) == honest,
+             f"{edges(work)} vs {honest}")
+
+
+def main():
+    part_a()
+    part_b()
+    print("\nSIGNATURE-GATE: " + ("ALL PASS" if ok else "FAILURES"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
