@@ -461,7 +461,7 @@ lie.
 ```json
 { "claim": "0.1", "id": "<id>", "subject": "<hex64>", "predicate": "<string>",
   "evidence": ["<hex64>", "..."],
-  "validation": { "runtime": "cmd@v1", "check": "<hex64>",
+  "validation": { "runtime": "oaip-host-shell@v1", "check": "<hex64>",
                   "verdict": "pass | fail", "transcript": "<hex64>" },
   "proposed_by": "<string>", "ts": <int> }
 ```
@@ -486,6 +486,15 @@ for a Warrant subject; it is never itself an accepted fact. `check` is a hash
 because the check is evidence: a reader must be able to fetch and re-run exactly
 the bytes that were run, and a command echoed into a record is a *description* of
 a check rather than the check.
+
+**`validation.runtime` MUST name the profile the check actually ran under**, and
+a filer MUST NOT record a runtime whose registered definition its execution did
+not satisfy. This is stated as a MUST because it was violated: until 2026-07-31
+this implementation ran the check through the host shell and recorded `cmd@v1`,
+a tag Warrant SPEC §3 defines as execution in an isolated container, and passed
+it into a signed decision (§3). A record that names an execution profile which
+did not happen is a false record even when every hash in it is correct. §7.3
+registers `oaip-host-shell@v1` for what actually happens.
 
 ### 2.8 `ClaimSubject` — what the decision is *about*
 
@@ -525,10 +534,35 @@ An **accepted** claim MUST be represented as a Warrant `accept` record, where:
   accept that omits this names no claim at all, and a reader MUST NOT guess one
   from the subject). Readers MUST match the prefix **case-insensitively**, so
   that its spelling cannot select a weaker code path;
-- `because` = `[ {kind:"prose", text: predicate}, {kind:"check", runtime, check,
-  verdict, transcript} ]` per Warrant §3 — the validation is the check reason;
-- `evidence` = the claim's `evidence` artifact hashes;
+- `because` begins with `{kind:"prose", text: predicate}`. How the **validation**
+  enters depends on the claim's `validation.runtime`, and the rule is a MUST
+  because getting it wrong puts a false statement inside a signature:
+  - if that runtime is registered in **Warrant's** reason-runtime registry
+    (Warrant SPEC §13.1) *and* the filer actually provided that runtime's
+    profile, the validation is filed as `{kind:"check", runtime, check, verdict,
+    transcript}` with all four members passed through unchanged;
+  - **otherwise the filer MUST NOT substitute a Warrant runtime tag.** OAIP's
+    own runtime registry (§7.3) is not Warrant's, an unregistered `runtime`
+    makes the Warrant record invalid by Warrant §3's MUST, and a *registered*
+    one whose profile did not happen is the defect this rule exists to stop. The
+    validation is instead filed as a **prose** reason naming the runtime and the
+    verdict, and `validation.check` and `validation.transcript` MUST be added to
+    the accept's `evidence` so those bytes still resolve in the store and remain
+    citable by hash;
+- `evidence` = the claim's `evidence` artifact hashes, plus the check blob and
+  transcript in the second case above;
 - `under` = the decision policy in force.
+
+**The reference implementation is always in the second case**, and will be until
+either OAIP grows a validation runtime that genuinely satisfies a Warrant tag or
+`oaip-host-shell@v1` is registered in Warrant §13.1 — a pull request against the
+Warrant repository, since that registry has no operator (Warrant SPEC §13). What
+the second case costs, stated rather than implied: the warrant carries no
+machine-readable `because[].check`, so it contributes no check outcome
+fingerprint to Warrant's §7(b) novelty test and a tool that looks for a check
+reason finds none. The trade is deliberate — a decision that cites its check as
+evidence and says in words how it ran is weaker than one whose check reason is
+machine-readable, and stronger than one whose check reason is untrue.
 
 Reject / revise / supersede use Warrant's native `prior` chain
 (`propose → reject → accept`). OAIP does **not** re-specify decision semantics —
@@ -723,8 +757,32 @@ re-run the check and get the same verdict, including the budget it may spend.
 
 | Tag | Versions | Status | Definition |
 | --- | --- | --- | --- |
-| `cmd@v1` | `claim` `0.1` | current | the check blob is executed as a command; exit 0 = `pass`, non-zero = `fail`. The same tag as Warrant §3 `cmd@v1`, so the bridge (§3) passes it through unchanged |
+| `oaip-host-shell@v1` | `claim` `0.1` | current | the check blob is executed by the host's POSIX shell — `sh -c <blob>` — **in the observed workspace**, as the process that ran the claim, with that process's full ambient authority: **no container and no isolation of the filesystem, the network, the user or the environment**. Exit 0 = `pass`, non-zero = `fail`. Re-running it reproduces the verdict only on a host configured like the filer's, and re-running a stranger's is running a stranger's shell script |
+| `cmd@v1` | `claim` `0.1` | current — **readable, never written by this implementation** | Warrant §3's tag [R3]: the check blob is executed as a command **in an isolated container**; exit 0 = `pass`, non-zero = `fail` |
 | `ski@v1` | — | **reserved; MUST be rejected in `claim` `0.1`** | Σ-GLYPH Book I [R7] SKI term evaluation under an ATP budget |
+
+**Why `cmd@v1` is registered and not written.** Until 2026-07-31 this
+implementation ran every check with `subprocess.run(check, shell=True)` on the
+observer's own host and recorded `cmd@v1`, and §3 passed that tag into a signed
+Warrant record — where Warrant §3 defines it as execution in an isolated
+container. The signed decision therefore promised an execution profile that
+never existed. Found by external audit (Codex, 2026-07-31) with a working
+reproduction, reproduced here before it was changed. `cmd@v1` stays **readable**
+because every claim written before that date carries it and §6 forbids making a
+record invalid that an earlier reading called valid; nothing in this
+specification, and nothing an implementation may do, makes it writable again
+without an execution that actually provides a container.
+
+**Why the honest tag stops at OAIP's own records.** `oaip-host-shell@v1` is
+registered *here*, in OAIP's registry. Warrant's reason-runtime registry (Warrant
+SPEC §13.1) is a different registry with the same policy (Specification
+Required), **no registry operator**, and registration by pull request against the
+Warrant repository; an unregistered `runtime` in a Warrant record makes that
+record invalid by MUST. So an OAIP-namespaced runtime is *not* currently
+legitimate in a Warrant record, and §3 forbids putting it there — the bridge
+files the validation as prose plus evidence instead. Making it legitimate is
+cross-repository coordination, not an OAIP edit; this specification does not
+presume the outcome.
 
 `ski@v1` is reserved rather than admitted because Σ-GLYPH is an *optional*
 dependency of this specification: a v0.1 verifier without a Book I oracle cannot
@@ -732,6 +790,11 @@ evaluate the check, and a runtime that some conforming verifiers can evaluate an
 others cannot is a runtime about which conforming verifiers disagree. Admitting
 it is a `claim` `0.2` change — exactly as Warrant admitted it in body version
 `0.2` and keeps it rejected in `0.1` [R3].
+
+A container runtime, an MCP call and a hosted CI job are each candidates for
+their own validation tag. None is registered, because none is implemented — and
+registering a tag for a profile no code provides is precisely the defect above,
+written down in advance.
 
 ### 7.4 Effect kinds — closed; artifact kinds — open
 
@@ -940,7 +1003,8 @@ and re-run exactly the bytes that ran — that makes the check auditable, not
 un-rewritable. This is the largest remaining hole in the §4 gate and no mechanism
 in §8.3 addresses it: closing it needs the check to run from a state the agent
 did not produce (a pinned revision, a separate checkout, a container), which is a
-deployment decision, not a format one.
+deployment decision, not a format one. Since 2026-07-31 the *record* says so: the
+runtime tag is `oaip-host-shell@v1` (§7.3, SA-12), not a tag that means container.
 
 **SA-2. The environment is assumed to be trusted.** `git`, `sh`, the Python
 interpreter and `$WARRANT_CLI`'s *availability* are inside the TCB; only
@@ -1044,6 +1108,29 @@ payload digest — and `tools/intoto.py` puts one exactly one hop from this ledg
 — from a Σ-GLYPH NodeHash, or from a git object id. No `SA-n` said so. It is
 recorded here in its narrowed form rather than quietly dropped, because the
 residue is the part that is still true.
+
+**SA-12. The validation check is assumed to run unconfined, and the record is
+assumed to say so.** OAIP provides no isolation for the check: `sh -c` on the
+host, as the observer's own user, in the observed workspace, with the network
+and the environment the observer has (§7.3, `oaip-host-shell@v1`). A check can
+therefore read the operator's files, reach the network, and — since the trust
+root is outside the *workspace* but not outside the *user* (SA-5) — read the
+signing key. Nothing in §8.3 stops any of that, and nothing here claims to.
+
+What changed on 2026-07-31 is not the confinement but the honesty of the record.
+Before it, the claim and the signed Warrant both said `cmd@v1` — Warrant §3's
+tag for execution in an isolated container — so a reader who applied the only
+published definition of that tag would conclude the check ran confined. **The
+assumption above was true the whole time and the record contradicted it.** That
+is the defect class this section exists to catch: not "a control is missing" but
+"a signed record describes a control that was never there". Found by external
+audit (Codex, 2026-07-31) with a working reproduction.
+
+The residue, stated plainly: a reader of an OAIP claim can now tell that the
+check was unconfined, and a reader of the Warrant record can read it in prose
+(§3). Neither can tell **what** an unconfined check did — including whether it
+changed the workspace after the Execution's output state was snapshotted, which
+is a second finding from the same audit and is not addressed by this item.
 
 #### Explicit non-goals
 

@@ -9,9 +9,12 @@ A minimal, RUNNABLE slice of the provenance stack we sketched:
   Ledger    → a SQLite PROJECTION over content-addressed truth. Deletable and
               rebuildable; it stores hashes + typed relations, not canon.
   Bridge    → an accepted CLAIM becomes a real, signed Warrant record — the
-              decision layer, with the provenance cited as evidence and a
-              validation command as a cmd@v1 check. Warrant is a normative
-              dependency, not reimplemented here.
+              decision layer, with the provenance, the check blob and its
+              transcript cited as evidence. Warrant is a normative dependency,
+              not reimplemented here — and the validation is NOT filed as a
+              Warrant `cmd@v1` check reason, because Warrant SPEC §3 defines
+              that tag as execution in an isolated container and this
+              implementation runs the check on the host (SPEC §7.3).
 
 Deliberately NOT decided here (later layers): whether the action was correct,
 whether the intent was met, which policy has authority, what reaction to run.
@@ -1298,8 +1301,27 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 # record invalid (§7): unknown-means-invalid is what stops a forward-dated value
 # from meaning "valid" here and "invalid" in a second implementation.
 EXECUTOR_RUNTIMES = {"exec@v1", "shell@v1"}
-VALIDATION_RUNTIMES = {"cmd@v1"}        # ski@v1 is RESERVED in claim 0.1 (§7.3)
+# §7.3. `oaip-host-shell@v1` is what this implementation ACTUALLY does; `cmd@v1`
+# stays readable because every claim written before 2026-07-31 carries it and §6
+# forbids making a record invalid that an earlier reading called valid — but this
+# implementation never writes it again. It cannot: `cmd@v1` is Warrant's tag and
+# Warrant SPEC §3 defines it as execution in an ISOLATED CONTAINER, which is not
+# what `subprocess.run(check, shell=True)` on the observer's own host is. Found
+# by external audit (Codex, 2026-07-31) with a working reproduction.
+HOST_SHELL_RUNTIME = "oaip-host-shell@v1"
+VALIDATION_RUNTIMES = {"cmd@v1", HOST_SHELL_RUNTIME}
 VALIDATION_RESERVED = {"ski@v1"}
+# Which validation runtimes may be filed into a Warrant record as a
+# `because[].check` reason. Warrant SPEC §13.1 registers exactly `cmd@v1`
+# (isolated container) and `ski@v1` (a Σ-GLYPH Book I oracle under an ATP
+# budget); an unregistered value makes the Warrant record INVALID by MUST, and
+# `warrant accept --runtime` will not even accept another string. OAIP can
+# provide neither profile, so the set is EMPTY and the bridge files the
+# validation as prose plus evidence instead (§3). It is a set rather than a
+# `False` so that a future OAIP runtime which genuinely satisfies a Warrant tag
+# has one place to be added — and so that this comment sits next to the reason
+# it is empty.
+WARRANT_CHECK_RUNTIMES = frozenset()
 EFFECT_KINDS = {"file.create", "file.modify", "file.delete", "file.typechange"}
 ENV_PROFILES = {"posix-base@v1"}
 TOOLCHAIN_PROFILES = {"posix-base@v1"}
@@ -2786,7 +2808,12 @@ def cmd_claim(a):
     # be echoed into the record as text, which describes a check without being
     # one: a reader could not fetch the bytes that ran and re-run them.
     check_hash = put_artifact(a.check.encode(), "check")
-    # validation check — SEPARATE from execution success (exit_code=0 earns nothing)
+    # validation check — SEPARATE from execution success (exit_code=0 earns
+    # nothing). It runs THROUGH THE HOST SHELL, as this process's user, in the
+    # observed workspace, with no isolation of the filesystem, the network or
+    # the environment — which is why the record says `oaip-host-shell@v1` and
+    # not `cmd@v1` (§7.3). Nothing here confines the check; the tag stops the
+    # record from claiming otherwise.
     chk = subprocess.run(a.check, shell=True, capture_output=True, text=True)
     transcript_hash = put_artifact((chk.stdout + chk.stderr).encode(),
                                    "check-transcript")
@@ -2815,14 +2842,15 @@ def cmd_claim(a):
     proposed_by = getattr(a, "actor", None) or default_actor()
     store_record({"claim": "0.1", "id": cid, "subject": subject_hash,
                   "predicate": a.predicate, "evidence": evidence,
-                  "validation": {"runtime": "cmd@v1", "check": check_hash,
+                  "validation": {"runtime": HOST_SHELL_RUNTIME,
+                                 "check": check_hash,
                                  "verdict": verdict,
                                  "transcript": transcript_hash},
                   "proposed_by": proposed_by, "ts": ts})
     con.execute("""INSERT INTO claims(id,execution_id,predicate,runtime,check_hash,
                    verdict,transcript_hash,subject_hash,evidence,proposed_by,
                    created_at,format) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (cid, a.execution, a.predicate, "cmd@v1", check_hash, verdict,
+                (cid, a.execution, a.predicate, HOST_SHELL_RUNTIME, check_hash, verdict,
                  transcript_hash, subject_hash, canon(evidence).decode(),
                  proposed_by, ts, "0.1"))
     con.commit()
@@ -2869,8 +2897,8 @@ def _accept(a):
     pol = w("blob", "add", str(policy)).stdout.strip()
     # The check blob is materialized from the ARTIFACT, byte for byte, rather
     # than re-rendered from a command string in a table: the whole reason §2.7
-    # cites it by hash is that the warrant's `because[].check` and the claim's
-    # `validation.check` must be the same bytes.
+    # cites it by hash is that the bytes a reader fetches from the Warrant store
+    # and the bytes the claim's `validation.check` names must be the same bytes.
     checkfile = OAIP / "check.tmp"
     checkfile.write_bytes((ART / check_hash).read_bytes())
     transcript_file = OAIP / "transcript.tmp"
@@ -2887,6 +2915,50 @@ def _accept(a):
                 ev_args += ["--evidence", str(p)]
     except ValueError:
         pass
+    # HOW THE VALIDATION ENTERS THE WARRANT, AND WHY NOT AS A CHECK REASON.
+    # It used to go in as `{kind:"check", runtime:"cmd@v1", …}`, passed through
+    # from the claim unchanged. Warrant SPEC §3 defines `cmd@v1` as "the check
+    # blob is executed as a command in an isolated container"; OAIP executes it
+    # with `subprocess.run(check, shell=True)` on the observer's own host. The
+    # signed record therefore named an execution profile that never happened —
+    # a provenance defect, not an injection one (external audit by Codex,
+    # 2026-07-31, reproduced locally).
+    #
+    # The honest tag (`oaip-host-shell@v1`, §7.3) CANNOT be substituted here:
+    # Warrant's registry (Warrant SPEC §13.1) admits `cmd@v1` and `ski@v1` only,
+    # an unregistered runtime makes the Warrant record invalid by MUST, and
+    # `warrant accept --runtime` is a closed choice list. Registering an
+    # OAIP-namespaced runtime there is a pull request against Warrant, i.e.
+    # cross-repository coordination this implementation must not presume.
+    #
+    # So until that registration exists (or OAIP grows a runtime that really
+    # satisfies a Warrant tag), the validation is filed as PROSE naming the
+    # runtime and the verdict, with the check blob and the transcript carried as
+    # EVIDENCE so the bytes still resolve in the store and are still citable by
+    # hash. What is lost is stated rather than hidden: the warrant no longer
+    # carries a machine-readable `because[].check`, so it contributes no §7(b)
+    # outcome fingerprint and a tool looking for a check reason will find none.
+    # That is a smaller loss than a signed claim of containment that did not
+    # happen.
+    if runtime in WARRANT_CHECK_RUNTIMES:
+        check_args = ["--check", str(checkfile), "--verdict", "pass",
+                      "--runtime", runtime, "--transcript",
+                      str(transcript_file)]
+        validation_prose = []
+    else:
+        check_args = []
+        where = (" — the check ran through the host shell in the observed "
+                 "workspace, NOT in an isolated container"
+                 if runtime == HOST_SHELL_RUNTIME else
+                 " — OAIP did not itself establish this runtime's execution "
+                 "profile")
+        validation_prose = ["--reason", (
+            f"validation: runtime={runtime} verdict={verdict}{where}, so it is "
+            f"not filed as a Warrant check reason (Warrant SPEC §3/§13.1). The "
+            f"check blob {check_hash} and its transcript {transcript_hash} are "
+            f"cited as evidence.")]
+        ev_args += ["--evidence", str(checkfile),
+                    "--evidence", str(transcript_file)]
     # The subject blob is the claim's SUBJECT, and two claims can share one:
     # {predicate, execution, effects} excludes the check command and verdict, so
     # `--check true` and `--check false` over the same execution collide. A
@@ -2897,10 +2969,9 @@ def _accept(a):
     # follows it instead of guessing by subject hash. Legacy records without the
     # note fall back to subject-hash matching restricted to supported claims.
     r = w("accept", "--subject", subj, "--under", pol,
-          "--check", str(checkfile), "--verdict", "pass",
-          "--runtime", runtime or "cmd@v1",
-          "--transcript", str(transcript_file),
+          *check_args,
           "--reason", f"claim: {predicate}",
+          *validation_prose,
           "--note", f"oaip-claim:{a.claim}",
           *ev_args,
           "--actor", a.actor, "--key", str(WKEY))
@@ -2963,8 +3034,9 @@ def _accept(a):
     con.execute("INSERT OR IGNORE INTO warrants(claim_id,warrant_id,created_at)"
                 " VALUES (?,?,?)", (a.claim, wid, wts))
     con.commit()
-    print(f"ACCEPTED -> warrant {wid}\n  (signed, hash-addressed, cites the provenance as evidence "
-          f"and the validation as a cmd@v1 check)")
+    print(f"ACCEPTED -> warrant {wid}\n  (signed, hash-addressed, cites the "
+          f"provenance, the check blob and its transcript as evidence; the "
+          f"validation ran under {runtime} and is recorded as such)")
 
 
 def cmd_bind(a):
