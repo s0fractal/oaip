@@ -121,10 +121,11 @@ that result are recorded below, the favourable one included.
   wrote the records they match, a State the current environment no longer
   reproduces is `mismatched` and NOT an error (environments change; a State says
   what was observed then), and a pre-0.1 execution is `unreproducible` because
-  it carries no State at all. What is NOT tested anywhere: the cross-host case,
-  where the answer should be `unreproducible` for every State and this
-  implementation would instead report `mismatched`, because it re-runs the
-  probes unconditionally rather than asking whether it is the same host.
+  it carries no State at all. What `mismatched` does NOT tell you, and
+  SPEC §2.2.4 now says so instead of implying otherwise: whether it is the same
+  host changed since, or a different host entirely. No record carries a host
+  identity, so no implementation can tell those apart; a consumer that needs the
+  distinction has to establish it by some means outside this protocol.
 - **One implementation.** Warrant has three that agree on broken stores; OAIP has
   Python only. Until a second exists, "conformant" here means "agrees with
   itself". This is the reason the negative vectors below were written first: a

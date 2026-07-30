@@ -282,9 +282,20 @@ MUST distinguish all three in its report:
 
 | Outcome | When |
 | --- | --- |
-| `matched` | the verifier re-ran the profile's probes on the host under audit and got the same hex64 |
-| `mismatched` | the verifier re-ran the probes and got a different hex64 |
+| `matched` | the verifier re-ran the profile's probes and got the same hex64 |
+| `mismatched` | the verifier re-ran the profile's probes and got a different hex64 |
 | `unreproducible` | the verifier did not, or could not, re-run the probes |
+
+The three are defined by **what the verifier did**, and deliberately not by
+where it did it. An earlier draft of this table said `matched` required
+re-running "on the host under audit", which is not decidable: no record carries
+a host identity, so no implementation can tell the audited host from any other,
+and a rule an implementation cannot evaluate is a rule that will be evaluated
+wrongly. The cost is stated rather than hidden: **`mismatched` does not
+distinguish "the same host, changed since" from "a different host entirely",
+and a verifier MUST NOT report it as either.** A consumer that needs that
+distinction must establish host identity by some means outside this
+specification.
 
 - A verifier that cannot re-run the probes (it is on another host, or the probe
   record is unavailable) MUST report `unreproducible`. It MUST NOT report
