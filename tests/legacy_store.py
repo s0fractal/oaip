@@ -221,6 +221,10 @@ def main():
         v = run_new("verify")
         case("verify passes over the mixed-format ledger", v.returncode == 0,
              (v.stdout + v.stderr)[-400:])
+        case("a legacy execution's fingerprints are UNREPRODUCIBLE, and said so "
+             "rather than left silent (§2.2.4 + §6.4)",
+             "unreproducible" in (v.stdout + v.stderr)
+             and "1 unreproducible" in v.stdout, v.stdout)
         case("...and reports the legacy records as legacy, not as corruption",
              "legacy" in (v.stdout + v.stderr)
              and "does not match its own address" not in v.stdout,

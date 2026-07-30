@@ -121,6 +121,31 @@ def main():
         case("clean ledger: verify passes", v.returncode == 0, v.stdout + v.stderr)
         case("clean ledger: verify actually looked at the canonical layer",
              "canonical layer" in v.stdout, v.stdout)
+        # SPEC §2.2.4: three outcomes, and `unreproducible` must never be
+        # collapsed into `matched`. Reporting NO outcome is that collapse with
+        # the middle step left out — a reader saw "every artifact matches its
+        # address" with nothing saying the environment behind those records was
+        # never checked.
+        case("clean ledger: the fingerprints get a §2.2.4 outcome, on the "
+             "record, not silence",
+             "fingerprints:" in v.stdout and "matched" in v.stdout, v.stdout)
+        case("clean ledger: on the host that wrote them, they MATCH",
+             "2 matched, 0 mismatched" in v.stdout, v.stdout)
+        # And a State the current environment cannot reproduce is `mismatched`,
+        # never an error: environments change, and a State says what was
+        # observed then.
+        con = sqlite3.connect(L.dir / ".oaip" / "ledger.db")
+        con.execute("UPDATE states SET env_fingerprint=? WHERE id IN "
+                    "(SELECT id FROM states LIMIT 1)", ("f" * 64,))
+        con.commit()
+        con.close()
+        v2 = L.run("verify")
+        case("a State the environment no longer reproduces is MISMATCHED",
+             "1 matched, 1 mismatched" in v2.stdout, v2.stdout)
+        case("...and a mismatch is reported, not treated as tampering",
+             v2.returncode == 0 and "not evidence of tampering" in v2.stdout,
+             v2.stdout)
+        L.run("rebuild")            # put the projection back before the rest
         r = L.run("rebuild")
         case("clean ledger: rebuild succeeds", r.returncode == 0, r.stdout + r.stderr)
     with_ledger(clean)

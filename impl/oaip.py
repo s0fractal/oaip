@@ -3159,6 +3159,63 @@ def verify_artifacts():
     return errs, subjects
 
 
+def fingerprint_report():
+    """SPEC §2.2.4: matched / mismatched / unreproducible, for every State.
+
+    THE GAP THIS CLOSES. §2.2.4 says a conforming verifier MUST distinguish
+    three fingerprint outcomes and MUST NOT collapse `unreproducible` into
+    `matched`. `oaip verify` reported no outcome at all, which is the collapse
+    with the middle step left out: a reader saw "canonical layer: every artifact
+    matches its address" and had nothing telling them the environment behind
+    those records was never checked. A specification clause no implementation
+    demonstrates is a clause nobody has tested.
+
+    The outcomes are REPORTED and never fatal, exactly as §2.2.4 requires:
+    environments change with time, so a mismatch is not evidence of tampering,
+    and whether either outcome blocks anything is a policy question one layer
+    above OAIP (§0). A malformed fingerprint is a different matter entirely — it
+    makes the State record invalid, and `verify_artifacts` already refuses it.
+    """
+    if not DB.is_file():
+        return []
+    try:
+        con = db()
+        states = list(con.execute(
+            "SELECT id, env_fingerprint, toolchain_fingerprint FROM states"))
+        legacy_n = con.execute(
+            "SELECT COUNT(*) FROM executions WHERE format IS NOT ?",
+            ("0.1",)).fetchone()[0]
+        con.close()
+    except sqlite3.Error as e:
+        return [f"fingerprints:    unreproducible — the projection could not be "
+                f"read ({e})"]
+    if not states and not legacy_n:
+        return ["fingerprints:    (no States recorded)"]
+    try:
+        _envr, env_now = environment_probe()
+        _toolr, tool_now = toolchain_probe()
+    except SystemExit as e:
+        # This host cannot run the profile's probes. That is `unreproducible`
+        # for every State, and it is NOT `mismatched`: nothing was compared.
+        return [f"fingerprints:    {len(states)} State(s) UNREPRODUCIBLE on this "
+                f"host — the posix-base@v1 probes could not be run ({e}). "
+                "Nothing was compared; this is not a mismatch."]
+    matched = sum(1 for _sid, e, t in states
+                  if e == env_now and t == tool_now)
+    mismatched = len(states) - matched
+    out = [f"fingerprints:    {matched} matched, {mismatched} mismatched, "
+           f"{legacy_n} unreproducible (§2.2.4, posix-base@v1)"]
+    if mismatched:
+        out.append("                 a mismatch is not evidence of tampering: a "
+                   "State says what was observed then, not a promise about now. "
+                   "Whether it blocks anything is a policy question above OAIP.")
+    if legacy_n:
+        out.append(f"                 {legacy_n} pre-0.1 execution(s) carry no "
+                   "State and no toolchain fingerprint at all, so no outcome "
+                   "other than `unreproducible` is available for them (§6.4).")
+    return out
+
+
 def cmd_verify(_):
     """Verify the canonical layer FIRST, then the decision layer.
 
@@ -3220,6 +3277,9 @@ def cmd_verify(_):
         print("ERR ", e)
     print(f"projection:      {len(proj_errs)} error(s)" if proj_errs
           else "projection:      derived (no refused rebuild since)")
+
+    for line in fingerprint_report():
+        print(line)
 
     accepts, wrec_files, store_errs = read_warrant_store()
     report, rerr = store_report() if wrec_files else (None, None)

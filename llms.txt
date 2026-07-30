@@ -116,9 +116,15 @@ that result are recorded below, the favourable one included.
   many words that any other variable can change what a command does without
   changing this number: it is a discriminator, not evidence of environmental
   equivalence. A verifier that cannot re-run the probes reports
-  `unreproducible`, which §2.2.4 forbids collapsing into `matched` — and the
-  reference implementation does not re-run them at all, so today every
-  fingerprint it reports is `unreproducible`.
+  `unreproducible`, which §2.2.4 forbids collapsing into `matched`. `oaip
+  verify` re-runs the probes and prints the three-way count; on the host that
+  wrote the records they match, a State the current environment no longer
+  reproduces is `mismatched` and NOT an error (environments change; a State says
+  what was observed then), and a pre-0.1 execution is `unreproducible` because
+  it carries no State at all. What is NOT tested anywhere: the cross-host case,
+  where the answer should be `unreproducible` for every State and this
+  implementation would instead report `mismatched`, because it re-runs the
+  probes unconditionally rather than asking whether it is the same host.
 - **One implementation.** Warrant has three that agree on broken stores; OAIP has
   Python only. Until a second exists, "conformant" here means "agrees with
   itself". This is the reason the negative vectors below were written first: a
