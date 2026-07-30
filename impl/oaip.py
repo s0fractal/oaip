@@ -316,8 +316,10 @@ def wrun(*args):
 def note_convention_since():
     """The ts from which a missing `oaip-claim:` note is a DEFECT, not history.
 
-    Returns an int, or None when this store predates the store-format marker
-    entirely (in which case any of its records may genuinely be legacy).
+    Returns (cutoff, error). `cutoff` is an int, or None when this store predates
+    the store-format marker ENTIRELY — file absent — in which case any of its
+    records may genuinely be legacy. A marker that is PRESENT but unreadable is
+    an error, never a None.
 
     WHY A STORE-FORMAT VERSION AND NOT A PROPERTY OF THE RECORD (F8, 2026-07-30,
     second review round). Rebuild routed accepts without the note to a
@@ -335,15 +337,37 @@ def note_convention_since():
     link is a defect in the filer, and no edge is derived — not even with
     --allow-legacy-links. Only a store with NO marker (created before OAIP
     stamped one) can contain genuinely legacy records, and even there the
-    fallback stays off until the operator asks for it in as many words."""
+    fallback stays off until the operator asks for it in as many words.
+
+    AND IT FAILED OPEN (C3-F1, 2026-07-30, THIRD review round). Every unreadable
+    marker — truncated file, wrong type, a directory at that path, a missing
+    field — returned None, which every caller read as "this store predates the
+    convention". So a single corrupt byte in `.oaip/store.json` turned a
+    brand-new store into an eligible-for-guessing legacy store, and
+    `--allow-legacy-links` then fired the subject-hash guess while printing the
+    false sentence "Only records filed before this store had a format marker are
+    eligible" — about a store that HAS one, sitting right there. A marker that is
+    present but cannot be read is the one case where OAIP knows it does not know:
+    it must refuse, not assume the weaker rule."""
+    if not STOREMETA.exists():
+        return None, None
     if not STOREMETA.is_file():
-        return None
+        return None, (f"{STOREMETA}: the store-format marker is not a regular "
+                      "file — this store's format cannot be read, and OAIP will "
+                      "not fall back to treating its records as legacy")
     try:
         meta = loads_ijson(STOREMETA.read_bytes())
-        ts = meta.get("note_convention_since")
-        return ts if isinstance(ts, int) and not isinstance(ts, bool) else None
-    except (ValueError, OSError):
-        return None
+    except (ValueError, OSError) as e:
+        return None, (f"{STOREMETA}: the store-format marker is present but "
+                      f"unreadable ({e}) — refusing to guess whether this "
+                      "store's records predate the oaip-claim note convention")
+    ts = meta.get("note_convention_since") if isinstance(meta, dict) else None
+    if not (isinstance(ts, int) and not isinstance(ts, bool)):
+        return None, (f"{STOREMETA}: the store-format marker carries no integer "
+                      "`note_convention_since` — refusing to guess whether this "
+                      "store's records predate the oaip-claim note convention "
+                      "(restore or remove the marker deliberately)")
+    return ts, None
 
 
 def ensure_trust():
@@ -1228,17 +1252,43 @@ def cmd_bind(a):
     acceptances would otherwise stop producing edges at the next rebuild, because
     nothing vouches for their signer), and an acceptance filed through the Warrant
     CLI directly. Naming the key is the operator's assertion, not OAIP's
-    discovery — which is why it is a separate, explicit verb."""
+    discovery — which is why it is a separate, explicit verb.
+
+    AND WHY IT CROSS-CHECKS `.oaip/dev.key.pub` (2026-07-30, third review round).
+    `cmd_accept` refuses to record an acceptance signed by a key that is not this
+    ledger's own; `bind` accepted ANY hex64 with no cross-check and no warning,
+    and `oaip verify` was clean afterwards — so the one command whose entire
+    purpose is to say "this key may sign as this actor" was the least careful
+    place in the codebase about which key that is. A foreign key is a real,
+    legitimate case (a store filed by another ledger's key), but it is a
+    different act from vouching for one's own, and it now has to be said out
+    loud: --foreign-key."""
     key = a.key
+    own = PUBKEY.read_text().strip() if PUBKEY.is_file() else None
     if key is None:
-        if not PUBKEY.is_file():
+        if not own:
             sys.exit(f"no {PUBKEY}: this ledger does not know its own public key "
                      "(it predates `init` recording it) — pass --key <hex64>, "
                      "e.g. the `key` field of a signature in "
                      f"{WSTORE / 'records'}")
-        key = PUBKEY.read_text().strip()
+        key = own
     if not (isinstance(key, str) and HEX64.match(key)):
         sys.exit("--key must be a 64-hex-character Ed25519 public key")
+    if own and key != own and not getattr(a, "foreign_key", False):
+        sys.exit(f"refusing to bind {key[:12]}: this ledger's own key is "
+                 f"{own[:12]} ({PUBKEY}), so this binding vouches for a key OAIP "
+                 "does not custody and cannot revoke — every acceptance signed by "
+                 "it will become an edge in this projection. If the store really "
+                 "was filed by another ledger's key, say so: `oaip bind --actor "
+                 f"{a.actor} --key {key[:12]}… --foreign-key`.")
+    if own and key != own:
+        print(f"warning: binding a FOREIGN key. {key[:12]} is not this ledger's "
+              f"own key ({own[:12]}); OAIP does not hold it, cannot revoke it, "
+              "and will derive an acceptance edge from anything it signs as "
+              f"{a.actor!r}.", file=sys.stderr)
+    if not own:
+        print(f"warning: no {PUBKEY}, so this binding could not be cross-checked "
+              "against this ledger's own key.", file=sys.stderr)
     bind_actor(a.actor, key)
     print(f"bound key {key[:12]} -> actor {a.actor}  ({TRUST})")
 
@@ -1478,6 +1528,13 @@ def _rebuild(a):
                 store_bad.append(f"keyring: {aerr}")
             unbound_sigs = unbound_by_warrant()
 
+    # The store-format marker decides which records may take the weaker,
+    # subject-hash link path. Read it HERE, with the other preflight checks, and
+    # refuse on an unreadable one: failing open here made a corrupt byte in
+    # `.oaip/store.json` promote a brand-new store to "legacy" (C3-F1).
+    cutoff, cutoff_err = note_convention_since()
+    meta_bad = [cutoff_err] if cutoff_err else []
+
     # What the CURRENT projection asserts, read before it is replaced. A rebuild
     # that drops the protocol's central edge must not report success (C2-F1b):
     # one appended co-signature made `oaip rebuild` print `warrant=0`, exit 0,
@@ -1493,15 +1550,20 @@ def _rebuild(a):
         except sqlite3.Error:
             prev_edges = set()          # unreadable: nothing to compare against
 
-    if art_bad or store_bad:
-        for e in art_bad + store_bad:
+    if art_bad or store_bad or meta_bad:
+        for e in art_bad + store_bad + meta_bad:
             print("ERR ", e, file=sys.stderr)
+        # Each layer is COUNTED AND NAMED SEPARATELY, including this ledger's own
+        # metadata: a diagnosis that sends the reader to the wrong directory is
+        # worse than none, because it is acted on (F13).
         where = ", ".join(
             p for p in (f"{len(art_bad)} corrupt artifact(s) in {ART}" if art_bad
                         else "",
                         f"{len(store_bad)} fault(s) in the decision layer "
-                        f"({WSTORE})" if store_bad else "") if p)
-        mark_untrusted(art_bad + store_bad)
+                        f"({WSTORE})" if store_bad else "",
+                        f"{len(meta_bad)} fault(s) in this ledger's own "
+                        f"metadata ({STOREMETA})" if meta_bad else "") if p)
+        mark_untrusted(art_bad + store_bad + meta_bad)
         sys.exit(f"refusing to rebuild: {where} — the projection would assert "
                  "facts the canonical layer does not support. The existing "
                  f"projection is left on disk but MARKED UNTRUSTED ({UNTRUSTED}): "
@@ -1589,7 +1651,6 @@ def _rebuild(a):
             claim_subjects.add(d["subject"])
             if d.get("supported"):
                 supported_by_subject.setdefault(d["subject"], []).append(d["id"])
-    cutoff = note_convention_since()
     counts["warrant@edge"] = 0
 
     derived, refused_why = set(), {}
@@ -1913,6 +1974,10 @@ def main():
     pb.add_argument("--actor", required=True)
     pb.add_argument("--key", help="hex64 Ed25519 public key; defaults to this "
                     "ledger's own key")
+    pb.add_argument("--foreign-key", action="store_true",
+                    help="required to bind a key that is NOT this ledger's own "
+                         "(.oaip/dev.key.pub): OAIP cannot custody or revoke it, "
+                         "and every acceptance it signs becomes an edge")
     pb.set_defaults(fn=cmd_bind)
     pd = sub.add_parser("do", help="one-shot: intent -> run -> validate -> accept-if-pass")
     pd.add_argument("--intent", required=True); pd.add_argument("--check", required=True)

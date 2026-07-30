@@ -194,6 +194,16 @@ property is not enforced at all, that is written down rather than implied away.
     store began requiring the note, stamped by `oaip init` in
     `.oaip/store.json` — a criterion the filer of a record cannot choose. In a
     store created by a current `oaip init` there are no eligible records at all.
+    A `.oaip/store.json` that is present but UNREADABLE (truncated, wrong type,
+    missing field, not a file) is now a refusal: it used to be read as "this
+    store predates the convention", so one corrupt byte promoted a brand-new
+    store to a legacy one and `--allow-legacy-links` ran the guess while
+    printing that the store had no marker.
+  - *Binding a key that is not this ledger's own* (`.oaip/dev.key.pub`) requires
+    `oaip bind --foreign-key` and prints a warning naming what OAIP cannot do
+    with it (custody it, revoke it). `bind` used to accept any hex64 with no
+    cross-check at all — the one command whose purpose is to say which key may
+    sign was the least careful about which key that was.
   - **Still outside OAIP's control:** `.oaip/trust.json` lives beside
     `.oaip/dev.key`, so **anyone who can write `.oaip/`** can write the keyring
     *and* the signing key — the binding raises the bar from "can run `keygen`" to

@@ -385,6 +385,47 @@ def main():
              r.returncode == 0 and "Traceback" not in r.stderr
              and "warning" in r.stderr, f"rc={r.returncode} {r.stderr[:200]}")
 
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- 9 (third adversarial round): `oaip bind` is the one command whose
+        # whole purpose is to say WHICH key may sign as an actor, and it was the
+        # least careful place in the codebase about it: any hex64 was accepted
+        # with no cross-check against `.oaip/dev.key.pub`, no warning, and `oaip
+        # verify` clean afterwards — while `cmd_accept` refuses an acceptance
+        # signed by a key that is not this ledger's. Binding a foreign key is a
+        # legitimate act (a store filed by another ledger), but it is a different
+        # act, and it now has to be said out loud.
+        L = Repo(Path(tmp) / "bind")
+        pub = L.dir / ".oaip" / "dev.key.pub"
+        if not pub.is_file():           # no Warrant CLI: a sentinel own-key
+            pub.write_text("b" * 63 + "1\n")
+        own = pub.read_text().strip()
+        trust = L.dir / ".oaip" / "trust.json"
+        foreign = "a" * 64
+
+        r = L.run("bind", "--actor", "someone@else", "--key", foreign)
+        out = r.stdout + r.stderr
+        case("bind REFUSES a key that is not this ledger's own",
+             r.returncode != 0 and "Traceback" not in r.stderr, out[-200:])
+        case("the refusal names both keys and the flag that would allow it",
+             foreign[:12] in out and own[:12] in out and "--foreign-key" in out,
+             out[-300:])
+        case("the refused bind wrote nothing into the keyring",
+             foreign not in trust.read_text(), trust.read_text())
+
+        r = L.run("bind", "--actor", "someone@else", "--key", foreign,
+                  "--foreign-key")
+        out = r.stdout + r.stderr
+        case("with --foreign-key it binds", r.returncode == 0, out[-200:])
+        case("...and says loudly that OAIP does not hold that key",
+             "FOREIGN" in r.stderr and "revoke" in r.stderr, r.stderr[-300:])
+        case("...and the keyring records it", foreign in trust.read_text(),
+             trust.read_text())
+
+        r = L.run("bind", "--actor", "tester@local", "--key", own)
+        case("binding this ledger's OWN key needs no flag and no warning",
+             r.returncode == 0 and "FOREIGN" not in r.stderr,
+             (r.stdout + r.stderr)[-200:])
+
     print("\nKEY-CUSTODY: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1
 

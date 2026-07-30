@@ -529,6 +529,68 @@ def main():
                  r.stdout + r.stderr)
 
     with tempfile.TemporaryDirectory() as tmp:
+        # --- case 8c (C3-F1, THIRD adversarial round): THE STORE-FORMAT MARKER
+        # FAILED OPEN. `note_convention_since()` returned None — "this store
+        # predates the convention" — for every unreadable `.oaip/store.json`:
+        # truncated file, missing field, wrong type. So one corrupt byte promoted
+        # a BRAND-NEW store to a legacy one, and `--allow-legacy-links` then ran
+        # the subject-hash guess while printing the false sentence "Only records
+        # filed before this store had a format marker are eligible" — about a
+        # store that has one, sitting right there. A marker that is present and
+        # unreadable is the one case where OAIP knows that it does not know.
+        work, run = make_repo(tmp)
+        r = run("do", "--intent", "real work", "--check", "test -f f.txt",
+                "--actor", "tester@local", "--", "sh", "-c", "echo hi > f.txt")
+        if "ACCEPTED" not in r.stdout:
+            print("FAIL  setup(8c): the one-shot flow did not accept\n",
+                  r.stdout, r.stderr)
+            return 1
+        db = work / ".oaip" / "ledger.db"
+        con = sqlite3.connect(db)
+        cid, subj = con.execute("SELECT id, subject_hash FROM claims").fetchone()
+        con.close()
+        wcli = (os.environ.get("WARRANT_CLI")
+                or f"{sys.executable} "
+                   f"{Path.home() / 'Projects/warrant/impl/warrant.py'}").split()
+        rr = subprocess.run(
+            wcli + ["--store", ".oaip/warrants", "accept", "--subject", subj,
+                    "--under", ".oaip/policy.txt", "--reason", "no note at all",
+                    "--actor", "tester@local", "--key", ".oaip/dev.key"],
+            cwd=work, capture_output=True, text=True)
+        nowid = (rr.stdout.strip().splitlines() or [""])[-1]
+        if len(nowid) != 64:
+            print("FAIL  setup(8c): the note-less accept did not file\n",
+                  rr.stdout, rr.stderr)
+            return 1
+        meta = work / ".oaip" / "store.json"
+        honest_marker = meta.read_bytes()
+        for name, content in (("truncated", b"{\"oaip_store\": \"oaip-st"),
+                              ("field missing",
+                               b'{"oaip_store":"oaip-store@v1"}'),
+                              ("field of the wrong type",
+                               b'{"note_convention_since":"soon",'
+                               b'"oaip_store":"oaip-store@v1"}')):
+            meta.write_bytes(content)
+            r = run("rebuild", "--allow-legacy-links")
+            out = r.stdout + r.stderr
+            case(f"a store.json that is {name}: rebuild REFUSES",
+                 r.returncode != 0, out[-300:])
+            case(f"...and does NOT run the subject-hash guess ({name})",
+                 "GUESSING by subject hash" not in out, out[-300:])
+            case(f"...and does not claim the store has no marker ({name})",
+                 "this store had a format marker" not in out, out[-400:])
+            case(f"...and names this ledger's own metadata, not another layer "
+                 f"({name})", "store.json" in out and "corrupt artifact" not in out,
+                 out[-300:])
+            rows = [json.loads(w) for w in snapshot(db)["warrants"]]
+            case(f"...and no legacy edge was written ({name})",
+                 all(w["warrant_id"] != nowid for w in rows), rows)
+        meta.write_bytes(honest_marker)
+        r = run("rebuild", "--allow-legacy-links")
+        case("with the marker restored, the same store rebuilds again",
+             r.returncode == 0, (r.stdout + r.stderr)[-300:])
+
+    with tempfile.TemporaryDirectory() as tmp:
         # --- case 9 (F7/F3): AN ATTACKER'S OWN KEY MUST NOT LAUNDER AN ACCEPTANCE.
         #
         # Case 7 above only rules out signatures no key produced. This one is
