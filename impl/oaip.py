@@ -53,6 +53,8 @@ DB = OAIP / "ledger.db"
 ART = OAIP / "artifacts"        # content-addressed artifact blobs
 WSTORE = OAIP / "warrants"      # the Warrant store (canonical decision layer)
 WKEY = OAIP / "dev.key"
+PUBKEY = OAIP / "dev.key.pub"    # the public half, recorded by `init` from keygen
+TRUST = OAIP / "trust.json"      # OAIP's keyring, in Warrant's trust-config shape
 # Warrant is a normative dependency (the decision layer). Point WARRANT_CLI at
 # your `warrant.py` (or an installed `warrant`); defaults to a sibling checkout.
 _wcli = os.environ.get("WARRANT_CLI")
@@ -61,6 +63,12 @@ if _wcli:
 else:
     _cand = Path.home() / "Projects/warrant/impl/warrant.py"
     WARRANT = [sys.executable, str(_cand)]
+# A sleeping Warrant CLI hung `rebuild` forever: WARRANT_CLI names an arbitrary
+# program, so every call to it is bounded (2026-07-30 review, F11).
+WARRANT_TIMEOUT = int(os.environ.get("OAIP_WARRANT_TIMEOUT") or 120)
+VERIFY_REPORT = "warrant.verify-report@v0"
+# The explicit claim→warrant link, carried in the signed `subject.note`.
+NOTE_PREFIX = "oaip-claim:"
 
 
 # ---------- content-addressed helpers ----------
@@ -74,13 +82,213 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 def warrant_cli_available() -> bool:
     """True when the WARRANT argv names something that can actually run.
     Mirrors tools/check.py: either the program is on PATH / at its path, and —
-    for the `python3 …/warrant.py` form — the script file exists."""
+    for the `python3 …/warrant.py` form — the script file exists.
+
+    NOT an identity check: `WARRANT_CLI=/usr/bin/true` satisfies this. See
+    `store_report`, which is the gate that actually asks *what program is this*."""
     prog = WARRANT[0]
     if not (shutil.which(prog) or Path(prog).exists()):
         return False
     if len(WARRANT) >= 2 and WARRANT[1].endswith(".py"):
         return Path(WARRANT[1]).is_file()
     return True
+
+
+def wrun(*args):
+    """The Warrant CLI, bounded in time.
+
+    Every call is `timeout=`-bounded because WARRANT_CLI names an ARBITRARY
+    program: a CLI that sleeps forever hung `oaip rebuild` forever, with no
+    output and no way to tell it from slow work (2026-07-30 review, F11). A
+    timeout is reported as a distinct, non-zero result — never as success."""
+    try:
+        return subprocess.run(WARRANT + list(args), capture_output=True,
+                              text=True, timeout=WARRANT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            WARRANT + list(args), 124, "",
+            f"the Warrant CLI did not exit within {WARRANT_TIMEOUT}s "
+            "(OAIP_WARRANT_TIMEOUT)")
+    except OSError as e:
+        return subprocess.CompletedProcess(WARRANT + list(args), 127, "",
+                                           f"cannot run the Warrant CLI: {e}")
+
+
+# ---------- OAIP's keyring (key↔actor binding) ----------
+# WHY OAIP OWNS THIS, AND WHY IT IS NOT WARRANT'S JOB
+# --------------------------------------------------
+# Warrant SPEC §5: "Key↔actor binding is out of scope for v0.1 (use your existing
+# PKI/keyring); implementations MUST verify signatures against the stated key and
+# report the binding as unverified if no keyring is configured." §5.1 adds:
+# "Bound/unbound is a report unless a v0.3 policy explicitly makes bound
+# signatures required", and "No interchangeable keyring file format is mandated."
+#
+# So `warrant verify` CANNOT be configured to fail on an unbound signature, and
+# it exits 0 for a store whose only record is signed by a freshly generated key
+# claiming any actor id it likes. Measured on this branch before this change:
+#   warrant keygen --out attacker.key
+#   warrant --store .oaip/warrants accept … --note oaip-claim:<cid> \
+#           --actor tester@local --key attacker.key
+#   -> warrant verify: 0 errors, 1 warning ("binding unverified (no keyring)")
+#   -> oaip rebuild:  warrant=1
+#   -> oaip log:      WARRANT 41d32da62a81…  (signed decision)
+# for a claim NOBODY accepted. The protocol's central fact, forged for free.
+#
+# Warrant's own settlement grade (`verify --settlement --trust-config`) DOES
+# compute bound/unbound against a pinned keyring, and OAIP corroborates with it
+# (see `unbound_by_warrant`) — but two properties make it insufficient alone:
+# it is a WARN by specification, and its machine-readable
+# `warrant.verify-report@v0` omits the finding entirely in quiet mode (the
+# emitting branch is `if quiet: pass`), so the JSON an integrator is told to
+# consume reports 0 errors and no binding finding for an unbound signer.
+# Therefore the ENFORCED rule is OAIP's own, over OAIP's own keyring.
+def ensure_trust():
+    """OAIP's keyring must exist before anything verifies: a missing trust config
+    makes Warrant's settlement preflight fail closed, and an empty one is the
+    honest starting point (no actor is bound until OAIP binds it)."""
+    OAIP.mkdir(exist_ok=True)
+    if not TRUST.is_file():
+        TRUST.write_text(json.dumps({"actors": {}}, sort_keys=True) + "\n")
+
+
+def read_trust():
+    """(actors, error). `actors` maps actor id → list of hex64 public keys.
+
+    Deliberately in Warrant's trust-config shape (`{"actors": {...}}`, the closed
+    schema its `--trust-config` validates) so the SAME file can be handed to
+    Warrant's settlement grade; OAIP does not invent a second format."""
+    if not TRUST.is_file():
+        return {}, None
+    try:
+        doc = loads_ijson(TRUST.read_bytes())
+    except (ValueError, OSError) as e:
+        return None, f"{TRUST}: unreadable keyring: {e}"
+    if not isinstance(doc, dict) or not isinstance(doc.get("actors", {}), dict):
+        return None, f"{TRUST}: not a keyring ({{\"actors\": {{...}}}} expected)"
+    actors = {}
+    for a, keys in doc["actors"].items() if doc.get("actors") else []:
+        if not (isinstance(keys, list) and all(isinstance(k, str) and HEX64.match(k)
+                                               for k in keys)):
+            return None, f"{TRUST}: actor {a!r} has a malformed key list"
+        actors[a] = list(keys)
+    return actors, None
+
+
+def bind_actor(actor: str, key: str):
+    """Record that `key` may sign as `actor`. Called only by `cmd_accept`, only
+    for the key `.oaip/dev.key` — the key THIS ledger generated and custodies —
+    so an attacker's key is never written here by any OAIP code path."""
+    ensure_trust()
+    actors, err = read_trust()
+    if err:
+        sys.exit(f"refusing to file an acceptance: {err}")
+    if key in actors.get(actor, []):
+        return
+    actors.setdefault(actor, []).append(key)
+    TRUST.write_text(json.dumps({"actors": actors}, sort_keys=True) + "\n")
+
+
+def unbound_signers(env, actors):
+    """Which of this record's signatures fail to establish who signed it.
+
+    Returns a list of human-readable reasons; empty means EVERY signature entry
+    names a key this keyring binds to the actor that entry claims. "Every", not
+    "some", on purpose: Warrant's §5 lets anyone with store write access append
+    co-signatures, and a record could carry a bound-but-invalid signature next to
+    an unbound-but-valid one. Requiring all of them, together with a Warrant
+    verification that reported no excluded signature and no error, leaves no
+    signature on the record that OAIP has not accounted for."""
+    reasons = []
+    sigs = env.get("sigs")
+    if not isinstance(sigs, list) or not sigs:
+        return ["the record carries no signatures"]
+    for s in sigs:
+        if not isinstance(s, dict):
+            reasons.append("a signature entry is not an object")
+            continue
+        a, k = s.get("actor"), s.get("key")
+        if not (isinstance(a, str) and isinstance(k, str)):
+            reasons.append("a signature entry has no actor/key strings")
+        elif k not in actors.get(a, []):
+            reasons.append(f"key {k[:12]} is not bound to actor {a!r} in {TRUST}")
+    return reasons
+
+
+def store_report(settlement=True):
+    """(report, error) — the Warrant CLI's `warrant.verify-report@v0` object.
+
+    THIS IS ALSO THE CLI IDENTITY PROBE (2026-07-30 review, F9). The previous
+    gate was "some program exited 0", so `WARRANT_CLI=/usr/bin/true` re-opened
+    the original forgery in full: rebuild derived every acceptance edge from a
+    store nothing had verified, and printed "(signed decision)". Exiting 0 is not
+    evidence of having verified anything. A program that cannot produce a
+    parseable report NAMING ITSELF (`"report": "warrant.verify-report@v0"`, with
+    integer counts and a findings list) is not a Warrant verifier as far as OAIP
+    is concerned, and OAIP refuses rather than trusting the exit code."""
+    if not warrant_cli_available():
+        return None, ("no runnable Warrant CLI is configured (set WARRANT_CLI) "
+                      "— refusing to reason about signatures nothing verified")
+    ensure_trust()
+    argv = ["--store", str(WSTORE), "verify", "--store-mode", "--json"]
+    if settlement:
+        argv += ["--settlement", "--trust-config", str(TRUST)]
+    r = wrun(*argv)
+    try:
+        doc = json.loads(r.stdout)
+    except ValueError:
+        tail = (r.stdout + r.stderr).strip().splitlines()
+        return None, (f"the configured Warrant CLI ({' '.join(WARRANT)}) did not "
+                      f"emit a {VERIFY_REPORT} object (exit {r.returncode}) — an "
+                      "exit status is not a verification"
+                      + (f": {tail[-1][:120]}" if tail else ""))
+    if not (isinstance(doc, dict) and doc.get("report") == VERIFY_REPORT
+            and isinstance(doc.get("errors"), int)
+            and isinstance(doc.get("warnings"), int)
+            and isinstance(doc.get("findings"), list)):
+        return None, (f"the configured Warrant CLI ({' '.join(WARRANT)}) emitted "
+                      f"JSON that is not a {VERIFY_REPORT}")
+    return doc, None
+
+
+def findings_by_record(report):
+    """subject → [messages], for the per-record half of a verify report."""
+    out = {}
+    for f in report.get("findings", []):
+        if isinstance(f, dict) and isinstance(f.get("subject"), str):
+            out.setdefault(f["subject"], []).append(str(f.get("message", "")))
+    return out
+
+
+# Findings that mean "OAIP cannot tell which signature on this record is the
+# valid one" — an excluded (non-verifying) entry, or a malformed entry. Warrant
+# reports these but does not treat them as fatal, correctly: they are only fatal
+# for the narrower question OAIP asks, which is whether a specific actor accepted.
+_AMBIGUOUS_SIG = ("does not verify", "is not an object", "no signatures",
+                  "sigs must be a list")
+
+
+def unbound_by_warrant():
+    """Warrant's OWN bound/unbound determination, as corroboration.
+
+    `verify --settlement --trust-config` reports `signature unbound` / `binding
+    unverified` in its human report against the same keyring file OAIP writes.
+    It is read from the TEXT output because the machine-readable report drops the
+    finding in quiet mode (`if quiet: pass` in warrant.py's emitting branch), so
+    the JSON cannot carry it. Returns a set of 12-char WarrantID prefixes; an
+    unreadable run returns None, which callers must treat as "no corroboration",
+    never as "clean" — the enforced check is `unbound_signers`."""
+    ensure_trust()
+    r = wrun("--store", str(WSTORE), "verify", "--settlement",
+             "--trust-config", str(TRUST))
+    if r.returncode not in (0, 1):
+        return None
+    flagged = set()
+    for line in (r.stdout + r.stderr).splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "WARN" and (
+                "signature unbound" in line or "binding unverified" in line):
+            flagged.add(parts[1])
+    return flagged
 
 
 # ---------- strict I-JSON ingestion (SPEC §1) ----------
@@ -357,9 +565,17 @@ CREATE TABLE IF NOT EXISTS warrants(
 def cmd_init(_):
     OAIP.mkdir(exist_ok=True)
     db().executescript(SCHEMA)
-    subprocess.run(WARRANT + ["--store", str(WSTORE), "init"], capture_output=True)
+    wrun("--store", str(WSTORE), "init")
     if not WKEY.exists():
-        subprocess.run(WARRANT + ["keygen", "--out", str(WKEY)], capture_output=True)
+        r = wrun("keygen", "--out", str(WKEY))
+        # Record the PUBLIC half. OAIP is stdlib-only and cannot derive an Ed25519
+        # public key from a seed, so the one moment the pubkey is knowable is the
+        # line `warrant keygen` prints. Without it OAIP could not say which key it
+        # custodies, and a keyring that cannot name its own key is not a keyring.
+        m = re.search(r"\bpubkey\s+([0-9a-f]{64})\b", r.stdout or "")
+        if m:
+            PUBKEY.write_text(m.group(1) + "\n")
+    ensure_trust()
     # Keep the signing key and the store out of the USER's own commits too.
     # workspace_snapshot() excludes .oaip by pathspec, but a plain `git add -A`
     # by the user would still commit dev.key; init owns the directory, so init
@@ -500,8 +716,7 @@ def cmd_accept(a):
         sys.exit("refusing to accept: the claim's validation check did NOT pass "
                  "(execution success is not acceptance)")
     # materialize the subject + policy + check blob + transcript as warrant blobs
-    w = lambda *args: subprocess.run(WARRANT + ["--store", str(WSTORE), *args],
-                                     capture_output=True, text=True)
+    w = lambda *args: wrun("--store", str(WSTORE), *args)
     subject_bytes = (ART / subject_hash).read_bytes()
     subj_file = OAIP / "subject.tmp"
     subj_file.write_bytes(subject_bytes)
@@ -538,12 +753,56 @@ def cmd_accept(a):
     # second reading of the clock. The projection row must be re-derivable from
     # the canonical layer alone (§5), and two clock reads can straddle a second
     # boundary: a rebuild that disagrees by one second is not "the same graph".
-    wts = json.loads((WSTORE / "records" / f"{wid}.json").read_text())["body"]["ts"]
+    env = json.loads((WSTORE / "records" / f"{wid}.json").read_text())
+    wts = env["body"]["ts"]
+    # BIND THE SIGNER TO THE ACTOR, in OAIP's own keyring, from the record that
+    # was just filed. This is the fact `rebuild` will require before it derives an
+    # acceptance edge (2026-07-30 review, F7/F3): without it, any self-generated
+    # key claiming any actor id produced an edge, because Warrant reports an
+    # unbound binding as a WARN by specification and exits 0.
+    #
+    # The key is read back out of the filed signature rather than assumed, so the
+    # binding records what actually signed; when `init` captured the public half
+    # it is cross-checked, and a mismatch is fatal — it would mean the store was
+    # signed by a key this ledger does not custody.
+    signed_key = next((s.get("key") for s in env.get("sigs", [])
+                       if isinstance(s, dict) and s.get("actor") == a.actor), None)
+    if not (isinstance(signed_key, str) and HEX64.match(signed_key)):
+        sys.exit(f"filed warrant {wid[:12]} carries no signature by {a.actor}; "
+                 "refusing to record an acceptance nothing signed")
+    if PUBKEY.is_file() and PUBKEY.read_text().strip() != signed_key:
+        sys.exit(f"filed warrant {wid[:12]} was signed by {signed_key[:12]}, "
+                 f"not by this ledger's own key ({PUBKEY.read_text().strip()[:12]})")
+    bind_actor(a.actor, signed_key)
     con.execute("INSERT INTO warrants(claim_id,warrant_id,created_at) VALUES (?,?,?)",
                 (a.claim, wid, wts))
     con.commit()
     print(f"ACCEPTED -> warrant {wid}\n  (signed, hash-addressed, cites the provenance as evidence "
           f"and the validation as a cmd@v1 check)")
+
+
+def cmd_bind(a):
+    """Record in OAIP's keyring that a key may sign as an actor.
+
+    `cmd_accept` does this automatically for every acceptance it files, so a
+    ledger used through `oaip accept`/`oaip do` never needs this command. It
+    exists for two honest cases: a store created BEFORE OAIP had a keyring (whose
+    acceptances would otherwise stop producing edges at the next rebuild, because
+    nothing vouches for their signer), and an acceptance filed through the Warrant
+    CLI directly. Naming the key is the operator's assertion, not OAIP's
+    discovery — which is why it is a separate, explicit verb."""
+    key = a.key
+    if key is None:
+        if not PUBKEY.is_file():
+            sys.exit(f"no {PUBKEY}: this ledger does not know its own public key "
+                     "(it predates `init` recording it) — pass --key <hex64>, "
+                     "e.g. the `key` field of a signature in "
+                     f"{WSTORE / 'records'}")
+        key = PUBKEY.read_text().strip()
+    if not (isinstance(key, str) and HEX64.match(key)):
+        sys.exit("--key must be a 64-hex-character Ed25519 public key")
+    bind_actor(a.actor, key)
+    print(f"bound key {key[:12]} -> actor {a.actor}  ({TRUST})")
 
 
 def cmd_do(a):
@@ -577,6 +836,104 @@ def cmd_log(_):
                 print(f"    CLAIM {c[0]}  {c[1]}  [{sup}]")
                 for wr in con.execute("SELECT warrant_id FROM warrants WHERE claim_id=?", (c[0],)):
                     print(f"      WARRANT {wr[0][:16]}…  (signed decision)")
+
+
+def read_warrant_store():
+    """(accepts, record_files, errors) over the decision half of the canonical layer.
+
+    Every accept is returned as a dict carrying its subject hash, WarrantID, ts,
+    subject note AND ITS ENVELOPE — the envelope, because the signatures are what
+    `signer_gate` has to inspect, and re-reading the file later would be a second
+    observation of a mutable directory.
+
+    Integrity-checked before anything is derived from it, for the reason
+    `read_artifact` gives about the artifact half: a record whose body does not
+    hash to its own filename is not that record. Address-matching is NOT
+    verification, though — see the three layers named in `cmd_rebuild`."""
+    accepts, errors = [], []
+    wrec_dir = WSTORE / "records"
+    files = sorted(wrec_dir.glob("*.json")) if wrec_dir.is_dir() else []
+    for path in files:
+        if not HEX64.match(path.stem):
+            # Not forged — not a record at all. A stray notes.json used to be
+            # reported as "does not match its own address", misdiagnosing a
+            # benign file as a forgery. Say what it is, precisely.
+            errors.append(f"warrant store: stray file {path.name} in records/ — "
+                          "its name is not a record address; remove it (the "
+                          "Warrant store treats every records/*.json as a record)")
+            continue
+        try:
+            doc = loads_ijson(path.read_bytes())
+        except ValueError as e:
+            errors.append(f"warrant {path.stem[:12]}: unreadable record: {e}")
+            continue
+        body = doc.get("body") if isinstance(doc, dict) else None
+        if not isinstance(body, dict):
+            # A crafted non-dict body at a valid address used to crash this
+            # function with an AttributeError; a refusal is a decision, a
+            # traceback is an accident.
+            errors.append(f"warrant {path.stem[:12]}: envelope has no body object "
+                          "— not a warrant record")
+            continue
+        if sha256(canon(body)) != path.stem:
+            errors.append(f"warrant {path.stem[:12]}: body hashes to "
+                          f"{sha256(canon(body))[:12]} — record does not match "
+                          "its own address")
+            continue
+        if body.get("decision") == "accept":
+            subj = body.get("subject") if isinstance(body.get("subject"), dict) else {}
+            accepts.append({"subject": subj.get("hash"), "wid": path.stem,
+                            "ts": body.get("ts"),
+                            "note": subj.get("note") if isinstance(subj.get("note"), str) else "",
+                            "env": doc})
+    return accepts, files, errors
+
+
+def signer_gate(report, actors, unbound_prefixes):
+    """Return `refuse(wid, env) -> reason|None`: does this record's signature
+    establish WHO accepted?
+
+    THE DEFECT THIS CLOSES (F7/F3, 2026-07-30, second adversarial round). The
+    previous gate was `warrant verify` exiting 0, and Warrant exits 0 for a
+    cryptographically valid signature whose key nobody vouches for — by
+    specification (§5: report the binding as unverified; §5.1: "Bound/unbound is
+    a report"). Reproduced end to end on this branch before this function:
+
+        warrant keygen --out attacker.key
+        warrant --store .oaip/warrants accept --subject <a real claim's subject> \\
+                --note oaip-claim:<that claim's id> --actor tester@local \\
+                --key attacker.key
+        oaip rebuild   ->  warrant=1
+        oaip log       ->  WARRANT 41d32da62a81…  (signed decision)
+
+    for a claim NOBODY accepted, with the actor `tester@local` freely
+    impersonated. Three conditions must now hold, and each covers a way the other
+    two can be evaded:
+      * no signature on the record was EXCLUDED or malformed in Warrant's report
+        — otherwise OAIP cannot tell which of several signatures was the valid
+        one, and a bound-but-junk entry could stand next to an unbound-but-valid
+        one (§5 lets anyone with store write access append co-signatures);
+      * every signature entry names a key bound to the actor it claims in
+        `.oaip/trust.json` — the ENFORCED rule, OAIP's own, because Warrant has
+        none to enforce; and
+      * Warrant's settlement grade does not itself call the record unbound
+        against that same keyring file — corroboration, not the primary check.
+    """
+    per_record = findings_by_record(report) if report else {}
+
+    def refuse(wid, env):
+        amb = [m for m in per_record.get(wid, [])
+               if any(k in m for k in _AMBIGUOUS_SIG)]
+        if amb:
+            return f"Warrant excluded or could not read a signature on it ({amb[0]})"
+        reasons = unbound_signers(env, actors)
+        if reasons:
+            return reasons[0]
+        if unbound_prefixes and wid[:12] in unbound_prefixes:
+            return (f"Warrant's settlement grade reports it unbound against {TRUST}")
+        return None
+
+    return refuse
 
 
 def cmd_rebuild(_):
@@ -614,74 +971,41 @@ def cmd_rebuild(_):
         if isinstance(doc, dict) and isinstance(doc.get("oaip_record"), str):
             records.append(doc)
 
-    # The other half of the canonical layer: the Warrant store. Read and
-    # integrity-check BEFORE touching the projection, for the same reason as
-    # above: a record whose body does not hash to its own filename is not that
-    # record, and rebuilding from it would launder a forged acceptance -- the
-    # worst possible fact to forge.
-    #
-    # ADDRESS-MATCHING IS NOT VERIFICATION (2026-07-30 adversarial review).
-    # `sha256(canon(body)) == filename` is satisfied BY CONSTRUCTION by anyone
-    # who can write a file: a hand-written body with decision:"accept", a real
-    # claim's subject hash and junk sigs, filed at its own valid address, made
-    # this function print warrant=1 for a claim whose check had FAILED — an
-    # unsigned acceptance laundered into the projection, contradicting the very
-    # invariant cmd_accept signs for. So before ANY acceptance edge is derived,
-    # the store is verified by the Warrant CLI (signatures included) — the same
-    # normative dependency cmd_verify already shells out to. Fail closed both
-    # ways: a store that does not verify refuses the rebuild, and a store that
-    # CANNOT be verified (no runnable Warrant CLI) refuses too, rather than
-    # silently deriving edges no one checked. Rebuild is thereby never weaker
-    # than the live cmd_accept path, which files through the same CLI.
-    accepts = []                       # (subject_hash, warrant_id, ts, note)
-    wrec_dir = WSTORE / "records"
-    wrec_files = sorted(wrec_dir.glob("*.json")) if wrec_dir.is_dir() else []
-    for path in wrec_files:
-        if not HEX64.match(path.stem):
-            # Not forged — not a record at all. A stray notes.json used to be
-            # reported as "does not match its own address", misdiagnosing a
-            # benign file as a forgery. Say what it is, precisely.
-            bad.append(f"warrant store: stray file {path.name} in records/ — "
-                       "its name is not a record address; remove it (the "
-                       "Warrant store treats every records/*.json as a record)")
-            continue
-        try:
-            doc = loads_ijson(path.read_bytes())
-        except ValueError as e:
-            bad.append(f"warrant {path.stem[:12]}: unreadable record: {e}")
-            continue
-        body = doc.get("body") if isinstance(doc, dict) else None
-        if not isinstance(body, dict):
-            # A crafted non-dict body at a valid address used to crash this
-            # function with an AttributeError; a refusal is a decision, a
-            # traceback is an accident.
-            bad.append(f"warrant {path.stem[:12]}: envelope has no body object "
-                       "— not a warrant record")
-            continue
-        if sha256(canon(body)) != path.stem:
-            bad.append(f"warrant {path.stem[:12]}: body hashes to "
-                       f"{sha256(canon(body))[:12]} — record does not match "
-                       "its own address")
-            continue
-        if body.get("decision") == "accept":
-            subj = body.get("subject") if isinstance(body.get("subject"), dict) else {}
-            accepts.append((subj.get("hash"), path.stem, body.get("ts"),
-                            subj.get("note") or ""))
+    # The other half of the canonical layer: the Warrant store.
+    accepts, wrec_files, store_bad = read_warrant_store()
+    bad += store_bad
 
+    # WHAT VERIFICATION MEANS HERE, IN THREE LAYERS THAT WERE EACH ADDED AFTER
+    # THE PREVIOUS ONE WAS BROKEN BY REVIEW (2026-07-30, two rounds):
+    #   1. address-matching (above) — satisfied BY CONSTRUCTION by anyone who can
+    #      write a file, so it establishes nothing about who decided.
+    #   2. `warrant verify` exiting 0 — broken two ways: `WARRANT_CLI=/usr/bin/true`
+    #      exits 0 having verified nothing (so the call is now an IDENTITY PROBE:
+    #      the program must emit a parseable `warrant.verify-report@v0`), and a
+    #      cryptographically valid signature by a key nobody vouches for still
+    #      exits 0, because Warrant reports an unbound key↔actor binding as a WARN
+    #      by SPECIFICATION (§5, §5.1).
+    #   3. BINDING (this layer): the signer must be a key bound to the actor it
+    #      claims in OAIP's own keyring, `.oaip/trust.json`, which only
+    #      `cmd_accept`/`oaip bind` ever write. An accept signed by an unknown key
+    #      gets NO EDGE, whatever Warrant's exit status says.
+    report, unbound_prefixes, actors = None, None, {}
     if wrec_files:
-        if not warrant_cli_available():
-            bad.append("warrant store: records exist but no runnable Warrant "
-                       "CLI is configured (set WARRANT_CLI) — refusing to "
-                       "derive acceptance edges from records whose signatures "
-                       "nothing verified")
+        report, rerr = store_report()
+        if rerr:
+            bad.append(f"warrant store: {rerr}")
+        elif report["errors"]:
+            first = next((f"{f.get('subject','')[:12]} {f.get('message')}"
+                          for f in report["findings"]
+                          if isinstance(f, dict) and f.get("level") == "ERR"), "")
+            bad.append("warrant store: `warrant verify` reported "
+                       f"{report['errors']} error(s) — an unverified acceptance "
+                       f"must not become an edge ({first})")
         else:
-            r = subprocess.run(WARRANT + ["--store", str(WSTORE), "verify"],
-                               capture_output=True, text=True)
-            if r.returncode != 0:
-                tail = (r.stdout + r.stderr).strip().splitlines()
-                bad.append("warrant store: `warrant verify` FAILED — an "
-                           "unverified acceptance must not become an edge"
-                           + (f" ({tail[-1]})" if tail else ""))
+            actors, aerr = read_trust()
+            if aerr:
+                bad.append(f"warrant store: {aerr}")
+            unbound_prefixes = unbound_by_warrant()
 
     if bad:
         for e in bad:
@@ -754,14 +1078,27 @@ def cmd_rebuild(_):
                 and d.get("supported")):
             supported_by_subject.setdefault(d["subject"], []).append(d["id"])
     counts["warrant@edge"] = 0
-    NOTE_PREFIX = "oaip-claim:"
 
     def edge(cid, wid, wts):
         con.execute("INSERT INTO warrants(claim_id,warrant_id,created_at)"
                     " VALUES (?,?,?)", (cid, wid, wts))
         counts["warrant@edge"] += 1
 
-    for subj_hash, wid, wts, note in accepts:
+    refuse_signer = signer_gate(report, actors, unbound_prefixes)
+
+    for acc in accepts:
+        subj_hash, wid, wts, note = (acc["subject"], acc["wid"], acc["ts"],
+                                     acc["note"])
+        # WHO ACCEPTED, before WHAT was accepted. An acceptance whose signer is
+        # not bound to the actor it claims is not this actor's decision, however
+        # well-formed the rest of the record is (F7).
+        why = refuse_signer(wid, acc["env"])
+        if why is not None:
+            print(f"WARN  accept {wid[:12]}: {why} — the signer is NOT bound to "
+                  "the actor it claims, so this is not that actor's decision; "
+                  "no acceptance edge derived (`oaip bind --actor <id>` if the "
+                  "key really is this ledger's)", file=sys.stderr)
+            continue
         if note.startswith(NOTE_PREFIX):
             cid = note[len(NOTE_PREFIX):]
             c = claims_by_id.get(cid)
@@ -843,6 +1180,17 @@ def cmd_verify(_):
     `oaip verify` printed "0 errors" and exited 0. It was checking the store next
     door to the evidence — a real, adjacent, healthy thing — and reporting that
     as the health of this one.
+
+    AND WHY IT WAS STILL WRONG AFTER THAT
+    -------------------------------------
+    It reported `warrant verify`'s last line, and `warrant verify` exits 0 for an
+    acceptance signed by a key nobody vouches for — Warrant reports an unverified
+    key↔actor binding as a WARN by SPECIFICATION (§5). So `oaip verify` printed
+    "0 errors" for a store in which an attacker-generated key had accepted a claim
+    as `tester@local` (2026-07-30, second review round). An acceptance whose signer
+    is unknown is now an OAIP-level ERROR — for the accepts that claim to be
+    OAIP's; a Warrant store may legitimately hold OTHER decisions (root adoption,
+    key rotation) that this ledger has no business vouching for.
     """
     errs = verify_artifacts()
     for e in errs:
@@ -850,11 +1198,37 @@ def cmd_verify(_):
     print(f"canonical layer: {len(errs)} error(s)" if errs
           else "canonical layer: every artifact matches its address")
 
-    r = subprocess.run(WARRANT + ["--store", str(WSTORE), "verify"],
-                       capture_output=True, text=True)
-    print("decision layer:  " + (r.stdout.strip().splitlines()[-1]
-                                 if r.stdout.strip() else "(empty store)"))
-    sys.exit(1 if (errs or r.returncode != 0) else 0)
+    accepts, wrec_files, store_errs = read_warrant_store()
+    report, rerr = store_report() if wrec_files else (None, None)
+    for e in store_errs:
+        print("ERR ", e)
+    if rerr:
+        print("ERR  decision layer: " + rerr)
+    dec_errs = list(store_errs) + ([rerr] if rerr else [])
+    if report:
+        actors, aerr = read_trust()
+        if aerr:
+            print("ERR ", aerr)
+            dec_errs.append(aerr)
+        else:
+            refuse_signer = signer_gate(report, actors, unbound_by_warrant())
+            for acc in accepts:
+                if not acc["note"].lower().startswith(NOTE_PREFIX):
+                    continue        # not an OAIP claim acceptance; not ours to judge
+                why = refuse_signer(acc["wid"], acc["env"])
+                if why is not None:
+                    msg = (f"accept {acc['wid'][:12]} claims an OAIP claim but its "
+                           f"signer is not bound to the actor it claims: {why}")
+                    print("ERR ", msg)
+                    dec_errs.append(msg)
+        print(f"decision layer:  {report['records']} records, "
+              f"{report['errors'] + len(dec_errs)} error(s), "
+              f"{report['warnings']} warning(s)"
+              + ("" if report["errors"] == 0 else "  [Warrant]"))
+    elif not wrec_files:
+        print("decision layer:  (empty store)")
+    sys.exit(1 if (errs or dec_errs
+                   or (report and report["errors"])) else 0)
 
 
 def cmd_conformance(a):
@@ -898,6 +1272,12 @@ def main():
     pr = sub.add_parser("run"); pr.add_argument("--intent"); pr.add_argument("command", nargs=argparse.REMAINDER); pr.set_defaults(fn=cmd_run)
     pc = sub.add_parser("claim"); pc.add_argument("--execution", required=True); pc.add_argument("--predicate", required=True); pc.add_argument("--check", required=True); pc.set_defaults(fn=cmd_claim)
     pa = sub.add_parser("accept"); pa.add_argument("--claim", required=True); pa.add_argument("--actor", required=True); pa.set_defaults(fn=cmd_accept)
+    pb = sub.add_parser("bind", help="vouch that a key may sign as an actor "
+                        "(rebuild derives no acceptance edge from an unbound signer)")
+    pb.add_argument("--actor", required=True)
+    pb.add_argument("--key", help="hex64 Ed25519 public key; defaults to this "
+                    "ledger's own key")
+    pb.set_defaults(fn=cmd_bind)
     pd = sub.add_parser("do", help="one-shot: intent -> run -> validate -> accept-if-pass")
     pd.add_argument("--intent", required=True); pd.add_argument("--check", required=True)
     pd.add_argument("--predicate"); pd.add_argument("--actor", required=True)

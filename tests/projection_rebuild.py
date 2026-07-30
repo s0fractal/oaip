@@ -40,9 +40,9 @@ WHAT IT CHECKS
    (sha256(canon(body)) == filename) is satisfied by construction by anyone who
    can write a file: a hand-written accept with a real claim's subject hash and
    junk sigs made `oaip rebuild` print warrant=2 and `oaip log` print "(signed
-   decision)" for it (2026-07-30 adversarial review). Rebuild now verifies the
-   store through the Warrant CLI before deriving any edge, and fails closed —
-   including when no Warrant CLI can run at all.
+   decision)" for it (2026-07-30 adversarial review). Rebuild refuses the whole
+   rebuild when the store does not verify, and when no Warrant CLI can run at
+   all. That was NOT sufficient on its own — see case 9.
 8. A subject COLLISION cannot project an acceptance onto a FAILED claim. The
    claim subject {predicate, execution, effects} excludes the check command and
    verdict, so `--check true` and `--check false` over one execution collide;
@@ -50,8 +50,21 @@ WHAT IT CHECKS
    UNSUPPORTED claim after rebuild (§5 MUST violation, same review). New
    accepts carry an explicit oaip-claim:<id> note; legacy accepts without one
    fall back to subject-hash matching restricted to supported claims.
+9. An ATTACKER'S OWN KEY cannot launder an acceptance. Case 7 only rules out
+   signatures no key produced; this one is cryptographically perfect — a fresh
+   `warrant keygen` key signs a well-formed accept naming a real SUPPORTED claim
+   nobody accepted, claiming an actor id it does not own. `warrant verify` exits
+   0 for it BY SPECIFICATION (Warrant SPEC §5 puts key↔actor binding out of
+   scope; §5.1 makes bound/unbound "a report"), so before this case `oaip
+   rebuild` printed warrant=1 and `oaip log` printed "(signed decision)" for it.
+   OAIP now requires the signer to be bound to the actor in its own keyring
+   (`.oaip/trust.json`). The same block pins two ways the gate was evadable:
+   `WARRANT_CLI=/usr/bin/true` (exit 0 is not a verification — the CLI must emit
+   a parseable `warrant.verify-report@v0`), and a CLI that never exits (every
+   call is timeout-bounded).
 """
 import hashlib
+import time
 import json
 import os
 import shutil
@@ -341,11 +354,14 @@ def main():
         wcli = (os.environ.get("WARRANT_CLI")
                 or f"{sys.executable} "
                    f"{Path.home() / 'Projects/warrant/impl/warrant.py'}").split()
+        # `--actor tester@local`, the actor case 8's own accept already bound to
+        # this ledger's key: this case is about the missing NOTE, and mixing in an
+        # unbound actor would make it pass or fail for the F7 reason instead.
         rr = subprocess.run(
             wcli + ["--store", ".oaip/warrants", "accept",
                     "--subject", subs[cid_a], "--under", ".oaip/policy.txt",
                     "--reason", "legacy accept without a note",
-                    "--actor", "legacy@local", "--key", ".oaip/dev.key"],
+                    "--actor", "tester@local", "--key", ".oaip/dev.key"],
             cwd=work, capture_output=True, text=True)
         lwid = rr.stdout.strip().splitlines()[-1] if rr.stdout.strip() else ""
         if len(lwid) != 64:
@@ -360,6 +376,121 @@ def main():
                  any(w["claim_id"] == cid_a and w["warrant_id"] == lwid
                      for w in rows)
                  and all(w["claim_id"] != cid_b for w in rows), rows)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- case 9 (F7/F3): AN ATTACKER'S OWN KEY MUST NOT LAUNDER AN ACCEPTANCE.
+        #
+        # Case 7 above only rules out signatures no key produced. This one is
+        # cryptographically PERFECT: a freshly generated Ed25519 key signs a
+        # well-formed accept naming a real, SUPPORTED claim that nobody accepted,
+        # claiming an actor id it does not own. `warrant verify` exits 0 for it —
+        # by SPECIFICATION, since Warrant SPEC §5 puts key↔actor binding out of
+        # scope and §5.1 makes bound/unbound "a report". Measured on this branch
+        # before the fix: `oaip rebuild` -> warrant=1 and `oaip log` printed
+        # "WARRANT 41d32da62a81…  (signed decision)" for a claim nobody accepted.
+        #
+        # So the binding must be enforced by OAIP, over OAIP's own keyring
+        # (.oaip/trust.json), which only `oaip accept` and `oaip bind` write.
+        work, run = make_repo(tmp)
+        r = run("do", "--intent", "real work", "--check", "test -f f.txt",
+                "--actor", "tester@local", "--", "sh", "-c", "echo hi > f.txt")
+        if "ACCEPTED" not in r.stdout:
+            print("FAIL  setup(9): the one-shot flow did not accept\n",
+                  r.stdout, r.stderr)
+            return 1
+        real_edges = len(snapshot(work / ".oaip" / "ledger.db")["warrants"])
+
+        # a SECOND claim, supported, that nobody ever accepted
+        iid = run("intent", "unaccepted").stdout.strip()
+        eid = run("run", "--intent", iid, "--", "sh", "-c",
+                  "echo two > g.txt").stdout.split()[1]
+        cid = run("claim", "--execution", eid, "--predicate", "q",
+                  "--check", "true").stdout.split()[1]
+        con = sqlite3.connect(work / ".oaip" / "ledger.db")
+        subj_hash = con.execute("SELECT subject_hash FROM claims WHERE id=?",
+                                (cid,)).fetchone()[0]
+        con.close()
+
+        wcli = (os.environ.get("WARRANT_CLI")
+                or f"{sys.executable} "
+                   f"{Path.home() / 'Projects/warrant/impl/warrant.py'}").split()
+        w = lambda *a: subprocess.run(list(wcli) + list(a), cwd=work,
+                                      capture_output=True, text=True)
+        w("keygen", "--out", "attacker.key")
+        shutil.copy(work / ".oaip" / "artifacts" / subj_hash, work / "subj.json")
+        sb = w("--store", ".oaip/warrants", "blob", "add", "subj.json").stdout.strip()
+        pol = w("--store", ".oaip/warrants", "blob", "add",
+                ".oaip/policy.txt").stdout.strip()
+        rr = w("--store", ".oaip/warrants", "accept", "--subject", sb,
+               "--under", pol, "--reason", "an acceptance nobody made",
+               "--note", f"oaip-claim:{cid}", "--actor", "tester@local",
+               "--key", "attacker.key")
+        fwid = rr.stdout.strip().splitlines()[-1] if rr.stdout.strip() else ""
+        if len(fwid) != 64:
+            print("FAIL  setup(9): the attacker's accept did not file\n",
+                  rr.stdout, rr.stderr)
+            return 1
+
+        # THE NEGATIVE CONTROL: the old gate — `warrant verify` exiting 0 — is
+        # fully satisfied. If this ever stops holding, the cases below prove
+        # nothing about OAIP, only that Warrant changed.
+        vr = w("--store", ".oaip/warrants", "verify")
+        case("negative control: `warrant verify` exits 0 for the attacker's "
+             "accept (binding is a WARN by Warrant SPEC §5)",
+             vr.returncode == 0 and "binding" not in vr.stdout.lower()
+             or vr.returncode == 0, vr.stdout + vr.stderr)
+
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("attacker-keyed accept: rebuild still rebuilds the honest records",
+             r.returncode == 0, out[-400:])
+        rows = [json.loads(x) for x in
+                snapshot(work / ".oaip" / "ledger.db")["warrants"]]
+        case("attacker-keyed accept: NO acceptance edge was derived from it",
+             all(x["warrant_id"] != fwid for x in rows), rows)
+        case("the honest acceptance edge is still there",
+             len(rows) == real_edges, rows)
+        case("the refusal names the BINDING, not the signature bytes",
+             "not bound to" in out.lower() and "trust.json" in out, out[-400:])
+        case("the impersonated claim gets no WARRANT line in `oaip log`",
+             fwid[:16] not in run("log").stdout, run("log").stdout)
+        vr = run("verify")
+        case("`oaip verify` now FAILS on an acceptance with an unknown signer",
+             vr.returncode != 0 and fwid[:12] in (vr.stdout + vr.stderr),
+             (vr.stdout + vr.stderr)[-400:])
+
+        # F9: the gate must not be "some program exited 0". /usr/bin/true is a
+        # runnable file that exits 0 having verified nothing, and it re-opened
+        # case 7 in full: rebuild derived every edge from an unverified store.
+        (work / ".oaip" / "warrants" / "records" / f"{fwid}.json").unlink()
+        r = subprocess.run([sys.executable, "impl/oaip.py", "rebuild"], cwd=work,
+                           capture_output=True, text=True,
+                           env=dict(os.environ, WARRANT_CLI="/usr/bin/true"))
+        out = r.stdout + r.stderr
+        case("a stub CLI that merely exits 0 does not pass as a verifier",
+             r.returncode != 0 and "verify-report" in out, out[-400:])
+
+        # F11: a CLI that never exits used to hang rebuild forever, silently.
+        sleeper = work / "sleeper.py"
+        sleeper.write_text("import time\ntime.sleep(600)\n")
+        t0 = time.time()
+        r = subprocess.run([sys.executable, "impl/oaip.py", "rebuild"], cwd=work,
+                           capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ,
+                                    WARRANT_CLI=f"{sys.executable} {sleeper}",
+                                    OAIP_WARRANT_TIMEOUT="3"))
+        out = r.stdout + r.stderr
+        case("a Warrant CLI that never exits is a bounded refusal, not a hang",
+             r.returncode != 0 and time.time() - t0 < 45, f"{time.time()-t0:.0f}s "
+             + out[-300:])
+
+        # And the honest store still rebuilds, with the real edge intact.
+        r = run("rebuild")
+        rows = [json.loads(x) for x in
+                snapshot(work / ".oaip" / "ledger.db")["warrants"]]
+        case("after all of the above the honest store rebuilds, edge intact",
+             r.returncode == 0 and len(rows) == real_edges,
+             r.stdout + r.stderr + str(rows))
 
     print("\nPROJECTION-REBUILD: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1

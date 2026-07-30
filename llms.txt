@@ -103,20 +103,42 @@ better evidence of good faith than finding them hidden.
   store's `accept` records (it did not until 2026-07-30: the `warrants` table was
   never repopulated, so `oaip log` lost its WARRANT line at the first rebuild).
   The store itself is canonical, signed, and is not — cannot be — rebuilt.
-  A same-day fresh-context adversarial review (a Claude-family reviewer — not an
-  independent gate, and not adopted by any warrant) broke the first version of
-  that derivation twice, and both holes are closed and regression-tested:
-  address-matching alone accepted a hand-written `accept` with junk signatures
-  (rebuild now has the Warrant CLI verify the store *before* deriving any edge,
-  and fails closed — including when no Warrant CLI can run); and deriving by
-  subject hash projected one signed acceptance onto a claim whose check FAILED,
-  because the subject excludes the check and verdict, so `--check true` and
-  `--check false` over one execution collide. Accepts now carry the accepted
-  claim's id in the signed `subject.note` (`oaip-claim:<id>`), and rebuild
-  follows that link. Remaining, stated honestly: *legacy* accepts without the
-  note fall back to subject-hash matching restricted to supported claims — two
-  SUPPORTED claims with byte-identical subjects still cannot be told apart for
-  those old records.
+- **What actually gates an acceptance edge, and what does not.** Two rounds of
+  fresh-context adversarial review (a Claude-family reviewer — not an independent
+  gate, and not adopted by any warrant) broke the edge derivation four times.
+  Stated per layer, because the earlier summary here ("rebuild now has the
+  Warrant CLI verify the store before deriving any edge, and fails closed")
+  claimed a closure it did not have:
+  - *Address-matching* (`sha256(canon(body)) == filename`) is satisfied by
+    construction by anyone who can write a file. It establishes nothing about who
+    decided; a hand-written `accept` with junk signatures passed it.
+  - *`warrant verify` exiting 0* is also not enough, twice over.
+    `WARRANT_CLI=/usr/bin/true` exits 0 having verified nothing, so the call is
+    now an identity probe: the program must emit a parseable
+    `warrant.verify-report@v0`, and every call to it is timeout-bounded.
+    And a **cryptographically valid signature by a key nobody vouches for still
+    exits 0** — Warrant SPEC §5 puts key↔actor binding out of scope and §5.1
+    makes bound/unbound "a report". `warrant keygen` + one `accept` therefore
+    forged an acceptance for a claim nobody accepted, under any actor id.
+  - *Binding* is what is enforced now, and it is **OAIP's own rule, not
+    Warrant's**: an acceptance edge is derived only if every signature on the
+    record names a key bound to the actor it claims in `.oaip/trust.json`, which
+    only `oaip accept` and `oaip bind` ever write. `oaip verify` reports an
+    unbound signer on an OAIP acceptance as an error. What OAIP cannot do:
+    Warrant's `--trust-config` grade reports the same finding but by
+    specification never fails on it, and its machine-readable report omits the
+    finding entirely in quiet mode — so it is used as corroboration only.
+  - *Which claim* was accepted is read from the signed `subject.note`
+    (`oaip-claim:<id>`), not guessed from the subject hash: the subject
+    `{predicate, execution, effects}` excludes the check command and verdict, so
+    `--check true` and `--check false` over one execution collide, and hash
+    matching projected one signed acceptance onto a claim whose check FAILED.
+  - **Still outside OAIP's control:** `.oaip/trust.json` lives beside
+    `.oaip/dev.key`, so anyone who can write the ledger directory can write the
+    keyring — the binding raises the bar from "can run `keygen`" to "can write
+    `.oaip/`", it does not make acceptance unforgeable. There is no out-of-band
+    trust root, no key rotation, and no revocation. Two SUPPORTED claims with
+    byte-identical subjects still cannot be told apart for legacy records.
 - **The snapshot's `.oaip` exclusion has been broken three times by review**
   (nested ledgers leaked the signing key; cwd-relative pathspecs both leaked a
   HEAD-tracked root ledger and silently narrowed the "full worktree" snapshot to
