@@ -216,6 +216,74 @@ def main():
              "not canonical I-JSON" in v.stdout, v.stdout)
     with_ledger(dup_key)
 
+    # --- deep nesting: ~2 KB of brackets, in either half of the canonical layer.
+    #
+    # F3 (2026-07-30, FOURTH adversarial round). `json.loads` and both I-JSON
+    # walkers recurse, so ~1,000 levels raised RecursionError — which no caller
+    # catches, since they catch OSError/ValueError. Two things followed, and both
+    # are asserted here: the refusal became a TRACEBACK (the fourth instance of
+    # the class 1d5d0cb set out to close), and in `rebuild` the crash happened
+    # BEFORE `mark_untrusted`, so `oaip log` kept printing "(signed decision)"
+    # from a stale projection with no marker — the sticky-projection pattern
+    # cb0712f claims to have closed, reopened by 2 KB of "[[[[".
+    def deep_nesting_store(L):
+        recs = sorted((L.dir / ".oaip" / "warrants" / "records").glob("*.json"))
+        case("deep nesting: there is a store record to nest inside", bool(recs))
+        if not recs:
+            return
+        env = json.loads(recs[0].read_text())
+        env["deep"] = json.loads("[" * 1000 + "]" * 1000)
+        recs[0].write_text(json.dumps(env))
+        case("deep nesting: the file is small (this is not a size attack)",
+             recs[0].stat().st_size < 8192, recs[0].stat().st_size)
+
+        r = L.run("rebuild")
+        out = r.stdout + r.stderr
+        case("deeply nested store record: rebuild refuses", r.returncode != 0,
+             out[-300:])
+        case("deeply nested store record: a sentence, not a traceback",
+             "Traceback" not in out and "RecursionError" not in out, out[-500:])
+        case("deeply nested store record: the sentence names the depth",
+             "nested deeper" in out, out[-500:])
+        # The half that made this more than cosmetic.
+        case("deeply nested store record: the refusal MARKED the projection "
+             "untrusted (it used to crash before that line)",
+             (L.dir / ".oaip" / "projection.untrusted").is_file())
+        lg = L.run("log")
+        case("deeply nested store record: `oaip log` no longer reports the stale "
+             "projection as a signed decision",
+             lg.returncode != 0 and "(signed decision)" not in lg.stdout,
+             (lg.stdout + lg.stderr)[-300:])
+        v = L.run("verify")
+        case("deeply nested store record: verify says it in a sentence too",
+             v.returncode != 0 and "Traceback" not in (v.stdout + v.stderr),
+             (v.stdout + v.stderr)[-300:])
+    with_ledger(deep_nesting_store)
+
+    def deep_nesting_artifact(L):
+        """The same bytes in the artifact half, written AT THE ADDRESS OF THEIR
+        OWN BYTES so the only thing wrong with them is the nesting."""
+        import hashlib
+        forged = json.dumps({"oaip_record": "execution@v1",
+                             "deep": json.loads("[" * 1000 + "]" * 1000)},
+                            separators=(",", ":")).encode()
+        (L.dir / ".oaip" / "artifacts"
+         / hashlib.sha256(forged).hexdigest()).write_bytes(forged)
+        v = L.run("verify")
+        out = v.stdout + v.stderr
+        case("deeply nested artifact at a valid address: verify fails",
+             v.returncode != 0, out[-300:])
+        case("deeply nested artifact: reported as a canonicalization failure, "
+             "not a traceback",
+             "not canonical I-JSON" in out and "Traceback" not in out, out[-400:])
+        r = L.run("rebuild")
+        rout = r.stdout + r.stderr
+        case("deeply nested artifact: rebuild refuses in a sentence",
+             r.returncode != 0 and "Traceback" not in rout, rout[-400:])
+        case("deeply nested artifact: and marks the projection untrusted",
+             (L.dir / ".oaip" / "projection.untrusted").is_file())
+    with_ledger(deep_nesting_artifact)
+
     print("\nCANONICAL-LAYER: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1
 

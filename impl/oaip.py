@@ -808,13 +808,31 @@ def loads_ijson(raw):
     here and not in Warrant: `read_artifact` passes raw bytes, so the BOM was
     genuinely accepted, whereas every Warrant call site passes a `str`, where
     `json.loads` already fails. The reject vector recorded it as
-    "ACCEPTED — must be refused" before this line existed."""
+    "ACCEPTED — must be refused" before this line existed.
+
+    DEPTH IS PART OF THE DOMAIN (F3, 2026-07-30, fourth round). `json.loads` and
+    both walkers above recurse, so ~1,000 levels of nesting anywhere in a ~2 KB
+    document raised RecursionError — an exception no caller catches, since
+    `read_artifact` and `read_warrant_store` catch OSError/ValueError. A 2 KB
+    file therefore replaced every diagnosis with a traceback (the fourth instance
+    of the class 1d5d0cb set out to close), and in `rebuild` it crashed BEFORE
+    `mark_untrusted`, so `oaip log` went on printing "(signed decision)" from a
+    stale projection with no marker — the sticky-projection pattern cb0712f
+    claims to have closed. It is converted here, at the domain boundary, rather
+    than at each of the six call sites: a depth this parser cannot walk is a
+    document outside the domain, which is exactly what ValueError means here."""
     bom = b"\xef\xbb\xbf" if isinstance(raw, (bytes, bytearray)) else "﻿"
     if raw[:len(bom)] == bom:
         raise ValueError("leading byte order mark (not canonical I-JSON)")
-    return _reject_floats(_reject_lone_surrogates(
-        json.loads(raw, object_pairs_hook=_reject_dup_keys,
-                   parse_constant=_reject_constant)))
+    try:
+        return _reject_floats(_reject_lone_surrogates(
+            json.loads(raw, object_pairs_hook=_reject_dup_keys,
+                       parse_constant=_reject_constant)))
+    except RecursionError:
+        raise ValueError(
+            "nested deeper than this parser will walk (the limit is "
+            f"{sys.getrecursionlimit()} levels) — a document that cannot be "
+            "walked cannot be canonicalized, hashed or compared") from None
 
 
 def read_artifact(path: Path):
