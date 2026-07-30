@@ -564,12 +564,100 @@ def part_e():
              (work / ".oaip" / "projection.untrusted").is_file())
 
 
+def file_accept(work, body, seed, actor):
+    """An accept record at its own valid address, signed with a REAL Ed25519 key
+    that this ledger does not bind — the case `warrant verify` reports as a
+    WARNING by specification (§5, §5.1), so the store still verifies at 0 errors
+    and the record reaches OAIP's own gate."""
+    wid = sha256(canon(body))
+    pub, sig = ed25519_sign(seed, bytes.fromhex(wid))
+    (work / ".oaip" / "warrants" / "records" / f"{wid}.json").write_text(
+        json.dumps({"body": body, "sigs": [{"actor": actor, "key": pub.hex(),
+                                            "sig": sig.hex()}]}))
+    return wid
+
+
+def part_f():
+    """F6 (2026-07-30, FOURTH round): `verify` and `rebuild` audited different
+    sets of accepts.
+
+    `_rebuild` ran `assess_signer` on EVERY accept; `cmd_verify` ran it only on
+    accepts whose note starts with `oaip-claim:`. They agreed on edges — nothing
+    was derived unverified — and disagreed on REPORTING, which is the half a
+    human acts on. Measured before the fix, with a note-less accept carrying a
+    real claim's subject hash and a valid signature by an UNBOUND key:
+    `oaip rebuild` printed "WARN accept <id> … key … is not bound to actor
+    'tester@local'", and `oaip verify` printed nothing about it and exited 0.
+    Under --allow-legacy-links that same class of record can produce an edge."""
+    with tempfile.TemporaryDirectory() as tmp:
+        work, run = make_repo(tmp, "auditset")
+        r = run("do", "--intent", "real work", "--check", "test -f f.txt",
+                "--actor", "tester@local", "--", "sh", "-c", "echo hi > f.txt")
+        if "ACCEPTED" not in r.stdout:
+            case("setup(F): the one-shot flow accepted", False, r.stdout + r.stderr)
+            return
+        _, env = real_accept(work)
+
+        # (1) A NOTE-LESS accept about the same claim's subject, signed by a key
+        # nobody vouches for. This is the record --allow-legacy-links derives
+        # from, and the one `verify` never looked at.
+        body = json.loads(json.dumps(env["body"]))
+        body["ts"] = body["ts"] + 1
+        body["subject"].pop("note", None)
+        wid = file_accept(work, body, bytes.fromhex("22" * 32), "tester@local")
+
+        r = run("rebuild", "--allow-legacy-links")
+        out = r.stdout + r.stderr
+        case("negative control(F): rebuild already reports the note-less accept",
+             wid[:12] in out and "not bound" in out, out[-500:])
+        case("negative control(F): and derives no edge from it",
+             all(w != wid for _, w in edges(work)), edges(work))
+        v = run("verify")
+        vout = v.stdout + v.stderr
+        case("`oaip verify` audits the note-less accept rebuild warns about",
+             wid[:12] in vout, vout[-600:])
+        case("and reports it as an ERROR, so the exit status carries it",
+             v.returncode != 0 and "ERR" in vout and "not bound" in vout,
+             vout[-600:])
+
+    # (2) The other direction, which the same change must not break: a decision
+    # in the store that is NOT about an OAIP claim (root adoption, key rotation,
+    # another ledger's business — F14). `rebuild` warns and derives nothing;
+    # `verify` must not turn that into an accusation or a failing exit status.
+    with tempfile.TemporaryDirectory() as tmp:
+        work, run = make_repo(tmp, "foreign")
+        r = run("do", "--intent", "real work", "--check", "test -f f.txt",
+                "--actor", "tester@local", "--", "sh", "-c", "echo hi > f.txt")
+        if "ACCEPTED" not in r.stdout:
+            case("setup(F2): the one-shot flow accepted", False, r.stdout + r.stderr)
+            return
+        honest = edges(work)
+        _, env = real_accept(work)
+        body = json.loads(json.dumps(env["body"]))
+        body["ts"] = body["ts"] + 2
+        body["actor"] = {"id": "root@other-ledger"}
+        body["subject"] = {"hash": "ab" * 32}      # no OAIP claim has this subject
+        fwid = file_accept(work, body, bytes.fromhex("33" * 32),
+                           "root@other-ledger")
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("a foreign decision in the store: rebuild still succeeds",
+             r.returncode == 0 and edges(work) == honest, out[-400:])
+        v = run("verify")
+        vout = v.stdout + v.stderr
+        case("`oaip verify` passes a store holding another ledger's decision "
+             "(no false accusation, F14)", v.returncode == 0, vout[-600:])
+        case("and it is reported as a WARN, matching what rebuild says",
+             fwid[:12] in vout and "WARN" in vout, vout[-600:])
+
+
 def main():
     part_a()
     part_b()
     part_c()
     part_d()
     part_e()
+    part_f()
     print("\nSIGNATURE-GATE: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1
 

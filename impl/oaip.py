@@ -2114,15 +2114,20 @@ def _rebuild(a):
 
 def verify_artifacts():
     """Every artifact's bytes must hash to its filename, and every record must be
-    canonical I-JSON. Returns a list of errors.
+    canonical I-JSON. Returns (errors, claim subject hashes).
 
     Also: every hash the projection CITES must resolve. A dangling citation means
     the projection asserts a fact whose evidence is absent — reporting the graph
     as intact then is the same mistake as trusting a filename.
+
+    The claim subjects come back with the errors because `cmd_verify` needs the
+    same fact `_rebuild` needs — is this accept about an OAIP claim at all? — and
+    reading the artifact directory twice to answer it would be a second
+    observation of a mutable directory (F6).
     """
-    errs = []
+    errs, subjects = [], set()
     if not ART.is_dir():
-        return [f"no canonical layer at {ART}"]
+        return [f"no canonical layer at {ART}"], subjects
     present = set()
     for path in sorted(ART.glob("*")):
         doc, err = read_artifact(path)
@@ -2130,6 +2135,9 @@ def verify_artifacts():
             errs.append(err)
         else:
             present.add(path.name)
+            if (isinstance(doc, dict) and doc.get("oaip_record") == "claim@v1"
+                    and isinstance(doc.get("subject"), str)):
+                subjects.add(doc["subject"])
 
     if DB.is_file():
         con = db()
@@ -2144,7 +2152,7 @@ def verify_artifacts():
             if h and h not in present:
                 errs.append(f"{where} cites {h[:12]} — not resolvable in the "
                             "canonical layer")
-    return errs
+    return errs, subjects
 
 
 def cmd_verify(_):
@@ -2170,8 +2178,23 @@ def cmd_verify(_):
     is unknown is now an OAIP-level ERROR — for the accepts that claim to be
     OAIP's; a Warrant store may legitimately hold OTHER decisions (root adoption,
     key rotation) that this ledger has no business vouching for.
+
+    AND IT AUDITS THE SAME ACCEPTS `rebuild` DOES (F6, 2026-07-30, fourth round)
+    ---------------------------------------------------------------------------
+    `_rebuild` runs `assess_signer` on EVERY accept in the store; this function
+    ran it only on accepts whose note starts with `oaip-claim:`. The two agreed
+    on EDGES — nothing was ever derived unverified — and disagreed on REPORTING,
+    which is the half a human acts on: a note-less accept whose signature is
+    broken made `rebuild` print a WARN and `verify` print nothing at all. Under
+    `--allow-legacy-links` such an accept can even produce an edge, so `verify`
+    was silent about exactly the records the weaker path derives from. The set is
+    now the same; only the SEVERITY differs, on the same criterion `_rebuild`
+    uses to decide whether a record is this ledger's business at all (F14): an
+    accept that names an OAIP claim, or carries a claim's subject hash, is an
+    ERROR when its signer cannot be established, and any other decision in the
+    store is reported as the WARN `rebuild` prints and left to its own ledger.
     """
-    errs = verify_artifacts()
+    errs, claim_subjects = verify_artifacts()
     for e in errs:
         print("ERR ", e)
     print(f"canonical layer: {len(errs)} error(s)" if errs
@@ -2208,20 +2231,35 @@ def cmd_verify(_):
             dec_errs.append(aerr)
         else:
             assess_signer = signer_gate(report, actors, unbound_by_warrant())
+            # EVERY accept, exactly as `_rebuild` does (F6). The note only
+            # decides how loudly a failure is reported, never whether it is
+            # looked at — a record `verify` never examines is a record whose
+            # signature nobody re-checks between rebuilds.
             for acc in accepts:
-                if not acc["note"].lower().startswith(NOTE_PREFIX):
-                    continue        # not an OAIP claim acceptance; not ours to judge
                 why, notes = assess_signer(acc["wid"], acc["env"])
                 for n in notes:
                     # A co-signature is a fact about the record worth printing,
                     # and not an error: §5 permits appending one (C2-F1b).
                     print(f"NOTE  accept {acc['wid'][:12]}: {n}")
-                if why is not None:
-                    msg = (f"accept {acc['wid'][:12]} claims an OAIP claim but no "
-                           "key bound to the actor it names signed it: "
+                if why is None:
+                    continue
+                if (acc["note"].lower().startswith(NOTE_PREFIX)
+                        or acc["subject"] in claim_subjects):
+                    # This ledger's own business: it names an OAIP claim, or it
+                    # carries a claim's subject hash (the record
+                    # `--allow-legacy-links` would derive an edge from).
+                    msg = (f"accept {acc['wid'][:12]} is about an OAIP claim but "
+                           "no key bound to the actor it names signed it: "
                            f"{why}")
                     print("ERR ", msg)
                     dec_errs.append(msg)
+                else:
+                    # Some other ledger's decision, sharing this store (F14).
+                    # `rebuild` warns and derives nothing; saying more than that
+                    # here would be an accusation this ledger cannot support.
+                    print(f"WARN  accept {acc['wid'][:12]}: {why} — not an OAIP "
+                          "claim acceptance, so this ledger derives nothing from "
+                          "it either way")
         print(f"decision layer:  {report['records']} records, "
               f"{report['errors'] + len(dec_errs)} error(s), "
               f"{report['warnings']} warning(s)"
