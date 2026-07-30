@@ -2191,6 +2191,61 @@
         "output": "not-a-hash"
       },
       "why": "output cites an artifact by address"
+    },
+    {
+      "name": "legacy-execution-with-intent-member",
+      "class": "type-tag",
+      "outcome": "legacy",
+      "record": {
+        "oaip_record": "execution@v1",
+        "id": "1784000000001-bbbb0002",
+        "intent": "1784000000000-aaaa0001",
+        "command": "bash change.sh",
+        "exit_code": 0,
+        "before_tree": "0000000000000000000000000000000000000000",
+        "after_tree": "1000000000000000000000000000000000000000",
+        "env_fp": "0000000000000000000000000000000000000000000000000000000000000000",
+        "stdout": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ts": 1784000000,
+        "effects": []
+      },
+      "why": "a pre-0.1 execution carries a member named `intent` and a pre-0.1 claim one named `execution`, both of which are v0.1 TYPE TAGS. Classifying by tag first called an intact legacy ledger three corrupt artifacts, so §1.1 tests the legacy tag first and this vector pins the order"
+    },
+    {
+      "name": "legacy-claim-with-execution-member",
+      "class": "type-tag",
+      "outcome": "legacy",
+      "record": {
+        "oaip_record": "claim@v1",
+        "id": "1784000000002-cccc0003",
+        "execution": "1784000000001-bbbb0002",
+        "predicate": "p",
+        "check": "true",
+        "check_exit": 0,
+        "supported": true,
+        "transcript": "0000000000000000000000000000000000000000000000000000000000000000",
+        "subject": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ts": 1784000000
+      },
+      "why": "the same collision from the claim side"
+    },
+    {
+      "name": "legacy-claim-subject",
+      "class": "type-tag",
+      "outcome": "legacy",
+      "record": {
+        "oaip_subject": "claim@v1",
+        "predicate": "p",
+        "execution": "1784000000001-bbbb0002",
+        "effects": [
+          {
+            "path": "src/auth.py",
+            "status": "modified",
+            "after": "0000000000000000000000000000000000000000"
+          }
+        ]
+      },
+      "why": "the pre-0.1 subject blob had its own tag and also carries a member named `execution`; it is legacy, not an execution record with a broken version"
     }
   ]
 }

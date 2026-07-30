@@ -92,13 +92,20 @@ type tag" rule decidable by inspection.
 this order, and the order is normative because otherwise two readers disagree
 about which refusal to issue:
 
-1. If one or more of its member **names** is a registered type tag (§7.1), it is
-   a record of that type. Two or more such names ⇒ `invalid` (§6.2). A type tag
-   whose **value** is not a version string (`^[0-9]+\.[0-9]+$`) ⇒ `invalid`; the
-   type is known, its version is unreadable, and guessing one is exactly the move
-   this section exists to forbid.
-2. Otherwise, if it carries a member named `oaip_record` whose value matches
-   `^[a-z_]+@v[0-9]+$`, it is a **legacy** record (§6.4).
+1. If it carries a member named `oaip_record` (or `oaip_subject`) whose value
+   matches `^[a-z_]+@v[0-9]+$`, it is a **legacy** record (§6.4). This test comes
+   **first**, and the order is normative: a pre-0.1 execution record carries a
+   member named `intent` and a pre-0.1 claim one named `execution`, both of
+   which are v0.1 type tags. Testing the tags first classifies every legacy
+   execution as "an `execution` record whose version is an event id" and reports
+   an intact ledger as corrupt. (That collision is the same one that forced the
+   renames to `intent_id`/`execution_id` in §2.4/§2.5, met from the other side.)
+2. Otherwise, if one or more of its member **names** is a registered type tag
+   (§7.1), it is a record of that type. Two or more such names ⇒ `invalid`
+   (§6.2). A type tag whose **value** is not a version string
+   (`^[0-9]+\.[0-9]+$`) ⇒ `invalid`; the type is known, its version is
+   unreadable, and guessing one is exactly the move this section exists to
+   forbid.
 3. Otherwise, if it carries a **type-tag-shaped** member — a name matching
    `^[a-z][a-z0-9_]*$` whose value is a version string — it is `unknown-type`.
 4. Otherwise it is **not an OAIP record**, and a reader MUST NOT report it as a
@@ -595,8 +602,11 @@ for `objective`; `command`, `before_tree`, `after_tree`, `env_fp` for
 `Attribution` or probe records at all — effects and attributions were nested
 inside the execution record. Stores in that shape exist.
 
+The pre-0.1 claim subject blob carried its own tag, `oaip_subject`, and the
+same rules apply to it.
+
 - A v0.1 reader MAY implement a **legacy-read mode** that accepts
-  `oaip_record`-tagged records. Where it does, it MUST: interpret them under the
+  `oaip_record`- and `oaip_subject`-tagged records. Where it does, it MUST: interpret them under the
   legacy rules and never the v0.1 rules; mark everything derived from them as
   legacy-format in its projection and its reports, so that no reader mistakes a
   git tree `hex40` in an `input_state` position for a StateID; and **write only

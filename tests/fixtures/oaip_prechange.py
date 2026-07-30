@@ -841,519 +841,6 @@ def loads_ijson(raw):
             "walked cannot be canonicalized, hashed or compared") from None
 
 
-# ---------- record shapes (SPEC §1.1, §2, §6.2) ----------
-# WHY A SCHEMA LAYER EXISTS AT ALL (2026-07-30, O3)
-# ------------------------------------------------
-# Until this section, "conformance" in this repository meant `examples/
-# vectors.json`: byte-exact canonicalization over a handful of records, plus 25
-# byte sequences the loader must refuse. That pins the SERIALIZER and says
-# nothing about the RECORD — and the reference implementation was, in fact,
-# writing a different record for every type in SPEC §2 (`oaip_record:
-# "intent@v1"` with `description` where §2.3 declares `intent: "0.1"` with
-# `actor`/`constraints`/`acceptance_refs`; no State records at all; nested
-# effects; `check`/`check_exit`/`supported` where §2.7 declares `validation`).
-# Both halves passed every vector, because no vector ever looked at a shape.
-#
-# So the shapes are now code, the code is pinned by `examples/record-vectors.
-# json`, and every reader in this file runs them. The negative half is the half
-# that matters: an implementation that accepts everything passes every positive
-# vector, and the same is true one layer up — a validator that accepts every
-# object validates nothing.
-RECORD_TYPES = ("artifact", "attribution", "claim", "claim_subject", "effect",
-                "environment_probe", "execution", "intent", "state",
-                "toolchain_probe")
-RECORD_VERSION = "0.1"                  # the only version this reader knows
-LEGACY_TAG = "oaip_record"
-# The pre-0.1 claim-SUBJECT blob had its own tag, and it carries a member named
-# `execution` — a v0.1 type tag — so it needs the same first-position treatment
-# the record tag gets. Its legacy identity is prefixed `subject:` because its
-# tag value ("claim@v1") is the same string the legacy claim RECORD used.
-LEGACY_SUBJECT_TAG = "oaip_subject"
-_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+$")
-_TAGNAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-_LEGACY_RE = re.compile(r"^[a-z_]+@v[0-9]+$")
-HEX40 = re.compile(r"^[0-9a-f]{40}$")
-
-# §7 registries, as data. An unregistered value in a CLOSED field makes the
-# record invalid (§7): unknown-means-invalid is what stops a forward-dated value
-# from meaning "valid" here and "invalid" in a second implementation.
-EXECUTOR_RUNTIMES = {"exec@v1", "shell@v1"}
-VALIDATION_RUNTIMES = {"cmd@v1"}        # ski@v1 is RESERVED in claim 0.1 (§7.3)
-VALIDATION_RESERVED = {"ski@v1"}
-EFFECT_KINDS = {"file.create", "file.modify", "file.delete", "file.typechange"}
-ENV_PROFILES = {"posix-base@v1"}
-TOOLCHAIN_PROFILES = {"posix-base@v1"}
-# §2.2.1: exactly these five names, always present, absence encoded as null.
-ENV_PROFILE_VARS = ("LANG", "LC_ALL", "PATH", "SOURCE_DATE_EPOCH", "TZ")
-# §2.2.2: exactly this probe, in this order.
-TOOLCHAIN_PROFILE_TOOLS = ({"name": "git", "argv": ["git", "--version"]},)
-# §7.6: the ceiling is BELOW certainty on purpose — an observer that started one
-# process cannot exclude a writer it did not start.
-ATTRIBUTION_METHODS = {"exclusive-command-window": 999999}
-# §7.4's registered artifact kind for a record of each type. ONE table, used by
-# the writer and by the rebuild: they had two, and the rebuild's copy silently
-# relabelled every probe artifact ("record:environment_probe" against the
-# writer's "environment-probe"), which is a real post-rebuild difference in a
-# graph §5 says must be identical.
-ARTIFACT_KIND = {"environment_probe": "environment-probe",
-                 "toolchain_probe": "toolchain-probe",
-                 "claim_subject": "claim-subject"}
-
-
-def artifact_kind(record_type: str) -> str:
-    return ARTIFACT_KIND.get(record_type, "record:" + record_type)
-
-
-def classify_record(doc):
-    """SPEC §1.1: what IS this document? -> (outcome, type, version, detail).
-
-    outcome is one of: "record" (known type+version, shape not yet checked),
-    "unsupported-version", "unknown-type", "legacy", "invalid", "not-a-record".
-    The order of the tests is normative (§1.1) — without a fixed order two
-    readers issue two different refusals for one document."""
-    if not isinstance(doc, dict):
-        return "not-a-record", None, None, None
-    # THE LEGACY TAG IS TESTED FIRST, and that ordering is normative (§1.1).
-    # A pre-0.1 execution record carries a member named `intent` and a pre-0.1
-    # claim carries one named `execution` — both of which are v0.1 TYPE TAGS.
-    # Testing the type tags first therefore classified every legacy execution as
-    # "an execution record whose version is `1785439280731-5536ccfa`", and
-    # rebuild called a perfectly intact pre-0.1 ledger three corrupt artifacts.
-    # That collision is the same one that forced §2.4/§2.5 to rename those
-    # members to `intent_id`/`execution_id`, arriving from the other direction.
-    for member, prefix in ((LEGACY_TAG, ""), (LEGACY_SUBJECT_TAG, "subject:")):
-        v = doc.get(member)
-        if isinstance(v, str) and _LEGACY_RE.match(v):
-            return "legacy", prefix + v, None, None
-    tags = [k for k in doc if k in RECORD_TYPES]
-    if len(tags) > 1:
-        return ("invalid", None, None,
-                "carries " + str(len(tags)) + " type tags (" +
-                ", ".join(sorted(tags)) + "): a document that is two record "
-                "types is neither")
-    if tags:
-        t = tags[0]
-        v = doc[t]
-        if not (isinstance(v, str) and _VERSION_RE.match(v)):
-            return ("invalid", t, None,
-                    f"the type tag {t!r} carries {v!r}, which is not a version "
-                    "string — the type is known and its version is not, and "
-                    "guessing one is what §1.1 forbids")
-        if v != RECORD_VERSION:
-            return ("unsupported-version", t, v,
-                    f"{t} {v} is not a version this reader knows (it reads "
-                    f"{RECORD_VERSION}); it is neither valid nor corrupt")
-        return "record", t, v, None
-    for k, v in doc.items():
-        if (isinstance(k, str) and _TAGNAME_RE.match(k)
-                and isinstance(v, str) and _VERSION_RE.match(v)):
-            return ("unknown-type", k, v,
-                    f"{k!r} is not a registered OAIP record type (§7.1)")
-    return "not-a-record", None, None, None
-
-
-def _hex64(v):
-    return isinstance(v, str) and bool(HEX64.match(v))
-
-
-def _hex40(v):
-    return isinstance(v, str) and bool(HEX40.match(v))
-
-
-def _int(v):
-    return isinstance(v, int) and not isinstance(v, bool)
-
-
-def _text(v):
-    return isinstance(v, str) and v != ""
-
-
-def _closed(doc, required, optional=()):
-    """Members exactly `required`, plus at most `optional`. §1.1: an unknown
-    member makes the record invalid, because a member one reader ignores and
-    another reads is a member about which two readers derive different graphs
-    from identical bytes."""
-    have = set(doc)
-    unknown = sorted(have - set(required) - set(optional))
-    if unknown:
-        return f"unknown member(s) {', '.join(repr(u) for u in unknown)}"
-    missing = sorted(set(required) - have)
-    if missing:
-        return f"missing required member(s) {', '.join(repr(m) for m in missing)}"
-    return None
-
-
-def _hash_list(v, what, elem=_hex64, kind="hex64"):
-    if not isinstance(v, list):
-        return f"{what} must be an array"
-    for h in v:
-        if not elem(h):
-            return f"{what} must contain only {kind} values (found {h!r})"
-    if v != sorted(v):
-        return f"{what} must be sorted ascending (array order is significant)"
-    if len(set(v)) != len(v):
-        return f"{what} must not repeat a value"
-    return None
-
-
-def _v_artifact(d):
-    e = _closed(d, ("artifact", "hash", "kind", "size"))
-    if e:
-        return e
-    if not _hex64(d["hash"]):
-        return "hash must be hex64"
-    if not _text(d["kind"]):
-        return "kind must be a non-empty string"
-    if not _int(d["size"]) or d["size"] < 0:
-        return "size must be a non-negative integer"
-    return None
-
-
-def _v_state(d):
-    e = _closed(d, ("state", "repo_commit", "worktree_tree", "env_fingerprint",
-                    "toolchain_fingerprint"))
-    if e:
-        return e
-    if not (d["repo_commit"] is None or _hex40(d["repo_commit"])):
-        return "repo_commit must be hex40 or null (null = no commit yet)"
-    if not _hex40(d["worktree_tree"]):
-        return "worktree_tree must be a hex40 git tree id"
-    for f in ("env_fingerprint", "toolchain_fingerprint"):
-        if not _hex64(d[f]):
-            return f"{f} must be hex64 (§2.2.1/§2.2.2)"
-    return None
-
-
-def _v_environment_probe(d):
-    e = _closed(d, ("environment_probe", "profile", "os", "arch", "vars"))
-    if e:
-        return e
-    if d["profile"] not in ENV_PROFILES:
-        return (f"profile {d['profile']!r} is not registered (§7.5) — an "
-                "unregistered profile is a fingerprint nobody else can reproduce")
-    if not (_text(d["os"]) and _text(d["arch"])):
-        return "os and arch must be non-empty strings (§2.2.3)"
-    v = d["vars"]
-    if not isinstance(v, dict):
-        return "vars must be an object"
-    extra = sorted(set(v) - set(ENV_PROFILE_VARS))
-    missing = sorted(set(ENV_PROFILE_VARS) - set(v))
-    if extra or missing:
-        return ("vars must carry EXACTLY the profile's five names"
-                + (f"; unexpected {extra}" if extra else "")
-                + (f"; missing {missing} (absence is encoded as null, never by "
-                   "omitting the member)" if missing else ""))
-    for name in ENV_PROFILE_VARS:
-        if not (v[name] is None or isinstance(v[name], str)):
-            return f"vars.{name} must be a string or null"
-    return None
-
-
-def _v_toolchain_probe(d):
-    e = _closed(d, ("toolchain_probe", "profile", "tools"))
-    if e:
-        return e
-    if d["profile"] not in TOOLCHAIN_PROFILES:
-        return f"profile {d['profile']!r} is not registered (§7.5)"
-    tools = d["tools"]
-    if not isinstance(tools, list) or len(tools) != len(TOOLCHAIN_PROFILE_TOOLS):
-        return (f"tools must hold exactly {len(TOOLCHAIN_PROFILE_TOOLS)} probe(s), "
-                "in the profile's order")
-    for got, want in zip(tools, TOOLCHAIN_PROFILE_TOOLS):
-        if not isinstance(got, dict):
-            return "each tool must be an object"
-        err = _closed(got, ("name", "argv", "status", "stdout_sha256"))
-        if err:
-            return f"tool: {err}"
-        if got["name"] != want["name"] or got["argv"] != want["argv"]:
-            return (f"tool {got.get('name')!r} does not match the profile's probe "
-                    f"{want['name']!r} {want['argv']} — the probe set IS the "
-                    "profile")
-        if got["status"] not in ("ok", "absent", "error"):
-            return "tool.status must be ok | absent | error"
-        h = got["stdout_sha256"]
-        if got["status"] == "absent":
-            if h is not None:
-                return "an absent tool produced no stdout: stdout_sha256 must be null"
-        elif not _hex64(h):
-            return "stdout_sha256 must be hex64 unless the tool was absent"
-    return None
-
-
-def _v_intent(d):
-    e = _closed(d, ("intent", "id", "actor", "parent", "objective",
-                    "constraints", "acceptance_refs", "ts"))
-    if e:
-        return e
-    for f in ("id", "actor", "objective"):
-        if not _text(d[f]):
-            return f"{f} must be a non-empty string"
-    if not (d["parent"] is None or _text(d["parent"])):
-        return "parent must be an intent id or null"
-    if not (isinstance(d["constraints"], list)
-            and all(_text(c) for c in d["constraints"])):
-        return "constraints must be an array of non-empty strings"
-    err = _hash_list(d["acceptance_refs"], "acceptance_refs")
-    if err:
-        return err
-    if not _int(d["ts"]):
-        return "ts must be an integer (Unix seconds)"
-    return None
-
-
-def _v_execution(d):
-    e = _closed(d, ("execution", "id", "intent_id", "executor", "input_state",
-                    "output_state", "invocation", "environment", "status",
-                    "exit_code", "output", "ts"))
-    if e:
-        return e
-    if not _text(d["id"]):
-        return "id must be a non-empty string"
-    if not (d["intent_id"] is None or _text(d["intent_id"])):
-        return "intent_id must be an intent id or null"
-    ex = d["executor"]
-    if not isinstance(ex, dict):
-        return "executor must be an object"
-    err = _closed(ex, ("actor", "runtime"))
-    if err:
-        return f"executor: {err}"
-    if not _text(ex["actor"]):
-        return "executor.actor must be a non-empty string"
-    if ex["runtime"] not in EXECUTOR_RUNTIMES:
-        return (f"executor.runtime {ex['runtime']!r} is not registered (§7.2); "
-                "the runtime is what says how `invocation` is interpreted")
-    for f in ("input_state", "output_state", "environment"):
-        if not _hex64(d[f]):
-            return f"{f} must be hex64 (a StateID, §2.2)" if f.endswith("state") \
-                   else f"{f} must be hex64 (§2.2.1)"
-    inv = d["invocation"]
-    if not (isinstance(inv, list) and inv and all(isinstance(s, str) for s in inv)):
-        return ("invocation must be a non-empty array of strings — a joined "
-                "string cannot reconstruct an argv vector (§2.4)")
-    if ex["runtime"] == "shell@v1" and len(inv) != 1:
-        return ("shell@v1 takes EXACTLY one invocation element (the script); "
-                f"this record has {len(inv)}")
-    if d["status"] not in ("exited", "failed", "killed"):
-        return "status must be exited | failed | killed (§2.4)"
-    code = d["exit_code"]
-    if d["status"] == "exited":
-        if not _int(code) or not 0 <= code <= 255:
-            return "an exited process has an integer exit_code in 0..255"
-    elif code is not None:
-        return (f"a {d['status']} process never returned a code: exit_code must "
-                "be null")
-    if not (d["output"] is None or _hex64(d["output"])):
-        return ("output must be the hex64 address of the captured-output "
-                "artifact, or null where nothing was captured (§2.4)")
-    if not _int(d["ts"]):
-        return "ts must be an integer (Unix seconds)"
-    return None
-
-
-def _v_effect(d):
-    e = _closed(d, ("effect", "id", "execution_id", "kind", "target", "before",
-                    "after"), optional=("entities",))
-    if e:
-        return e
-    for f in ("id", "execution_id", "target"):
-        if not _text(d[f]):
-            return f"{f} must be a non-empty string"
-    if d["kind"] not in EFFECT_KINDS:
-        return (f"kind {d['kind']!r} is not registered (§7.4); a reader that "
-                "meets an unregistered kind cannot tell whether state was added "
-                "or removed")
-    for f in ("before", "after"):
-        if not (d[f] is None or _hex40(d[f])):
-            return f"{f} must be a hex40 git blob id or null"
-    b, a = d["before"], d["after"]
-    if d["kind"] == "file.create" and not (b is None and a is not None):
-        return "file.create requires before=null and a non-null after"
-    if d["kind"] == "file.delete" and not (a is None and b is not None):
-        return "file.delete requires after=null and a non-null before"
-    if d["kind"] in ("file.modify", "file.typechange"):
-        if b is None or a is None:
-            return f"{d['kind']} requires both before and after"
-        if b == a:
-            return f"{d['kind']} with before == after records no mutation"
-    if "entities" in d:
-        if not isinstance(d["entities"], list):
-            return "entities must be an array"
-        if d["entities"]:
-            return ("entities is RESERVED in effect 0.1 and must be empty — a "
-                    "v0.1 reader must never be handed semantics it will "
-                    "silently drop (§2.5)")
-    return None
-
-
-def _v_attribution(d):
-    e = _closed(d, ("attribution", "id", "effect_id", "cause", "method",
-                    "confidence_ppm", "support"))
-    if e:
-        return e
-    for f in ("id", "effect_id", "cause"):
-        if not _text(d[f]):
-            return f"{f} must be a non-empty string"
-    if d["method"] not in ATTRIBUTION_METHODS:
-        return (f"method {d['method']!r} is not registered (§7.6) — a confidence "
-                "number means nothing without a named, defined method")
-    c = d["confidence_ppm"]
-    if not _int(c) or not 0 <= c <= 1000000:
-        return "confidence_ppm must be an integer in 0..1000000 (no floats)"
-    cap = ATTRIBUTION_METHODS[d["method"]]
-    if c > cap:
-        return (f"confidence_ppm {c} exceeds the ceiling {cap} registered for "
-                f"{d['method']!r} (§7.6): the observer cannot exclude a writer "
-                "it did not start, so this method may not claim certainty")
-    err = _hash_list(d["support"], "support")
-    if err:
-        return err
-    return None
-
-
-def _v_claim(d):
-    e = _closed(d, ("claim", "id", "subject", "predicate", "evidence",
-                    "validation", "proposed_by", "ts"))
-    if e:
-        return e
-    for f in ("id", "predicate", "proposed_by"):
-        if not _text(d[f]):
-            return f"{f} must be a non-empty string"
-    if not _hex64(d["subject"]):
-        return "subject must be hex64 (the hash of a claim_subject, §2.8)"
-    err = _hash_list(d["evidence"], "evidence")
-    if err:
-        return err
-    v = d["validation"]
-    if not isinstance(v, dict):
-        return "validation must be an object"
-    err = _closed(v, ("runtime", "check", "verdict", "transcript"))
-    if err:
-        return f"validation: {err}"
-    if v["runtime"] in VALIDATION_RESERVED:
-        return (f"validation.runtime {v['runtime']!r} is RESERVED in claim 0.1 "
-                "(§7.3): a v0.1 verifier without a Σ-GLYPH oracle cannot "
-                "evaluate it, so admitting it would make conforming verifiers "
-                "disagree")
-    if v["runtime"] not in VALIDATION_RUNTIMES:
-        return f"validation.runtime {v['runtime']!r} is not registered (§7.3)"
-    for f in ("check", "transcript"):
-        if not _hex64(v[f]):
-            return (f"validation.{f} must be hex64 — the check is EVIDENCE, so "
-                    "the record cites the bytes that ran, not a description "
-                    "of them")
-    if v["verdict"] not in ("pass", "fail"):
-        return "validation.verdict must be pass | fail"
-    if not _int(d["ts"]):
-        return "ts must be an integer (Unix seconds)"
-    return None
-
-
-def _v_claim_subject(d):
-    e = _closed(d, ("claim_subject", "predicate", "execution_id", "effects"))
-    if e:
-        return e
-    for f in ("predicate", "execution_id"):
-        if not _text(d[f]):
-            return f"{f} must be a non-empty string"
-    effects = d["effects"]
-    if not isinstance(effects, list):
-        return "effects must be an array"
-    keys = []
-    for el in effects:
-        if not isinstance(el, dict):
-            return "each effects element must be an object"
-        err = _closed(el, ("target", "kind", "after"))
-        if err:
-            return f"effects element: {err}"
-        if not _text(el["target"]):
-            return "effects[].target must be a non-empty string"
-        if el["kind"] not in EFFECT_KINDS:
-            return f"effects[].kind {el['kind']!r} is not registered (§7.4)"
-        if not (el["after"] is None or _hex40(el["after"])):
-            return "effects[].after must be a hex40 git blob id or null"
-        keys.append((el["target"], el["kind"]))
-    if keys != sorted(keys):
-        return ("effects must be sorted by (target, kind): array order is "
-                "significant in JCS, and this array's hash IS the decision's "
-                "subject (§2.8)")
-    if len(set(keys)) != len(keys):
-        return "effects must not repeat a (target, kind) pair"
-    return None
-
-
-VALIDATORS = {
-    "artifact": _v_artifact,
-    "attribution": _v_attribution,
-    "claim": _v_claim,
-    "claim_subject": _v_claim_subject,
-    "effect": _v_effect,
-    "environment_probe": _v_environment_probe,
-    "execution": _v_execution,
-    "intent": _v_intent,
-    "state": _v_state,
-    "toolchain_probe": _v_toolchain_probe,
-}
-
-
-def validate_record(doc):
-    """SPEC §6.2 -> (outcome, type, version, detail).
-
-    outcome ∈ {valid, invalid, unsupported-version, unknown-type, legacy,
-    not-a-record}. `unsupported-version` and `unknown-type` are DISTINCT from
-    both valid and invalid and callers must keep them so: collapsing them into
-    "valid" reads a record this code does not understand, and collapsing them
-    into "invalid" calls a future record corrupt, which makes a
-    forward-compatible writer indistinguishable from an attacker."""
-    outcome, t, v, detail = classify_record(doc)
-    if outcome != "record":
-        return outcome, t, v, detail
-    err = VALIDATORS[t](doc)
-    return ("invalid" if err else "valid"), t, v, err
-
-
-# ---------- SPEC §6.4 legacy-read mode ----------
-# Stores written before the record formats were pinned exist, and this is the
-# read side of the migration. Three rules from §6.4 hold here and are the whole
-# design:
-#   * legacy records are interpreted under the LEGACY rules, never the v0.1
-#     ones. A legacy execution's `before_tree` is a git TREE id, and putting it
-#     in an `input_state` column without saying so would teach every downstream
-#     reader that a StateID is 40 characters long;
-#   * everything derived from one is MARKED legacy in the projection (the
-#     `format` column) and in `oaip log`; and
-#   * nothing is rewritten. The record is addressed by the hash of its own
-#     bytes, the Warrant store cites that address, and a "migration" that
-#     rewrites it produces a different record at a different address while
-#     breaking the citation.
-# The writer emits only v0.1 (§6.4: migration is read-side).
-LEGACY_FORMAT = "oaip_record@v1"
-_LEGACY_SHAPES = {
-    "intent@v1": ("id", "description", "parent", "ts"),
-    "execution@v1": ("id", "intent", "command", "exit_code", "before_tree",
-                     "after_tree", "env_fp", "stdout", "ts", "effects"),
-    "claim@v1": ("id", "execution", "predicate", "check", "check_exit",
-                 "supported", "transcript", "subject", "ts"),
-    "subject:claim@v1": ("predicate", "execution", "effects"),
-}
-
-
-def legacy_shape_ok(doc, tag):
-    """Is this really the pre-0.1 record it claims to be?
-
-    A legacy record gets no schema pass just for being old: reading a document
-    whose shape was never checked is how the projection came to assert whatever
-    members happened to be present. What it gets is the OLD schema, applied as
-    strictly as the new one."""
-    want = _LEGACY_SHAPES.get(tag)
-    if want is None:
-        return f"{tag} is not a record type this legacy reader knows"
-    missing = [f for f in want if f not in doc]
-    if missing:
-        return (f"a legacy {tag} without {', '.join(missing)} is not a "
-                f"{tag}")
-    return None
-
-
 def read_artifact(path: Path):
     """Load an artifact, refusing bytes that do not hash to their own address.
 
@@ -1626,145 +1113,17 @@ def workspace_snapshot() -> str:
     return tree
 
 
-# ---------- the fingerprints, per SPEC §2.2.1 / §2.2.2 ----------
-# WHAT THIS REPLACED, AND WHY IT COULD NOT STAY
-# ---------------------------------------------
-# The old `env_fingerprint()` hashed `{uname -sm, git --version, python
-# --version}` under no declared profile, and SPEC §2.2 named the field without
-# ever saying what went into it. Two consequences, both interop-fatal:
-#   * a second implementation could not compute the same StateID, so no third
-#     party could produce an interoperable State record — the review's
-#     deficiency #5, and the reason the whole record layer was untestable
-#     against anything but itself; and
-#   * a Go or Rust implementation hashing ITS OWN runtime version would have
-#     disagreed with this one about the same host, by construction.
-# So the probe set is a REGISTERED PROFILE (§7.5) carried inside the hashed
-# record, the probes are specified as commands rather than as host APIs (`uname
-# -s` says `Darwin` where a Python API says `darwin`), the implementation's own
-# interpreter is deliberately NOT probed, and §2.2.1 states in as many words
-# which five variables the profile covers and that everything else can change
-# what a command does without changing this number.
-_TRIM = "\t\n\r "
-
-
-def _uname(flag: str) -> str:
-    """A §2.2.3 capture: stdout of `uname <flag>`, trailing ASCII space trimmed.
-
-    Fails CLOSED rather than substituting anything. A replacement character
-    chosen here and a different one chosen by a second implementation are two
-    fingerprints for one environment, which is the defect this section exists
-    to close."""
-    try:
-        r = subprocess.run(["uname", flag], capture_output=True)
-    except OSError as e:
-        sys.exit(f"cannot run `uname {flag}` ({e}) — SPEC §2.2.3 defines this "
-                 "observer's `os`/`arch` as that command's output, so without it "
-                 "no State can be honestly fingerprinted on this host")
-    if r.returncode != 0:
-        sys.exit(f"`uname {flag}` exited {r.returncode}; refusing to invent an "
-                 "environment fingerprint")
-    try:
-        value = r.stdout.decode("utf-8").rstrip(_TRIM)
-    except UnicodeDecodeError:
-        sys.exit(f"`uname {flag}` did not emit UTF-8; SPEC §2.2.1 refuses a "
-                 "fingerprint rather than substituting a replacement character, "
-                 "because two implementations would substitute differently")
-    if not value:
-        sys.exit(f"`uname {flag}` printed nothing")
-    return value
-
-
-def environment_probe():
-    """(record, hex64) — SPEC §2.2.1, profile `posix-base@v1`."""
-    env_bytes = getattr(os, "environb", None)
-    variables = {}
-    for name in ENV_PROFILE_VARS:
-        if env_bytes is not None:
-            raw = env_bytes.get(name.encode("ascii"))
-            if raw is None:
-                variables[name] = None          # unset — NOT "" (§2.2.1)
-                continue
-            try:
-                variables[name] = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                sys.exit(f"${name} is not valid UTF-8; SPEC §2.2.1 refuses to "
-                         "fingerprint an environment it cannot encode exactly")
-        else:                                   # no os.environb (non-POSIX)
-            variables[name] = os.environ.get(name)
-    rec = {"environment_probe": "0.1", "profile": "posix-base@v1",
-           "os": _uname("-s"), "arch": _uname("-m"), "vars": variables}
-    return rec, sha256(canon(rec))
-
-
-def toolchain_probe():
-    """(record, hex64) — SPEC §2.2.2, profile `posix-base@v1`.
-
-    One probe. A profile that listed every tool this implementation happens to
-    use would be a profile only this implementation could reproduce."""
-    tools = []
-    for spec in TOOLCHAIN_PROFILE_TOOLS:
-        argv = list(spec["argv"])
-        try:
-            r = subprocess.run(argv, capture_output=True)
-        except FileNotFoundError:
-            status, out = "absent", None
-        except OSError:
-            status, out = "error", b""
-        else:
-            status = "ok" if r.returncode == 0 else "error"
-            out = r.stdout
-        tools.append({"name": spec["name"], "argv": argv, "status": status,
-                      "stdout_sha256": None if out is None else sha256(out)})
-    rec = {"toolchain_probe": "0.1", "profile": "posix-base@v1", "tools": tools}
-    return rec, sha256(canon(rec))
-
-
-def snapshot_state():
-    """Build, STORE and return (StateID, state record) — SPEC §2.2.
-
-    The probe records are stored too, and that is not housekeeping: §2.2.4 gives
-    a verifier three outcomes, and without the probe record the only one
-    available to any reader is `unreproducible`. A fingerprint whose inputs
-    nobody can see is an opaque number wearing the word "fingerprint"."""
-    tree = workspace_snapshot()
-    try:
-        commit = git("rev-parse", "HEAD")
-    except RuntimeError:
-        commit = None                   # a repository with no commit yet
-    if commit is not None and not HEX40.match(commit):
-        commit = None
-    envr, envh = environment_probe()
-    toolr, toolh = toolchain_probe()
-    put_artifact(canon(envr), artifact_kind("environment_probe"))
-    put_artifact(canon(toolr), artifact_kind("toolchain_probe"))
-    state = {"state": "0.1", "repo_commit": commit, "worktree_tree": tree,
-             "env_fingerprint": envh, "toolchain_fingerprint": toolh}
-    return put_artifact(canon(state), "record:state"), state
-
-
-def default_actor() -> str:
-    """A best-effort `<user>@<host>` for the CLI's `--actor` default.
-
-    SPEC §8 is explicit that every actor string in an OAIP record is
-    UNAUTHENTICATED, so requiring the operator to type one would move the
-    fiction rather than remove it; the OS user and host are at least what this
-    process actually ran as. `oaip do` still requires it, because that path
-    files a signed warrant and the name goes into somebody's decision."""
-    try:
-        import getpass
-        import socket
-        return f"{getpass.getuser()}@{socket.gethostname()}"
-    except Exception:                   # a container with no passwd entry, etc.
-        return "unknown@unknown"
-
-
-# git's diff-tree status letters -> registered §7.4 effect kinds.
-_EFFECT_KIND = {"A": "file.create", "M": "file.modify", "D": "file.delete",
-                "T": "file.typechange"}
+def env_fingerprint() -> str:
+    manifest = {
+        "uname": subprocess.run(["uname", "-sm"], capture_output=True, text=True).stdout.strip(),
+        "git": git("--version"),
+        "python": sys.version.split()[0],
+    }
+    return sha256(json.dumps(manifest, sort_keys=True).encode())
 
 
 def effects_between(before_tree: str, after_tree: str):
-    """Per-file mutations as §2.5 (target, kind, before, after) via diff-tree."""
+    """Per-file mutations: (path, status, before_blob, after_blob) via diff-tree."""
     out = git("diff-tree", "-r", "--no-commit-id", before_tree, after_tree)
     for line in out.splitlines():
         if not line:
@@ -1772,43 +1131,15 @@ def effects_between(before_tree: str, after_tree: str):
         meta, path = line.split("\t", 1)
         _, _, before_blob, after_blob, status = meta.split()[:5]
         zero = "0" * 40
-        kind = _EFFECT_KIND.get(status[0])
-        if kind is None:
-            # §7.4 is a CLOSED registry, so there is no honest way to write this
-            # mutation down. Refusing names the gap; inventing a kind would put a
-            # value in the ledger that no conforming reader can interpret.
-            sys.exit(f"git reported diff status {status!r} for {path!r}, which "
-                     "has no registered OAIP effect kind (SPEC §7.4). Refusing "
-                     "to record a mutation this format cannot express.")
         yield {
-            "target": path,
-            "kind": kind,
-            "before": None if before_blob == zero else before_blob,
-            "after": None if after_blob == zero else after_blob,
+            "path": path,
+            "status": {"A": "created", "M": "modified", "D": "deleted"}.get(status[0], status),
+            "before_blob": None if before_blob == zero else before_blob,
+            "after_blob": None if after_blob == zero else after_blob,
         }
 
 
 # ---------- ledger (SQLite projection) ----------
-# What every table must carry for this build to read the projection at all. A
-# ledger.db written by the pre-0.1 code has `intents.description` where this one
-# has `intents.objective`, so every read command would die with a bare
-# `sqlite3.OperationalError: no such column` — a traceback where the answer is
-# one sentence long, and the same defect class this file has closed four times.
-_SCHEMA_PROBE = {"intents": "objective", "executions": "invocation",
-                 "claims": "verdict", "states": "worktree_tree"}
-
-
-def projection_is_current(con) -> bool:
-    for table, column in _SCHEMA_PROBE.items():
-        try:
-            cols = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
-        except sqlite3.Error:
-            return False
-        if column not in cols:
-            return False
-    return True
-
-
 def db(path=None, create=False):
     # An uninitialised (or blocked) ledger is a DIAGNOSIS. `sqlite3.connect`
     # raises a bare `OperationalError: unable to open database file` when the
@@ -1827,14 +1158,6 @@ def db(path=None, create=False):
     # (F10, 2026-07-30); the lock below is the real serialisation, this is the
     # backstop for every other command that touches the projection.
     con.execute("PRAGMA busy_timeout=10000")
-    if path is None and not create and not projection_is_current(con):
-        con.close()
-        sys.exit(f"the projection at {DB} was written by an older OAIP and its "
-                 "columns are the pre-0.1 record's, not SPEC §2's. Nothing is "
-                 "lost and nothing needs converting: the projection is "
-                 "DISPOSABLE by §5 and the canonical layer is untouched. Run "
-                 "`oaip rebuild` to derive a current one — it reads pre-0.1 "
-                 "records too (§6.4) and marks every row it derives from them.")
     return con
 
 
@@ -1925,41 +1248,22 @@ def require_trusted_projection():
              "itself has been left untouched for inspection).")
 
 
-# The projection's column names are the RECORD's field names (SPEC §5). They
-# were not: `command`/`before_tree`/`after_tree`/`env_fp`/`check_cmd`/
-# `check_exit`/`supported` were a second, unversioned vocabulary sitting next to
-# §2's, and `tools/intoto.py` followed THEM against the specification, with a
-# comment saying so. A projection whose columns contradict the records it
-# projects is how that happens.
-#
-# `format` exists so nothing here can silently conflate a v0.1 record with a
-# pre-0.1 one read through §6.4 legacy mode: a legacy execution's
-# `input_state` holds a git TREE id, not a StateID, and a column that cannot
-# say which is which invites exactly the misreading §6.4 forbids.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS intents(
-  id TEXT PRIMARY KEY, actor TEXT, objective TEXT NOT NULL, parent_id TEXT,
-  constraints TEXT, acceptance_refs TEXT, created_at INTEGER, format TEXT);
-CREATE TABLE IF NOT EXISTS states(
-  id TEXT PRIMARY KEY, repo_commit TEXT, worktree_tree TEXT,
-  env_fingerprint TEXT, toolchain_fingerprint TEXT);
+  id TEXT PRIMARY KEY, description TEXT NOT NULL, parent_id TEXT, created_at INTEGER);
 CREATE TABLE IF NOT EXISTS executions(
-  id TEXT PRIMARY KEY, intent_id TEXT, actor TEXT, runtime TEXT,
-  invocation TEXT NOT NULL, status TEXT, exit_code INTEGER, input_state TEXT,
-  output_state TEXT, environment TEXT, output TEXT, created_at INTEGER,
-  format TEXT);
+  id TEXT PRIMARY KEY, intent_id TEXT, command TEXT NOT NULL, exit_code INTEGER,
+  before_tree TEXT, after_tree TEXT, env_fp TEXT, stdout_hash TEXT, created_at INTEGER);
 CREATE TABLE IF NOT EXISTS effects(
-  id TEXT PRIMARY KEY, execution_id TEXT, kind TEXT, target TEXT,
+  id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id TEXT, path TEXT, status TEXT,
   before_blob TEXT, after_blob TEXT);
 CREATE TABLE IF NOT EXISTS artifacts(
   hash TEXT PRIMARY KEY, kind TEXT, size INTEGER);
 CREATE TABLE IF NOT EXISTS attributions(
-  id TEXT PRIMARY KEY, effect_id TEXT, cause TEXT, method TEXT,
-  confidence_ppm INTEGER);
+  effect_id INTEGER, cause TEXT, method TEXT, confidence_ppm INTEGER);
 CREATE TABLE IF NOT EXISTS claims(
-  id TEXT PRIMARY KEY, execution_id TEXT, predicate TEXT, runtime TEXT,
-  check_hash TEXT, verdict TEXT, transcript_hash TEXT, subject_hash TEXT,
-  evidence TEXT, proposed_by TEXT, created_at INTEGER, format TEXT);
+  id TEXT PRIMARY KEY, execution_id TEXT, predicate TEXT, check_cmd TEXT,
+  check_exit INTEGER, transcript_hash TEXT, subject_hash TEXT, supported INTEGER, created_at INTEGER);
 -- UNIQUE because this is the protocol's central edge and it had no constraint at
 -- all: four concurrent rebuilds wrote four identical rows for one store record
 -- and nothing downstream could tell that from four acceptances (F10, 2026-07-30).
@@ -2025,22 +1329,6 @@ def cmd_init(_):
     print(f"initialized .oaip (ledger + warrant store + dev key)")
 
 
-def store_record(rec, ts=None):
-    """Canonicalize, VALIDATE, store. Returns the artifact hash.
-
-    The writer runs the same validator every reader runs. Not belt-and-braces:
-    for the whole life of this file the writer emitted records no reader of the
-    SPECIFICATION could parse, and nothing in the repository was positioned to
-    notice. A writer that does not check its own output against the schema is
-    exactly the position this branch is here to leave."""
-    outcome, t, _v, detail = validate_record(rec)
-    if outcome != "valid":
-        sys.exit(f"refusing to write a record this implementation's own reader "
-                 f"would reject ({outcome}: {detail}). This is a bug in "
-                 f"impl/oaip.py, not in your ledger.")
-    return put_artifact(canon(rec), artifact_kind(t))
-
-
 def cmd_intent(a):
     i = kid()
     con = db()
@@ -2053,175 +1341,97 @@ def cmd_intent(a):
     # content-addressed. Demonstrated 2026-07-30 by deleting ledger.db. The
     # projection was the source of truth, which is the one thing §5 forbids, and
     # the opposite of the SPEC's own closing line.
-    actor = getattr(a, "actor", None) or default_actor()
-    constraints = list(getattr(a, "constraint", None) or [])
-    refs = sorted(set(getattr(a, "acceptance_ref", None) or []))
-    for h in refs:
-        if not HEX64.match(h):
-            sys.exit(f"--acceptance-ref {h!r} is not a hex64 artifact hash "
-                     "(SPEC §2.3: acceptance_refs cite artifacts by address)")
-    store_record({"intent": "0.1", "id": i, "actor": actor,
-                  "parent": a.parent, "objective": a.description,
-                  "constraints": constraints, "acceptance_refs": refs,
-                  "ts": ts})
-    con.execute("""INSERT INTO intents(id,actor,objective,parent_id,constraints,
-                   acceptance_refs,created_at,format) VALUES (?,?,?,?,?,?,?,?)""",
-                (i, actor, a.description, a.parent,
-                 canon(constraints).decode(), canon(refs).decode(), ts, "0.1"))
+    put_artifact(canon({"oaip_record": "intent@v1", "id": i,
+                        "description": a.description, "parent": a.parent,
+                        "ts": ts}), "record:intent")
+    con.execute("INSERT INTO intents(id, description, parent_id, created_at) VALUES (?,?,?,?)",
+                (i, a.description, a.parent, ts))
     con.commit()
     print(i)
     return i
 
 
-def _record_state(con, sid, state):
-    con.execute("""INSERT OR REPLACE INTO states(id,repo_commit,worktree_tree,
-                   env_fingerprint,toolchain_fingerprint) VALUES (?,?,?,?,?)""",
-                (sid, state["repo_commit"], state["worktree_tree"],
-                 state["env_fingerprint"], state["toolchain_fingerprint"]))
-
-
 def cmd_run(a):
-    if not a.command:
-        sys.exit("nothing to run: give a command after `--`")
-    db()                                # refuse early if there is no ledger
-    before_id, before = snapshot_state()
-    # WHY status/exit_code ARE COMPUTED AND NOT ASSUMED (SPEC §2.4). The old code
-    # was `subprocess.run(a.command)` with the return code copied straight into
-    # the record, so a command that did not exist raised FileNotFoundError and
-    # replaced the observation with a traceback, and a command killed by a signal
-    # was recorded as having "exited" with the negative number Python uses for
-    # that. §2.4's three statuses exist precisely so neither is written down as
-    # something it was not.
-    try:
-        proc = subprocess.run(a.command, capture_output=True, text=True)
-    except OSError as e:
-        status, code, out = "failed", None, f"{type(e).__name__}: {e}\n"
-    else:
-        out = proc.stdout + proc.stderr
-        if 0 <= proc.returncode <= 255:
-            status, code = "exited", proc.returncode
-        else:
-            status, code = "killed", None
-    after_id, after = snapshot_state()
-    stdout_hash = put_artifact(out.encode(), "stdout")
+    before = workspace_snapshot()
+    env_fp = env_fingerprint()
+    proc = subprocess.run(a.command, capture_output=True, text=True)
+    after = workspace_snapshot()
+    stdout_hash = put_artifact((proc.stdout + proc.stderr).encode(), "stdout")
     eid = kid()
-    ts = int(time.time())
-    actor = getattr(a, "actor", None) or default_actor()
-    store_record({
-        "execution": "0.1", "id": eid, "intent_id": a.intent,
-        "executor": {"actor": actor, "runtime": "exec@v1"},
-        "input_state": before_id, "output_state": after_id,
-        "invocation": list(a.command), "environment": before["env_fingerprint"],
-        "status": status, "exit_code": code, "output": stdout_hash,
-        "ts": ts})
-    # Effect and Attribution are SEPARATE records (§2.5, §2.6), not members
-    # nested inside the execution. They were nested, which made an Attribution
-    # unciteable: §2.6 gives it an `effect_id`, and a causal claim that cannot be
-    # addressed cannot be disputed, superseded or cited as support.
-    #
-    # EVERY artifact is written BEFORE the projection transaction opens.
-    # `put_artifact` uses its own connection, so writing one from inside an open
-    # write transaction deadlocks against this process's own lock — which it did,
-    # the first time these records became separate artifacts.
-    rows = []
-    for e in effects_between(before["worktree_tree"], after["worktree_tree"]):
-        fid, aid = kid(), kid()
-        store_record({"effect": "0.1", "id": fid, "execution_id": eid,
-                      "kind": e["kind"], "target": e["target"],
-                      "before": e["before"], "after": e["after"],
-                      "entities": []})
-        # exclusive-window attribution: we wrapped the command -> high confidence,
-        # capped BELOW certainty by §7.6 because we did not start every writer.
-        store_record({"attribution": "0.1", "id": aid, "effect_id": fid,
-                      "cause": eid, "method": "exclusive-command-window",
-                      "confidence_ppm": 999000, "support": [stdout_hash]})
-        rows.append((fid, aid, e))
-    n = len(rows)
     con = db()
-    _record_state(con, before_id, before)
-    _record_state(con, after_id, after)
-    con.execute("""INSERT INTO executions(id,intent_id,actor,runtime,invocation,
-                   status,exit_code,input_state,output_state,environment,
-                   output,created_at,format)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (eid, a.intent, actor, "exec@v1", canon(list(a.command)).decode(),
-                 status, code, before_id, after_id, before["env_fingerprint"],
-                 stdout_hash, ts, "0.1"))
-    for fid, aid, e in rows:
-        con.execute("""INSERT INTO effects(id,execution_id,kind,target,
-                       before_blob,after_blob) VALUES (?,?,?,?,?,?)""",
-                    (fid, eid, e["kind"], e["target"], e["before"], e["after"]))
-        con.execute("""INSERT INTO attributions(id,effect_id,cause,method,
-                       confidence_ppm) VALUES (?,?,?,?,?)""",
-                    (aid, fid, eid, "exclusive-command-window", 999000))
+    ts = int(time.time())
+    effects = list(effects_between(before, after))
+    # One canonical artifact carrying the execution AND its effects and
+    # attributions, so the whole causal step survives the projection (§5).
+    put_artifact(canon({
+        "oaip_record": "execution@v1", "id": eid, "intent": a.intent,
+        "command": " ".join(a.command), "exit_code": proc.returncode,
+        "before_tree": before, "after_tree": after, "env_fp": env_fp,
+        "stdout": stdout_hash, "ts": ts,
+        "effects": [{"path": e["path"], "status": e["status"],
+                     "before": e["before_blob"], "after": e["after_blob"],
+                     # Attribution travels with the effect it explains: a causal
+                     # claim separated from what it explains is not recoverable.
+                     "attribution": {"cause": eid,
+                                     "method": "exclusive-command-window",
+                                     "confidence_ppm": 999000}}
+                    for e in effects],
+    }), "record:execution")
+    con.execute("""INSERT INTO executions(id,intent_id,command,exit_code,before_tree,after_tree,
+                   env_fp,stdout_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+                (eid, a.intent, " ".join(a.command), proc.returncode, before, after,
+                 env_fp, stdout_hash, ts))
+    n = 0
+    for e in effects:
+        cur = con.execute("""INSERT INTO effects(execution_id,path,status,before_blob,after_blob)
+                             VALUES (?,?,?,?,?)""",
+                          (eid, e["path"], e["status"], e["before_blob"], e["after_blob"]))
+        # exclusive-window attribution: we wrapped the command -> high confidence
+        con.execute("INSERT INTO attributions(effect_id,cause,method,confidence_ppm) VALUES (?,?,?,?)",
+                    (cur.lastrowid, eid, "exclusive-command-window", 999000))
+        n += 1
     con.commit()
-    # Both identities are printed because they are two different things and the
-    # ledger now holds both: `in`/`out` are §2.2 StateIDs (SHA-256 over the whole
-    # State record, fingerprints included), `before_tree`/`after_tree` are the
-    # git tree objects inside them. Printing only one taught a reader to treat a
-    # tree id as a StateID, which is exactly the confusion §6.4 has to warn about
-    # for legacy records.
-    print(f"execution {eid}  status={status} exit={code}  effects={n}  "
-          f"in={before_id[:10]} out={after_id[:10]}  "
-          f"before_tree={before['worktree_tree'][:10]} "
-          f"after_tree={after['worktree_tree'][:10]}")
+    print(f"execution {eid}  exit={proc.returncode}  effects={n}  before={before[:10]} after={after[:10]}")
     return eid
 
 
 def cmd_claim(a):
     con = db()
-    ex = con.execute("SELECT output FROM executions WHERE id=?",
-                     (a.execution,)).fetchone()
+    ex = con.execute("SELECT id FROM executions WHERE id=?", (a.execution,)).fetchone()
     if not ex:
         sys.exit(f"no execution {a.execution}")
-    # The check is EVIDENCE, so it is stored and cited by hash (§2.7). It used to
-    # be echoed into the record as text, which describes a check without being
-    # one: a reader could not fetch the bytes that ran and re-run them.
-    check_hash = put_artifact(a.check.encode(), "check")
     # validation check — SEPARATE from execution success (exit_code=0 earns nothing)
     chk = subprocess.run(a.check, shell=True, capture_output=True, text=True)
-    transcript_hash = put_artifact((chk.stdout + chk.stderr).encode(),
-                                   "check-transcript")
-    verdict = "pass" if chk.returncode == 0 else "fail"
-    # content-addressed claim subject (what the decision is ABOUT), §2.8. Sorted
-    # by (target, kind) because array order is significant in JCS and this
-    # array's hash is the address §3 files the decision under.
-    effects = sorted(
-        ((r[0], r[1], r[2]) for r in
-         con.execute("SELECT target,kind,after_blob FROM effects "
-                     "WHERE execution_id=?", (a.execution,))),
-        key=lambda r: (r[0], r[1]))
-    subject = {"claim_subject": "0.1", "predicate": a.predicate,
-               "execution_id": a.execution,
-               "effects": [{"target": t, "kind": k, "after": af}
-                           for t, k, af in effects]}
-    outcome, _t, _v, detail = validate_record(subject)
-    if outcome != "valid":
-        sys.exit(f"refusing to write a claim subject this reader would reject "
-                 f"({detail})")
-    subject_hash = put_artifact(canon(subject),
-                                artifact_kind("claim_subject"))  # JCS, §1
+    transcript_hash = put_artifact((chk.stdout + chk.stderr).encode(), "check-transcript")
+    supported = 1 if chk.returncode == 0 else 0
+    # content-addressed claim subject (what the decision is ABOUT)
+    subject = {
+        "oaip_subject": "claim@v1",
+        "predicate": a.predicate,
+        "execution": a.execution,
+        "effects": [dict(path=r[0], status=r[1], after=r[2]) for r in
+                    con.execute("SELECT path,status,after_blob FROM effects WHERE execution_id=?",
+                                (a.execution,)).fetchall()],
+    }
+    subject_hash = put_artifact(canon(subject), "claim-subject")   # JCS, SPEC §1
     cid = kid()
-    evidence = sorted({h for h in (ex[0],) if isinstance(h, str)})
-    ts = int(time.time())
-    proposed_by = getattr(a, "actor", None) or default_actor()
-    store_record({"claim": "0.1", "id": cid, "subject": subject_hash,
-                  "predicate": a.predicate, "evidence": evidence,
-                  "validation": {"runtime": "cmd@v1", "check": check_hash,
-                                 "verdict": verdict,
-                                 "transcript": transcript_hash},
-                  "proposed_by": proposed_by, "ts": ts})
-    con.execute("""INSERT INTO claims(id,execution_id,predicate,runtime,check_hash,
-                   verdict,transcript_hash,subject_hash,evidence,proposed_by,
-                   created_at,format) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (cid, a.execution, a.predicate, "cmd@v1", check_hash, verdict,
-                 transcript_hash, subject_hash, canon(evidence).decode(),
-                 proposed_by, ts, "0.1"))
+    # The claim record itself, not only its subject: check command, exit code,
+    # verdict and transcript are the §4 evidence that execution success is not
+    # acceptance, and they were projection-only until now.
+    put_artifact(canon({"oaip_record": "claim@v1", "id": cid,
+                        "execution": a.execution, "predicate": a.predicate,
+                        "check": a.check, "check_exit": chk.returncode,
+                        "supported": bool(supported), "transcript": transcript_hash,
+                        "subject": subject_hash, "ts": int(time.time())}),
+                 "record:claim")
+    con.execute("""INSERT INTO claims(id,execution_id,predicate,check_cmd,check_exit,
+                   transcript_hash,subject_hash,supported,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+                (cid, a.execution, a.predicate, a.check, chk.returncode,
+                 transcript_hash, subject_hash, supported, int(time.time())))
     con.commit()
     print(f"claim {cid}  predicate={a.predicate}  check_exit={chk.returncode}  "
-          f"verdict={verdict}  "
-          f"{'SUPPORTED' if verdict == 'pass' else 'UNSUPPORTED (check failed)'}")
-    return cid, verdict == "pass"
+          f"{'SUPPORTED' if supported else 'UNSUPPORTED (check failed)'}")
+    return cid, bool(supported)
 
 
 def cmd_accept(a):
@@ -2235,14 +1445,12 @@ def cmd_accept(a):
 
 def _accept(a):
     con = db()
-    c = con.execute("""SELECT predicate,runtime,check_hash,verdict,transcript_hash,
-                       subject_hash,evidence FROM claims WHERE id=?""",
-                    (a.claim,)).fetchone()
+    c = con.execute("""SELECT predicate,check_cmd,check_exit,transcript_hash,subject_hash,supported
+                       FROM claims WHERE id=?""", (a.claim,)).fetchone()
     if not c:
         sys.exit(f"no claim {a.claim}")
-    (predicate, runtime, check_hash, verdict, transcript_hash, subject_hash,
-     evidence_json) = c
-    if verdict != "pass":
+    predicate, check_cmd, check_exit, transcript_hash, subject_hash, supported = c
+    if not supported:
         sys.exit("refusing to accept: the claim's validation check did NOT pass "
                  "(execution success is not acceptance)")
     # materialize the subject + policy + check blob + transcript as warrant blobs
@@ -2255,26 +1463,10 @@ def _accept(a):
     if not policy.exists():
         policy.write_text("OAIP decision policy v0: accept requires a passing validation check.\n")
     pol = w("blob", "add", str(policy)).stdout.strip()
-    # The check blob is materialized from the ARTIFACT, byte for byte, rather
-    # than re-rendered from a command string in a table: the whole reason §2.7
-    # cites it by hash is that the warrant's `because[].check` and the claim's
-    # `validation.check` must be the same bytes.
     checkfile = OAIP / "check.tmp"
-    checkfile.write_bytes((ART / check_hash).read_bytes())
+    checkfile.write_text(check_cmd + "\n")
     transcript_file = OAIP / "transcript.tmp"
     transcript_file.write_bytes((ART / transcript_hash).read_bytes())
-    # §3: `evidence` = the claim's evidence artifact hashes. They were never
-    # passed, so the bridge filed a decision citing none of the provenance it
-    # exists to cite. Blob-added from the artifact files so they RESOLVE in the
-    # store rather than dangling as unresolved references.
-    ev_args = []
-    try:
-        for h in json.loads(evidence_json or "[]"):
-            p = ART / h
-            if p.is_file():
-                ev_args += ["--evidence", str(p)]
-    except ValueError:
-        pass
     # The subject blob is the claim's SUBJECT, and two claims can share one:
     # {predicate, execution, effects} excludes the check command and verdict, so
     # `--check true` and `--check false` over the same execution collide. A
@@ -2286,11 +1478,9 @@ def _accept(a):
     # note fall back to subject-hash matching restricted to supported claims.
     r = w("accept", "--subject", subj, "--under", pol,
           "--check", str(checkfile), "--verdict", "pass",
-          "--runtime", runtime or "cmd@v1",
           "--transcript", str(transcript_file),
           "--reason", f"claim: {predicate}",
           "--note", f"oaip-claim:{a.claim}",
-          *ev_args,
           "--actor", a.actor, "--key", str(WKEY))
     wid = r.stdout.strip()
     for f in (subj_file, checkfile, transcript_file):
@@ -2410,11 +1600,9 @@ def cmd_do(a):
     an agent action becomes a signed decision only if its validation check
     passes, in a single command (SPEC §4)."""
     from argparse import Namespace
-    i = cmd_intent(Namespace(description=a.intent, parent=None, actor=a.actor,
-                             constraint=None, acceptance_ref=None))
-    eid = cmd_run(Namespace(intent=i, command=a.command, actor=a.actor))
-    cid, supported = cmd_claim(Namespace(execution=eid, actor=a.actor,
-                                         predicate=(a.predicate or a.intent),
+    i = cmd_intent(Namespace(description=a.intent, parent=None))
+    eid = cmd_run(Namespace(intent=i, command=a.command))
+    cid, supported = cmd_claim(Namespace(execution=eid, predicate=(a.predicate or a.intent),
                                          check=a.check))
     if supported:
         cmd_accept(Namespace(claim=cid, actor=a.actor))
@@ -2424,39 +1612,19 @@ def cmd_do(a):
         sys.exit(1)
 
 
-def show_invocation(stored):
-    """An argv array, rendered for a human without pretending it is a string.
-
-    The projection stores the canonical ARRAY (§2.4); only the display joins it,
-    and it quotes any element containing whitespace so that the rendering does
-    not reintroduce the ambiguity the array form exists to remove."""
-    try:
-        argv = json.loads(stored)
-    except (ValueError, TypeError):
-        return str(stored)
-    if not isinstance(argv, list):
-        return str(stored)
-    return " ".join(f'"{s}"' if any(c.isspace() for c in str(s)) else str(s)
-                    for s in argv)
-
-
 def cmd_log(_):
     # A projection a rebuild refused is not a report; it is a suspect (C2-F1a).
     require_trusted_projection()
     con = db()
-    for i in con.execute("SELECT id,objective,format FROM intents ORDER BY id"):
-        legacy = "  [legacy 0.0 record]" if i[2] != "0.1" else ""
-        print(f"INTENT {i[0]}  {i[1]}{legacy}")
-        for e in con.execute(
-                "SELECT id,invocation,status,exit_code,effects_n FROM "
-                "(SELECT e.id,e.invocation,e.status,e.exit_code,COUNT(f.id) effects_n"
-                " FROM executions e LEFT JOIN effects f ON f.execution_id=e.id "
-                " WHERE e.intent_id=? GROUP BY e.id)", (i[0],)):
-            print(f"  EXEC {e[0]}  `{show_invocation(e[1])}`  {e[2]}={e[3]}  "
-                  f"effects={e[4]}")
-            for c in con.execute("SELECT id,predicate,verdict FROM claims "
-                                 "WHERE execution_id=?", (e[0],)):
-                sup = "supported" if c[2] == "pass" else "unsupported"
+    for i in con.execute("SELECT id,description FROM intents ORDER BY id"):
+        print(f"INTENT {i[0]}  {i[1]}")
+        for e in con.execute("SELECT id,command,exit_code,effects_n FROM "
+                             "(SELECT e.id,e.command,e.exit_code,COUNT(f.id) effects_n "
+                             " FROM executions e LEFT JOIN effects f ON f.execution_id=e.id "
+                             " WHERE e.intent_id=? GROUP BY e.id)", (i[0],)):
+            print(f"  EXEC {e[0]}  `{e[1]}`  exit={e[2]}  effects={e[3]}")
+            for c in con.execute("SELECT id,predicate,supported FROM claims WHERE execution_id=?", (e[0],)):
+                sup = "supported" if c[2] else "unsupported"
                 print(f"    CLAIM {c[0]}  {c[1]}  [{sup}]")
                 for wr in con.execute("SELECT warrant_id FROM warrants WHERE claim_id=?", (c[0],)):
                     print(f"      WARRANT {wr[0][:16]}…  (signed decision)")
@@ -2628,9 +1796,7 @@ def _rebuild(a):
     # diagnosis, because it is acted on.
     records = []
     rec_addr = {}                  # id(doc) -> the address it was read from
-    rec_type = {}                  # id(doc) -> its registered type tag
-    legacy = []                    # (address, "<type>@v1", doc) — §6.4
-    art_bad, store_bad, unread = [], [], []
+    art_bad, store_bad = [], []
     for path in sorted(ART.glob("*")):
         # An artifact whose bytes do not hash to its address is not a record with
         # a problem, it is not that record at all. Rebuilding from it would
@@ -2640,31 +1806,9 @@ def _rebuild(a):
         if err:
             art_bad.append(err)
             continue
-        outcome, t, ver, detail = validate_record(doc)
-        if outcome == "valid":
+        if isinstance(doc, dict) and isinstance(doc.get("oaip_record"), str):
             records.append(doc)
             rec_addr[id(doc)] = path.name
-            rec_type[id(doc)] = t
-        elif outcome == "invalid":
-            # A record whose SHAPE is wrong is not a record to project. Before
-            # this branch existed the rebuild read whatever members happened to
-            # be there and wrote them into columns, so a record no conforming
-            # reader could parse still produced rows.
-            art_bad.append(f"{path.name[:12]}: {t or 'record'} is not valid: "
-                           f"{detail}")
-        elif outcome == "legacy":
-            why = legacy_shape_ok(doc, t)
-            if why:
-                art_bad.append(f"{path.name[:12]}: {why}")
-            else:
-                legacy.append((path.name, t, doc))
-        elif outcome in ("unsupported-version", "unknown-type"):
-            # §6.2: NOT valid and NOT corrupt. Reported as its own outcome, left
-            # untouched on disk, and it does not refuse the rebuild — refusing a
-            # whole store because one record is from the future is how a
-            # forward-compatible writer becomes indistinguishable from an
-            # attacker.
-            unread.append((path.name, outcome, t, ver, detail))
 
     # The other half of the canonical layer: the Warrant store.
     accepts, wrec_files, store_errs = read_warrant_store()
@@ -2722,13 +1866,7 @@ def _rebuild(a):
     prev_edges = set()
     if DB.is_file():
         try:
-            # A DIRECT connection, deliberately not `db()`: rebuild is the ONE
-            # command that must work against a projection whose schema this
-            # build cannot otherwise read, since regenerating it is the whole
-            # point. The `warrants` table has held (claim_id, warrant_id) in
-            # every schema, so the comparison that protects the acceptance edge
-            # survives the upgrade it is protecting against.
-            con0 = sqlite3.connect(DB)
+            con0 = db()
             prev_edges = {(r[0], r[1]) for r in
                           con0.execute("SELECT claim_id, warrant_id FROM warrants")}
             con0.close()
@@ -2767,120 +1905,41 @@ def _rebuild(a):
     # Deterministic order: by timestamp then id, so a rebuild is reproducible and
     # two rebuilds of the same artifacts give the same projection.
     records.sort(key=lambda d: (d.get("ts", 0), d.get("id", "")))
-    # A claim cites its subject by hash and the EXECUTION lives in the subject
-    # (§2.8), so the claim→execution edge is re-derived through the subject
-    # record — from the canonical layer, not from the database being rebuilt.
-    subject_exec = {rec_addr[id(d)]: d.get("execution_id") for d in records
-                    if rec_type[id(d)] == "claim_subject"}
-    counts = {"intent": 0, "state": 0, "execution": 0, "effect": 0,
-              "attribution": 0, "claim": 0}
+    counts = {"intent@v1": 0, "execution@v1": 0, "claim@v1": 0}
     for d in records:
-        kind = rec_type[id(d)]
-        if kind == "intent":
-            con.execute("""INSERT OR REPLACE INTO intents(id,actor,objective,
-                           parent_id,constraints,acceptance_refs,created_at,format)
-                           VALUES (?,?,?,?,?,?,?,?)""",
-                        (d["id"], d["actor"], d["objective"], d["parent"],
-                         canon(d["constraints"]).decode(),
-                         canon(d["acceptance_refs"]).decode(), d["ts"], "0.1"))
-        elif kind == "state":
-            con.execute("""INSERT OR REPLACE INTO states(id,repo_commit,
-                           worktree_tree,env_fingerprint,toolchain_fingerprint)
-                           VALUES (?,?,?,?,?)""",
-                        (rec_addr[id(d)], d["repo_commit"], d["worktree_tree"],
-                         d["env_fingerprint"], d["toolchain_fingerprint"]))
-        elif kind == "execution":
-            con.execute("""INSERT OR REPLACE INTO executions(id,intent_id,actor,
-                           runtime,invocation,status,exit_code,input_state,
-                           output_state,environment,output,created_at,format)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (d["id"], d["intent_id"], d["executor"]["actor"],
-                         d["executor"]["runtime"], canon(d["invocation"]).decode(),
-                         d["status"], d["exit_code"], d["input_state"],
-                         d["output_state"], d["environment"], d["output"],
-                         d["ts"], "0.1"))
-        elif kind == "effect":
-            con.execute("""INSERT OR REPLACE INTO effects(id,execution_id,kind,
-                           target,before_blob,after_blob) VALUES (?,?,?,?,?,?)""",
-                        (d["id"], d["execution_id"], d["kind"], d["target"],
-                         d["before"], d["after"]))
-        elif kind == "attribution":
-            con.execute("""INSERT OR REPLACE INTO attributions(id,effect_id,cause,
-                           method,confidence_ppm) VALUES (?,?,?,?,?)""",
-                        (d["id"], d["effect_id"], d["cause"], d["method"],
-                         d["confidence_ppm"]))
-        elif kind == "claim":
-            v = d["validation"]
-            con.execute("""INSERT OR REPLACE INTO claims(id,execution_id,predicate,
-                           runtime,check_hash,verdict,transcript_hash,subject_hash,
-                           evidence,proposed_by,created_at,format)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (d["id"], subject_exec.get(d["subject"]), d["predicate"],
-                         v["runtime"], v["check"], v["verdict"], v["transcript"],
-                         d["subject"], canon(d["evidence"]).decode(),
-                         d["proposed_by"], d["ts"], "0.1"))
-        else:
-            continue                    # claim_subject / artifact: not a row
-        counts[kind] = counts.get(kind, 0) + 1
-    # SPEC §6.4: the legacy half, projected under the legacy rules and MARKED.
-    counts["legacy"] = 0
-    for addr, tag, d in sorted(legacy, key=lambda x: (x[2].get("ts", 0),
-                                                      x[2].get("id", ""))):
-        if tag == "intent@v1":
-            con.execute("""INSERT OR REPLACE INTO intents(id,actor,objective,
-                           parent_id,constraints,acceptance_refs,created_at,
-                           format) VALUES (?,?,?,?,?,?,?,?)""",
-                        (d["id"], None, d["description"], d["parent"], None,
-                         None, d["ts"], LEGACY_FORMAT))
-        elif tag == "execution@v1":
-            # `invocation` holds the STRING the legacy record carried, as a JSON
-            # string rather than a one-element array: the argv was never
-            # recorded, and a one-element array would assert an argv nobody
-            # observed. `input_state`/`output_state` hold git TREE ids, which is
-            # exactly why `format` exists.
-            con.execute("""INSERT OR REPLACE INTO executions(id,intent_id,actor,
-                           runtime,invocation,status,exit_code,input_state,
-                           output_state,environment,output,created_at,format)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (d["id"], d["intent"], None, None,
-                         canon(d["command"]).decode(), None, d["exit_code"],
-                         d["before_tree"], d["after_tree"], d["env_fp"],
-                         d["stdout"], d["ts"], LEGACY_FORMAT))
-            for n, e in enumerate(d["effects"] or []):
-                # Legacy effects and attributions carry no ids (they were nested
-                # members). The synthetic ids are DERIVED from the execution and
-                # the position, so two rebuilds of the same artifact agree — §5
-                # requires the same graph, not merely a similar one.
-                fid = f"{d['id']}#legacy-effect-{n}"
-                con.execute("""INSERT OR REPLACE INTO effects(id,execution_id,
-                               kind,target,before_blob,after_blob)
-                               VALUES (?,?,?,?,?,?)""",
-                            (fid, d["id"],
-                             {"created": "file.create", "modified": "file.modify",
-                              "deleted": "file.delete"}.get(e.get("status"),
-                                                            e.get("status")),
-                             e.get("path"), e.get("before"), e.get("after")))
+        kind = d["oaip_record"]
+        if kind == "intent@v1":
+            con.execute("INSERT OR REPLACE INTO intents(id,description,parent_id,created_at)"
+                        " VALUES (?,?,?,?)", (d["id"], d.get("description"),
+                                              d.get("parent"), d.get("ts")))
+        elif kind == "execution@v1":
+            con.execute("""INSERT OR REPLACE INTO executions(id,intent_id,command,exit_code,
+                           before_tree,after_tree,env_fp,stdout_hash,created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (d["id"], d.get("intent"), d.get("command"), d.get("exit_code"),
+                         d.get("before_tree"), d.get("after_tree"), d.get("env_fp"),
+                         d.get("stdout"), d.get("ts")))
+            for e in d.get("effects", []):
+                cur = con.execute("""INSERT INTO effects(execution_id,path,status,
+                                     before_blob,after_blob) VALUES (?,?,?,?,?)""",
+                                  (d["id"], e.get("path"), e.get("status"),
+                                   e.get("before"), e.get("after")))
                 at = e.get("attribution") or {}
                 if at:
-                    con.execute("""INSERT OR REPLACE INTO attributions(id,
-                                   effect_id,cause,method,confidence_ppm)
-                                   VALUES (?,?,?,?,?)""",
-                                (f"{fid}#attribution", fid, at.get("cause"),
-                                 at.get("method"), at.get("confidence_ppm")))
-        elif tag == "claim@v1":
-            # The check was stored as TEXT, so there is no blob to cite: the
-            # column is NULL rather than the hash of bytes this ledger never
-            # had. `verdict` is derived from the legacy boolean, which is the
-            # one place the two vocabularies really do mean the same thing.
-            con.execute("""INSERT OR REPLACE INTO claims(id,execution_id,
-                           predicate,runtime,check_hash,verdict,transcript_hash,
-                           subject_hash,evidence,proposed_by,created_at,format)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (d["id"], d["execution"], d["predicate"], None, None,
-                         "pass" if d["supported"] else "fail", d["transcript"],
-                         d["subject"], None, None, d["ts"], LEGACY_FORMAT))
-        counts["legacy"] += 1
-
+                    con.execute("""INSERT INTO attributions(effect_id,cause,method,
+                                   confidence_ppm) VALUES (?,?,?,?)""",
+                                (cur.lastrowid, at.get("cause"), at.get("method"),
+                                 at.get("confidence_ppm")))
+        elif kind == "claim@v1":
+            con.execute("""INSERT OR REPLACE INTO claims(id,execution_id,predicate,check_cmd,
+                           check_exit,transcript_hash,subject_hash,supported,created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (d["id"], d.get("execution"), d.get("predicate"), d.get("check"),
+                         d.get("check_exit"), d.get("transcript"), d.get("subject"),
+                         1 if d.get("supported") else 0, d.get("ts")))
+        else:
+            continue
+        counts[kind] = counts.get(kind, 0) + 1
     # The claim→warrant edge, from the store records validated AND verified
     # above. Sorted filename order is deterministic, so two rebuilds agree
     # (same property the ts/id sort gives the artifact records).
@@ -2906,32 +1965,23 @@ def _rebuild(a):
     #     --allow-legacy-links, and (b) the record predates this store's note
     #     convention per `.oaip/store.json` (see note_convention_since) — a
     #     criterion stamped by `init`, which the filer of a record cannot choose.
-    # A claim, whatever its format, reduced to the three facts the acceptance
-    # edge needs. Legacy claims MUST take part: an existing ledger's acceptance
-    # is the one fact this protocol is for, and losing it at the upgrade would
-    # be the §5 violation this project already found once, arriving by a new
-    # route.
-    claims_by_id = {}
+    claims_by_id = {d["id"]: d for d in records
+                    if d["oaip_record"] == "claim@v1" and d.get("id")}
+    supported_by_subject = {}
+    claim_subjects = set()
     for d in records:
-        if rec_type[id(d)] == "claim":
-            claims_by_id[d["id"]] = (d["subject"],
-                                     d["validation"]["verdict"] == "pass")
-    for _addr, tag, d in legacy:
-        if tag == "claim@v1":
-            claims_by_id[d["id"]] = (d["subject"], bool(d["supported"]))
-    supported_by_subject, claim_subjects = {}, set()
-    for cid_, (subj_, ok_) in claims_by_id.items():
-        claim_subjects.add(subj_)
-        if ok_:
-            supported_by_subject.setdefault(subj_, []).append(cid_)
-    counts["warrant-edge"] = 0
+        if d["oaip_record"] == "claim@v1" and d.get("subject"):
+            claim_subjects.add(d["subject"])
+            if d.get("supported"):
+                supported_by_subject.setdefault(d["subject"], []).append(d["id"])
+    counts["warrant@edge"] = 0
 
     derived, refused_why = set(), {}
 
     def edge(cid, wid, wts):
         cur = con.execute("INSERT OR IGNORE INTO warrants(claim_id,warrant_id,"
                           "created_at) VALUES (?,?,?)", (cid, wid, wts))
-        counts["warrant-edge"] += cur.rowcount or 0
+        counts["warrant@edge"] += cur.rowcount or 0
         derived.add((cid, wid))
 
     assess_signer = signer_gate(report, actors, unbound_sigs)
@@ -2964,13 +2014,13 @@ def _rebuild(a):
                 print(f"WARN  accept {wid[:12]} names claim {cid} — no such "
                       "claim record in the canonical layer; edge not derived",
                       file=sys.stderr)
-            elif c[0] != subj_hash:
+            elif c.get("subject") != subj_hash:
                 refused_why[wid] = (f"it names claim {cid} but carries a "
                                     "different subject than that claim's")
                 print(f"WARN  accept {wid[:12]} names claim {cid} but the "
                       "warrant's subject is not that claim's subject; edge "
                       "not derived", file=sys.stderr)
-            elif not c[1]:
+            elif not c.get("supported"):
                 refused_why[wid] = (f"it names claim {cid}, whose own validation "
                                     "check FAILED")
                 print(f"WARN  accept {wid[:12]} names claim {cid} whose own "
@@ -3035,17 +2085,17 @@ def _rebuild(a):
     # projection exactly rather than approximately.
     kinds = {}
     for d in records:
-        k = rec_type[id(d)]
-        if k == "execution" and isinstance(d["output"], str):
-            kinds.setdefault(d["output"], "stdout")
-        elif k == "claim":
-            v = d["validation"]
-            kinds.setdefault(v["check"], "check")
-            kinds.setdefault(v["transcript"], "check-transcript")
-            kinds.setdefault(d["subject"], "claim-subject")
+        k = d["oaip_record"]
+        if k == "execution@v1" and isinstance(d.get("stdout"), str):
+            kinds.setdefault(d["stdout"], "stdout")
+        elif k == "claim@v1":
+            if isinstance(d.get("transcript"), str):
+                kinds.setdefault(d["transcript"], "check-transcript")
+            if isinstance(d.get("subject"), str):
+                kinds.setdefault(d["subject"], "claim-subject")
         addr = rec_addr.get(id(d))
         if addr:
-            kinds.setdefault(addr, artifact_kind(k))
+            kinds.setdefault(addr, "record:" + k.split("@")[0])
     for path in sorted(ART.glob("*")):
         # "unreferenced" only for a blob no record explains — which the live path
         # cannot produce, since `put_artifact` always names a kind. Saying
@@ -3056,27 +2106,10 @@ def _rebuild(a):
                      path.stat().st_size))
     con.commit()
     con.close()
-    # §6.2: records this reader could not read are REPORTED, never dropped in
-    # silence and never counted as corruption. Silence here would make a
-    # forward-dated record indistinguishable from one that was never written.
-    if legacy:
-        print(f"NOTE  {len(legacy)} record(s) in this ledger are in the "
-              f"PRE-0.1 format (SPEC §6.4). They were read under the legacy "
-              "rules and every row derived from them is marked "
-              f"format={LEGACY_FORMAT!r} — in particular their state columns "
-              "hold git TREE ids, not StateIDs, and they carry no environment "
-              "or toolchain fingerprint that any verifier can reproduce. New "
-              "records are written in v0.1 shape; nothing here was rewritten, "
-              "because a record is addressed by the hash of its own bytes.",
-              file=sys.stderr)
-    for name, outcome, t, ver, detail in unread:
-        print(f"NOTE  artifact {name[:12]}: {outcome} — {detail}. It is left "
-              "exactly as it is and contributes nothing to this projection.",
-              file=sys.stderr)
     os.replace(tmp_db, DB)          # atomic: never a moment with no projection
     UNTRUSTED.unlink(missing_ok=True)   # this projection WAS derived; it stands
     print("rebuilt projection from the canonical layer: "
-          + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+          + ", ".join(f"{k.split('@')[0]}={v}" for k, v in sorted(counts.items())))
 
     # A DROPPED EDGE IS NOT A SUCCESSFUL REBUILD (C2-F1b, third adversarial
     # round). §5's "the same graph" is the promise; when the rebuild cannot keep
@@ -3119,27 +2152,11 @@ def verify_artifacts():
         doc, err = read_artifact(path)
         if err:
             errs.append(err)
-            continue
-        present.add(path.name)
-        # THE SHAPE, not only the address and the canonicalization. A record can
-        # sit at the address of its own impeccable JCS bytes and still assert
-        # something no conforming reader can interpret — an unregistered effect
-        # kind, a `killed` process with an exit code, an attribution claiming
-        # certainty a method may not claim. Checking the address without checking
-        # the shape is the same defect this file already found once at the layer
-        # below: verifying something adjacent to the evidence.
-        outcome, t, ver, detail = validate_record(doc)
-        if outcome == "invalid":
-            errs.append(f"{path.name[:12]}: {t or 'record'} is not valid under "
-                        f"SPEC §2: {detail}")
-        elif outcome in ("unsupported-version", "unknown-type", "legacy"):
-            # §6.2: neither valid nor corrupt. Reported as itself, and NOT an
-            # error — calling a forward-dated record corrupt is how a
-            # forward-compatible writer becomes indistinguishable from an
-            # attacker.
-            print(f"NOTE  {path.name[:12]}: {outcome} — {detail}")
-        elif t == "claim":
-            subjects.add(doc["subject"])
+        else:
+            present.add(path.name)
+            if (isinstance(doc, dict) and doc.get("oaip_record") == "claim@v1"
+                    and isinstance(doc.get("subject"), str)):
+                subjects.add(doc["subject"])
 
     if DB.is_file():
         con = db()
@@ -3147,11 +2164,9 @@ def verify_artifacts():
         cited = []
         for row in con.execute("SELECT hash FROM artifacts"):
             cited.append(("artifacts.hash", row[0]))
-        for row in con.execute("SELECT id,subject_hash,transcript_hash,check_hash"
-                               " FROM claims"):
+        for row in con.execute("SELECT id,subject_hash,transcript_hash FROM claims"):
             cited.append((f"claim {row[0]}.subject", row[1]))
             cited.append((f"claim {row[0]}.transcript", row[2]))
-            cited.append((f"claim {row[0]}.check", row[3]))
         for where, h in cited:
             if h and h not in present:
                 errs.append(f"{where} cites {h[:12]} — not resolvable in the "
@@ -3307,79 +2322,13 @@ def cmd_conformance(a):
     sys.exit(0 if ok == total else 1)
 
 
-def cmd_records(a):
-    """SPEC §10: the RECORD-SHAPE vectors, positive and negative.
-
-    `conformance` pins the serializer; this pins what a record IS. The two are
-    not the same check and this repository shipped only the first one for its
-    whole life — which is how the reference implementation came to write a
-    different record from the one SPEC §2 declares for every single type while
-    reporting ALL PASS.
-
-    Every reject vector names the OUTCOME it must produce, not merely "not
-    valid": `unsupported-version` and `unknown-type` are distinct from
-    `invalid`, and an implementation that returns one for the other has a real
-    interoperability bug (§6.2) that a boolean assertion would hide."""
-    doc = json.loads(Path(a.vectors).read_text(encoding="utf-8"))
-    ok = total = 0
-    for v in doc["accept"]:
-        total += 1
-        outcome, t, ver, detail = validate_record(v["record"])
-        good = (outcome == "valid" and t == v["type"] and ver == v["version"])
-        print(("OK   " if good else "FAIL "), f"accept/{v['type']}/{v['name']}",
-              "" if good else f"-> {outcome} {t}/{ver} {detail or ''}")
-        ok += good
-    for v in doc["reject"]:
-        total += 1
-        want = v["outcome"]
-        if "bytes_hex" in v:
-            # These leave the §1 domain, so they are refused at INGESTION and the
-            # shape layer never sees them. A vector whose refusal comes from the
-            # wrong layer is still a pass here, and saying which layer refused it
-            # is the point of printing the detail.
-            try:
-                rec = loads_ijson(bytes.fromhex(v["bytes_hex"]))
-                outcome, detail = validate_record(rec)[0], "shape layer"
-            except (ValueError, UnicodeDecodeError) as e:
-                outcome, detail = "invalid", f"ingestion: {e}"
-        else:
-            outcome, _t, _ver, detail = validate_record(v["record"])
-        good = outcome == want
-        print(("OK   " if good else "FAIL "),
-              f"reject/{v['class']}/{v['name']}",
-              "" if good else f"-> {outcome}, wanted {want} ({detail or ''})")
-        ok += good
-    tag = "ALL PASS" if ok == total else "FAILURES"
-    print(f"\nOAIP-RECORDS: {tag} ({ok}/{total})")
-    sys.exit(0 if ok == total else 1)
-
-
 def main():
     ap = argparse.ArgumentParser(prog="oaip", description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init").set_defaults(fn=cmd_init)
-    pi = sub.add_parser("intent"); pi.add_argument("description")
-    pi.add_argument("--parent")
-    # --actor is OPTIONAL here and required on `do`. SPEC §8: every actor string
-    # in an OAIP record is unauthenticated, so demanding one would move the
-    # fiction rather than remove it; `do` files a signed warrant, where the name
-    # lands inside somebody's decision, and there it is asked for.
-    pi.add_argument("--actor", help="who declared this intent (§2.3; "
-                    "UNAUTHENTICATED per §8). Default: this OS user@host")
-    pi.add_argument("--constraint", action="append",
-                    help="a constraint on the intent (§2.3); repeatable")
-    pi.add_argument("--acceptance-ref", action="append",
-                    help="hex64 artifact that would EVIDENCE satisfaction "
-                         "(§2.3); repeatable")
-    pi.set_defaults(fn=cmd_intent)
-    pr = sub.add_parser("run"); pr.add_argument("--intent")
-    pr.add_argument("--actor", help="the executor (§2.4 executor.actor; "
-                    "UNAUTHENTICATED per §8). Default: this OS user@host")
-    pr.add_argument("command", nargs=argparse.REMAINDER); pr.set_defaults(fn=cmd_run)
-    pc = sub.add_parser("claim"); pc.add_argument("--execution", required=True); pc.add_argument("--predicate", required=True); pc.add_argument("--check", required=True)
-    pc.add_argument("--actor", help="who proposes the claim (§2.7 proposed_by; "
-                    "UNAUTHENTICATED per §8). Default: this OS user@host")
-    pc.set_defaults(fn=cmd_claim)
+    pi = sub.add_parser("intent"); pi.add_argument("description"); pi.add_argument("--parent"); pi.set_defaults(fn=cmd_intent)
+    pr = sub.add_parser("run"); pr.add_argument("--intent"); pr.add_argument("command", nargs=argparse.REMAINDER); pr.set_defaults(fn=cmd_run)
+    pc = sub.add_parser("claim"); pc.add_argument("--execution", required=True); pc.add_argument("--predicate", required=True); pc.add_argument("--check", required=True); pc.set_defaults(fn=cmd_claim)
     pa = sub.add_parser("accept"); pa.add_argument("--claim", required=True); pa.add_argument("--actor", required=True); pa.set_defaults(fn=cmd_accept)
     pb = sub.add_parser("bind", help="vouch that a key may sign as an actor "
                         "(rebuild derives no acceptance edge from an unbound signer)")
@@ -3408,10 +2357,6 @@ def main():
     prb.set_defaults(fn=cmd_rebuild)
     sub.add_parser("verify").set_defaults(fn=cmd_verify)
     pf = sub.add_parser("conformance"); pf.add_argument("vectors", nargs="?", default="examples/vectors.json"); pf.set_defaults(fn=cmd_conformance)
-    pv = sub.add_parser("records", help="record-SHAPE conformance vectors "
-                        "(SPEC §10) — what a record is, not how it serializes")
-    pv.add_argument("vectors", nargs="?", default="examples/record-vectors.json")
-    pv.set_defaults(fn=cmd_records)
     a = ap.parse_args()
     if a.cmd in ("run", "do") and a.command and a.command[0] == "--":
         a.command = a.command[1:]
