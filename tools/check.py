@@ -82,6 +82,18 @@ CHECKS = [
     ("graduation bridge (an unsigned decision → a signed Warrant)",
      ["bash", "examples/graduate-decision.sh"], "warrant-cli",
      "graduated -> signed Warrant"),
+    # The release gate lives here for the same reason everything else does: a
+    # check whose membership is remembered rather than recorded runs less over
+    # time. These two are the CHECKOUT half — the extractor's own selftest, and
+    # every documented invocation measured against impl/oaip.py. The half that
+    # measures the built WHEEL needs a wheel and a venv, so it runs in
+    # .github/workflows/publish.yml, before the publish step it guards.
+    ("release-surface extractor selftest (the gate is checked before it is used)",
+     ["python3", "tools/check_release_surface.py", "--selftest"], None,
+     "RELEASE-SURFACE-SELFTEST: ALL PASS"),
+    ("documented CLI surface exists (README.md + llms.txt vs the real parser)",
+     ["python3", "tools/check_release_surface.py"], None,
+     "RELEASE SURFACE: ALL PASS"),
 ]
 
 
