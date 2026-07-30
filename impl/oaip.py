@@ -53,9 +53,14 @@ OAIP = Path(".oaip")
 DB = OAIP / "ledger.db"
 ART = OAIP / "artifacts"        # content-addressed artifact blobs
 WSTORE = OAIP / "warrants"      # the Warrant store (canonical decision layer)
-WKEY = OAIP / "dev.key"
-PUBKEY = OAIP / "dev.key.pub"    # the public half, recorded by `init` from keygen
-TRUST = OAIP / "trust.json"      # OAIP's keyring, in Warrant's trust-config shape
+# THE TRUST ROOT: the signing key and the keyring that says which key may sign
+# as which actor. Everything else in `.oaip/` is content-addressed or signed and
+# survives being written by a hostile hand; these two do not. They are held
+# together so there is ONE directory whose custody has to be reasoned about.
+TRUST_ROOT = OAIP
+WKEY = TRUST_ROOT / "dev.key"
+PUBKEY = TRUST_ROOT / "dev.key.pub"  # the public half, recorded by `init` from keygen
+TRUST = TRUST_ROOT / "trust.json"    # OAIP's keyring, in Warrant's trust-config shape
 # Warrant is a normative dependency (the decision layer). Point WARRANT_CLI at
 # your `warrant.py` (or an installed `warrant`); defaults to a sibling checkout.
 _wcli = os.environ.get("WARRANT_CLI")
@@ -430,6 +435,99 @@ def ensure_oaip_dir_readable():
         ensure_oaip_dir()               # refuses, naming what is in the way
 
 
+# ---------- custody: who else on this host can read the key or write the keyring
+# THE GAP THIS CLOSES (O4, 2026-07-30). Five rounds of review hardened WHAT OAIP
+# believes — the signature, the binding, the claim link — and nothing at all
+# checked WHO ELSE CAN SUPPLY those inputs from the same filesystem. A signing
+# key at mode 0644 is a key every account on the host can sign with, and a
+# keyring at 0666 is a keyring every account can vouch with; OAIP would have used
+# both without a word. The check is cheap, it is the baseline every ssh client
+# has enforced for thirty years, and its absence was not written down anywhere.
+#
+# Deliberately narrow, and NOT a claim about privilege separation: mode bits say
+# nothing about a process running as the same uid, which is the case that matters
+# most for an observed agent (see the deployment profiles in SPEC §8). What they
+# do rule out is the accidental widening — an umask of 0002, a `cp -p` off a
+# FAT/exFAT volume, a tarball unpacked as 0644, a shared group on a build host.
+KEY_MODE_FORBIDDEN = 0o077      # a secret: NO group/other access of any kind
+WRITE_MODE_FORBIDDEN = 0o022    # a decision input: no group/other WRITE
+
+
+def _perm(path):
+    """The permission bits of `path`, or None if they cannot be read / do not
+    mean anything here (Windows reports a mode POSIX bits cannot be read from)."""
+    if os.name != "posix":
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_mode & 0o777
+
+
+def trust_perm_errors():
+    """Custody refusals about the trust root, as a list of sentences.
+
+    Returned rather than raised because the read paths (`verify`, `rebuild`) must
+    REPORT this alongside their other findings, while the write paths (`init`,
+    `accept`, `bind`) must refuse outright — see `require_trust_custody`."""
+    errs = []
+    m = _perm(WKEY)
+    if m is not None and m & KEY_MODE_FORBIDDEN:
+        errs.append(
+            f"{WKEY}: the signing key is mode {m:04o} — accessible to group or "
+            "other. Every acceptance this ledger files is that key, so an "
+            "account that can read it can sign as this actor and OAIP will "
+            f"derive the edge. Refusing to use it: `chmod 600 {WKEY}` (and "
+            "rotate it if the host is shared — the exposure is not undone by "
+            "narrowing the mode).")
+    m = _perm(TRUST)
+    if m is not None and m & WRITE_MODE_FORBIDDEN:
+        errs.append(
+            f"{TRUST}: the keyring is mode {m:04o} — writable by group or "
+            "other. An acceptance edge is derived only from a signer this file "
+            "vouches for, so whoever can write it can vouch for their own key. "
+            f"`chmod 600 {TRUST}`.")
+    m = _perm(TRUST_ROOT)
+    if m is not None and m & WRITE_MODE_FORBIDDEN:
+        errs.append(
+            f"{TRUST_ROOT}: the directory holding the signing key and the "
+            f"keyring is mode {m:04o} — writable by group or other, so both "
+            "files can be REPLACED whatever their own modes say. "
+            f"`chmod 700 {TRUST_ROOT}`.")
+    return errs
+
+
+def require_trust_custody():
+    """The write paths' half of the same check: a refusal, in words.
+
+    Called before anything SIGNS or VOUCHES. Signing with a key others can read,
+    or binding into a keyring others can rewrite, records a custody that does not
+    exist — and a false statement about custody is the one thing this project's
+    decision layer cannot survive."""
+    errs = trust_perm_errors()
+    if errs:
+        sys.exit("refusing to use this ledger's key material:\n  "
+                 + "\n  ".join(errs))
+
+
+def harden_trust_perms():
+    """Make the trust root's own files what the check above demands.
+
+    `warrant keygen` already chmods 0600, and this repeats it deliberately: OAIP
+    must not depend on a delegate's umask discipline for the custody it then
+    asserts. Failures are ignored on purpose — a filesystem with no POSIX modes
+    (Windows, some network mounts) is a place where `trust_perm_errors` reports
+    nothing either, and refusing to run there would be a claim about custody
+    rather than a check of it."""
+    for p, mode in ((TRUST_ROOT, 0o700), (WKEY, 0o600), (TRUST, 0o600)):
+        try:
+            if os.name == "posix" and os.path.exists(p):
+                os.chmod(p, mode)
+        except OSError:
+            pass
+
+
 def ensure_trust():
     """OAIP's keyring must exist before anything verifies: a missing trust config
     makes Warrant's settlement preflight fail closed, and an empty one is the
@@ -445,6 +543,7 @@ def write_keyring(actors):
     could not write and why that matters (2026-07-30, third review round)."""
     try:
         TRUST.write_text(json.dumps({"actors": actors}, sort_keys=True) + "\n")
+        harden_trust_perms()
     except OSError as e:
         sys.exit(f"cannot write the keyring {TRUST}: {e}. Nothing was bound — "
                  "OAIP derives an acceptance edge only from a signer this file "
@@ -457,7 +556,15 @@ def read_trust():
 
     Deliberately in Warrant's trust-config shape (`{"actors": {...}}`, the closed
     schema its `--trust-config` validates) so the SAME file can be handed to
-    Warrant's settlement grade; OAIP does not invent a second format."""
+    Warrant's settlement grade; OAIP does not invent a second format.
+
+    A keyring whose CUSTODY is broken is reported here as unreadable, not as
+    empty: every caller treats an error as a refusal to derive edges, and
+    treating "anyone on this host may rewrite this file" as an ordinary keyring
+    would be the same mistake as reading a filename for an address."""
+    custody = trust_perm_errors()
+    if custody:
+        return None, "; ".join(custody)
     if not TRUST.is_file():
         return {}, None
     try:
@@ -1290,6 +1397,15 @@ def cmd_init(_):
     db(create=True).executescript(SCHEMA)
     wrun("--store", str(WSTORE), "init")
     if not WKEY.exists():
+        # CREATE THE FILE BEFORE THE SECRET GOES INTO IT. `warrant keygen` writes
+        # the seed and then chmods 0600, which leaves a window in which the key
+        # exists at the umask's mode; on a host with umask 0022 that window is a
+        # world-readable signing key. `O_EXCL` also refuses to follow a symlink
+        # planted at that path, which is the same window used the other way.
+        try:
+            os.close(os.open(WKEY, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except OSError as e:
+            sys.exit(f"cannot create the signing key {WKEY}: {e}")
         r = wrun("keygen", "--out", str(WKEY))
         # Record the PUBLIC half. OAIP is stdlib-only and cannot derive an Ed25519
         # public key from a seed, so the one moment the pubkey is knowable is the
@@ -1298,7 +1414,13 @@ def cmd_init(_):
         m = re.search(r"\bpubkey\s+([0-9a-f]{64})\b", r.stdout or "")
         if m:
             PUBKEY.write_text(m.group(1) + "\n")
+        elif WKEY.stat().st_size == 0:
+            # No Warrant CLI generated anything: leave no empty file behind, or
+            # the next `init` would take it for a key it already custodies.
+            WKEY.unlink(missing_ok=True)
     ensure_trust()
+    harden_trust_perms()
+    require_trust_custody()
     # Stamp the store format ONCE, and never restamp: this marker is what tells
     # `rebuild` that every accept in this store had the chance to carry an
     # explicit claim link, so a missing one is a defect and not history (F8).
@@ -1444,6 +1566,9 @@ def cmd_accept(a):
 
 
 def _accept(a):
+    # Before the key is used at all: a signature made with a key other accounts
+    # can read is not evidence that THIS actor decided anything (O4).
+    require_trust_custody()
     con = db()
     c = con.execute("""SELECT predicate,check_cmd,check_exit,transcript_hash,subject_hash,supported
                        FROM claims WHERE id=?""", (a.claim,)).fetchone()
@@ -1552,6 +1677,7 @@ def cmd_bind(a):
     legitimate case (a store filed by another ledger's key), but it is a
     different act from vouching for one's own, and it now has to be said out
     loud: --foreign-key."""
+    require_trust_custody()
     key = a.key
     own = PUBKEY.read_text().strip() if PUBKEY.is_file() else None
     if key is None:
@@ -1857,6 +1983,11 @@ def _rebuild(a):
     # `.oaip/store.json` promote a brand-new store to "legacy" (C3-F1).
     cutoff, cutoff_err = note_convention_since()
     meta_bad = [cutoff_err] if cutoff_err else []
+    # Custody, checked here and not only inside `read_trust`, because that
+    # function is reached only when there is a store to report on: a ledger whose
+    # keyring anyone on the host may rewrite must refuse to project acceptance
+    # edges even before the first accept is filed (O4).
+    custody_bad = trust_perm_errors()
 
     # What the CURRENT projection asserts, read before it is replaced. A rebuild
     # that drops the protocol's central edge must not report success (C2-F1b):
@@ -1873,8 +2004,8 @@ def _rebuild(a):
         except sqlite3.Error:
             prev_edges = set()          # unreadable: nothing to compare against
 
-    if art_bad or store_bad or meta_bad:
-        for e in art_bad + store_bad + meta_bad:
+    if art_bad or store_bad or meta_bad or custody_bad:
+        for e in art_bad + store_bad + meta_bad + custody_bad:
             print("ERR ", e, file=sys.stderr)
         # Each layer is COUNTED AND NAMED SEPARATELY, including this ledger's own
         # metadata: a diagnosis that sends the reader to the wrong directory is
@@ -1885,8 +2016,10 @@ def _rebuild(a):
                         f"{len(store_bad)} fault(s) in the decision layer "
                         f"({WSTORE})" if store_bad else "",
                         f"{len(meta_bad)} fault(s) in this ledger's own "
-                        f"metadata ({STOREMETA})" if meta_bad else "") if p)
-        mark_untrusted(art_bad + store_bad + meta_bad)
+                        f"metadata ({STOREMETA})" if meta_bad else "",
+                        f"{len(custody_bad)} custody fault(s) in the trust root "
+                        f"({TRUST_ROOT})" if custody_bad else "") if p)
+        mark_untrusted(art_bad + store_bad + meta_bad + custody_bad)
         sys.exit(f"refusing to rebuild: {where} — the projection would assert "
                  "facts the canonical layer does not support. The existing "
                  f"projection is left on disk but MARKED UNTRUSTED ({UNTRUSTED}): "
@@ -2219,6 +2352,18 @@ def cmd_verify(_):
     print(f"canonical layer: {len(errs)} error(s)" if errs
           else "canonical layer: every artifact matches its address")
 
+    # CUSTODY IS A LAYER OF ITS OWN, and it is the one this tool never reported.
+    # Every other line here is about bytes that are already written; this one is
+    # about who can write the next ones (O4).
+    custody = trust_perm_errors()
+    for e in custody:
+        print("ERR ", e)
+    print(f"key custody:     {len(custody)} error(s)" if custody
+          else "key custody:     " + (
+              f"key and keyring in {TRUST_ROOT}, not group/world accessible"
+              if WKEY.exists() else
+              f"no signing key in {TRUST_ROOT} (this ledger signs nothing)"))
+
     # The projection is a THIRD thing, named as itself: a fault here is neither
     # the canonical layer's nor the decision layer's, and this file has already
     # been wrong once by reporting one layer's health as another's.
@@ -2285,7 +2430,7 @@ def cmd_verify(_):
               + ("" if report["errors"] == 0 else "  [Warrant]"))
     elif not wrec_files:
         print("decision layer:  (empty store)")
-    sys.exit(1 if (errs or dec_errs or proj_errs
+    sys.exit(1 if (errs or dec_errs or proj_errs or custody
                    or (report and report["errors"])) else 0)
 
 

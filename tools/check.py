@@ -60,6 +60,11 @@ CHECKS = [
     ("key custody (the snapshot must not embed .oaip / the signing key)",
      ["python3", "tests/key_custody.py"], None,
      "KEY-CUSTODY: ALL PASS"),
+    # `needs` the CLI: every case files or re-verifies a real signed acceptance,
+    # and a custody check that never reaches a signature is not a custody check.
+    ("privilege separation (who can supply this ledger's own acceptance)",
+     ["python3", "tests/privilege_separation.py"], "warrant-cli",
+     "PRIVILEGE-SEPARATION: ALL PASS"),
     # `needs` the CLI: the end-to-end half files real signed records. The
     # verifier's own vectors would run anywhere, but a half-run check that still
     # printed its ALL PASS line would be the "passes by not looking" pattern this
