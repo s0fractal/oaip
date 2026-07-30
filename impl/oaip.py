@@ -392,37 +392,75 @@ def bind_actor(actor: str, key: str):
     TRUST.write_text(json.dumps({"actors": actors}, sort_keys=True) + "\n")
 
 
-def unaccounted_signatures(wid, env, actors):
-    """Which of this record's signatures fail to establish who signed it.
+def accepting_signature(wid, env, actors):
+    """Does a VALID, BOUND signature by the actor this record NAMES stand on it?
 
-    Returns a list of human-readable reasons; empty means EVERY signature entry
-    both VERIFIES (OAIP's own Ed25519 check, over the WarrantID OAIP recomputed)
-    and names a key this keyring binds to the actor that entry claims. "Every",
-    not "some", on purpose: Warrant's §5 lets anyone with store write access
-    append co-signatures, and a record could carry a bound-but-invalid signature
-    next to an unbound-but-valid one.
+    Returns (refusal_or_None, notes, key, actor). `notes` are informational: they
+    describe the OTHER signature entries, which are reported and never fatal.
 
-    The cryptographic half used to be delegated entirely to the Warrant CLI, so
-    a stub program that printed a clean report made a record with `"sig":
-    "abab…"` — bytes no key produced — pass this function on the strength of
-    NAMING a bound key (2026-07-30, third adversarial round, C2-F1a)."""
-    reasons = []
+    WHY "THE NAMED ACTOR'S", NOT "ALL OF THEM" (2026-07-30, third adversarial
+    round, C2-F1b). This function used to demand that EVERY signature entry be
+    bound, reasoning that a bound-but-invalid entry could stand next to an
+    unbound-but-valid one. Now that OAIP verifies each signature itself that
+    reasoning is gone, and what the rule actually did was hand a deletion primitive
+    to anyone with store write access: Warrant SPEC §5 explicitly permits appending
+    a co-signature, and deliberately will not let a junk one invalidate a good
+    record (a griefing/availability vector). Measured before this change: ONE
+    cryptographically VALID co-signature by `cosigner@other`, appended to an honest
+    accept, left `warrant verify` at 0 errors and made `oaip rebuild` print
+    `warrant=0` and exit 0 — the acceptance edge silently deleted by a
+    Warrant-sanctioned operation, and a legitimate second endorser could not be
+    expressed at all.
+
+    So the question is the one OAIP actually needs answered: did the actor this
+    record names sign it, with a key this ledger binds to that actor? Extra
+    signatures endorse; they do not decide, and they cannot un-decide."""
+    body = env.get("body") if isinstance(env, dict) else None
+    actor = body.get("actor") if isinstance(body, dict) else None
+    claimed = actor.get("id") if isinstance(actor, dict) else None
+    if not (isinstance(claimed, str) and claimed):
+        return ("the record names no actor (body.actor.id), so no signature on "
+                "it can be anyone's decision"), [], None, None
     sigs = env.get("sigs")
     if not isinstance(sigs, list) or not sigs:
-        return ["the record carries no signatures"]
+        return "the record carries no signatures", [], None, claimed
+    notes, by_claimed = [], []
     for s in sigs:
         if not isinstance(s, dict):
-            reasons.append("a signature entry is not an object")
+            notes.append("a signature entry is not an object (ignored)")
             continue
         a, k = s.get("actor"), s.get("key")
         if not (isinstance(a, str) and isinstance(k, str)):
-            reasons.append("a signature entry has no actor/key strings")
-        elif not signature_verifies(wid, s):
-            reasons.append(f"the signature by {a!r} does NOT verify against "
-                           f"key {k[:12]} (OAIP's own Ed25519 check)")
-        elif k not in actors.get(a, []):
-            reasons.append(f"key {k[:12]} is not bound to actor {a!r} in {TRUST}")
-    return reasons
+            notes.append("a signature entry has no actor/key strings (ignored)")
+            continue
+        valid, bound = signature_verifies(wid, s), k in actors.get(a, [])
+        if a == claimed:
+            by_claimed.append((valid, bound, k))
+            if valid and bound:
+                continue                    # this is the decision itself
+        if not valid:
+            notes.append(f"a signature by {a!r} does not verify and is EXCLUDED "
+                         "(Warrant SPEC §5 permits appended co-signatures; a junk "
+                         "one must not invalidate a good record)")
+        elif not bound:
+            notes.append(f"a VALID co-signature by {a!r} (key {k[:12]}) is not "
+                         f"bound in {TRUST} — recorded, but it endorses rather "
+                         "than decides")
+        else:
+            notes.append(f"a VALID, bound co-signature by {a!r} (key {k[:12]})")
+    for valid, bound, k in by_claimed:
+        if valid and bound:
+            return None, notes, k, claimed
+    if not by_claimed:
+        return (f"no signature entry claims the actor this record names "
+                f"({claimed!r})"), notes, None, claimed
+    valid_key = next((k for valid, _, k in by_claimed if valid), None)
+    if valid_key is not None:
+        return (f"key {valid_key[:12]} is not bound to actor {claimed!r} in "
+                f"{TRUST}"), notes, valid_key, claimed
+    return (f"the signature by {claimed!r} does NOT verify against key "
+            f"{by_claimed[0][2][:12]} (OAIP's own Ed25519 check)"), \
+        notes, by_claimed[0][2], claimed
 
 
 def store_report(settlement=True):
@@ -439,7 +477,7 @@ def store_report(settlement=True):
     that swallows output — not an adversary.
 
     What makes an adversary's stub useless is that OAIP no longer BELIEVES this
-    report about signatures: `unaccounted_signatures` verifies Ed25519 in
+    report about signatures: `accepting_signature` verifies Ed25519 in
     process. This report can still make OAIP REFUSE (errors here are fatal to a
     rebuild), which is the safe direction for a delegated check."""
     if not warrant_cli_available():
@@ -476,12 +514,19 @@ def findings_by_record(report):
     return out
 
 
-# Findings that mean "OAIP cannot tell which signature on this record is the
-# valid one" — an excluded (non-verifying) entry, or a malformed entry. Warrant
-# reports these but does not treat them as fatal, correctly: they are only fatal
-# for the narrower question OAIP asks, which is whether a specific actor accepted.
+# Findings that say Warrant excluded or could not read A signature on a record.
+# They are NOT fatal here: Warrant reports them and carries on, correctly (§5
+# lets anyone with store write access append a co-signature, so a junk one must
+# not invalidate a good record), and OAIP now verifies each signature itself, so
+# it can say WHICH entry was junk instead of losing track of all of them.
 _AMBIGUOUS_SIG = ("does not verify", "is not an object", "no signatures",
                   "sigs must be a list")
+
+# `WARN <wid12>  signature unbound: key <key12> claims actor <id>` — warrant.py's
+# own text rendering (`print(f"{level:4} {wid[:12]}  {msg}")`).
+_UNBOUND_LINE = re.compile(
+    r"^WARN\s+(\S+)\s+(?:signature unbound|binding unverified \(no keyring\)): "
+    r"key (\S+) claims actor (.*)$")
 
 
 def unbound_by_warrant():
@@ -491,9 +536,15 @@ def unbound_by_warrant():
     unverified` in its human report against the same keyring file OAIP writes.
     It is read from the TEXT output because the machine-readable report drops the
     finding in quiet mode (`if quiet: pass` in warrant.py's emitting branch), so
-    the JSON cannot carry it. Returns a set of 12-char WarrantID prefixes; an
-    unreadable run returns None, which callers must treat as "no corroboration",
-    never as "clean" — the enforced check is `unbound_signers`."""
+    the JSON cannot carry it.
+
+    Returns a set of (WarrantID prefix, key prefix, actor) triples — PER
+    SIGNATURE, not per record. Per record was a second way an appended co-sig
+    deleted an acceptance edge (C2-F1b): one unbound co-signature flagged the
+    whole record, so the corroboration refused a record whose named actor had
+    signed it perfectly well. An unreadable run returns None, which callers must
+    treat as "no corroboration", never as "clean" — the enforced check is
+    `accepting_signature`."""
     ensure_trust()
     r = wrun("--store", str(WSTORE), "verify", "--settlement",
              "--trust-config", str(TRUST))
@@ -501,10 +552,9 @@ def unbound_by_warrant():
         return None
     flagged = set()
     for line in (r.stdout + r.stderr).splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[0] == "WARN" and (
-                "signature unbound" in line or "binding unverified" in line):
-            flagged.add(parts[1])
+        m = _UNBOUND_LINE.match(line.strip())
+        if m:
+            flagged.add((m.group(1), m.group(2), m.group(3).strip()))
     return flagged
 
 
@@ -1289,9 +1339,9 @@ def read_warrant_store():
     return accepts, files, errors
 
 
-def signer_gate(report, actors, unbound_prefixes):
-    """Return `refuse(wid, env) -> reason|None`: does this record's signature
-    establish WHO accepted?
+def signer_gate(report, actors, unbound_sigs):
+    """Return `assess(wid, env) -> (refusal|None, notes)`: does this record's
+    signature establish WHO accepted?
 
     THE DEFECT THIS CLOSES (F7/F3, 2026-07-30, second adversarial round). The
     previous gate was `warrant verify` exiting 0, and Warrant exits 0 for a
@@ -1307,34 +1357,35 @@ def signer_gate(report, actors, unbound_prefixes):
         oaip log       ->  WARRANT 41d32da62a81…  (signed decision)
 
     for a claim NOBODY accepted, with the actor `tester@local` freely
-    impersonated. Three conditions must now hold, and each covers a way the other
-    two can be evaded:
-      * no signature on the record was EXCLUDED or malformed in Warrant's report
-        — otherwise OAIP cannot tell which of several signatures was the valid
-        one, and a bound-but-junk entry could stand next to an unbound-but-valid
-        one (§5 lets anyone with store write access append co-signatures);
-      * every signature entry VERIFIES under OAIP's own Ed25519 check and names
-        a key bound to the actor it claims in `.oaip/trust.json` — the ENFORCED
-        rule, OAIP's own, because Warrant has none to enforce and because a
-        delegated verifier is a verifier someone else can supply (C2-F1a); and
-      * Warrant's settlement grade does not itself call the record unbound
+    impersonated. The condition that must hold is one condition, about ONE
+    signature — the one the record's own `body.actor.id` is answerable for:
+      * it VERIFIES under OAIP's own Ed25519 check, over the WarrantID OAIP
+        recomputed from the record's bytes (C2-F1a: delegating this to a
+        subprocess named by an environment variable made it forgeable); and
+      * it names a key bound to that actor in `.oaip/trust.json` — the ENFORCED
+        rule, OAIP's own, because Warrant has none to enforce; and
+      * Warrant's settlement grade does not itself call THAT signature unbound
         against that same keyring file — corroboration, not the primary check.
-    """
+
+    Everything else on the record is a NOTE. Requiring all signatures to be bound
+    (and treating any "excluded signature" finding as fatal) made an appended
+    co-signature — which Warrant SPEC §5 explicitly permits, and which
+    `warrant verify` passes at 0 errors — silently delete the acceptance edge
+    (C2-F1b). A second endorser must be expressible; a griefer must not be able
+    to erase a decision by adding to it."""
     per_record = findings_by_record(report) if report else {}
 
-    def refuse(wid, env):
-        amb = [m for m in per_record.get(wid, [])
-               if any(k in m for k in _AMBIGUOUS_SIG)]
-        if amb:
-            return f"Warrant excluded or could not read a signature on it ({amb[0]})"
-        reasons = unaccounted_signatures(wid, env, actors)
-        if reasons:
-            return reasons[0]
-        if unbound_prefixes and wid[:12] in unbound_prefixes:
-            return (f"Warrant's settlement grade reports it unbound against {TRUST}")
-        return None
+    def assess(wid, env):
+        why, notes, key, actor = accepting_signature(wid, env, actors)
+        notes += [f"Warrant reports: {m}" for m in per_record.get(wid, [])
+                  if any(k in m for k in _AMBIGUOUS_SIG)]
+        if why is None and unbound_sigs and key and (
+                wid[:12], key[:12], actor) in unbound_sigs:
+            why = (f"Warrant's settlement grade reports THIS signature (key "
+                   f"{key[:12]}, actor {actor!r}) unbound against {TRUST}")
+        return why, notes
 
-    return refuse
+    return assess
 
 
 def cmd_rebuild(a):
@@ -1402,13 +1453,14 @@ def _rebuild(a):
     #      parseable `warrant.verify-report@v0` ruled out the accident; a stub
     #      that prints one defeated it entirely (third round, C2-F1a). Errors
     #      reported here still refuse a rebuild — a delegate may veto.
-    #   3. SIGNATURE + BINDING (this layer, OAIP's own, in process): every
-    #      signature must verify under `ed25519_verify` over the WarrantID OAIP
-    #      recomputed, AND name a key bound to the actor it claims in
-    #      `.oaip/trust.json`, which only `cmd_accept`/`oaip bind` ever write. An
-    #      accept signed by an unknown key — or by no key at all — gets NO EDGE,
-    #      whatever any subprocess says.
-    report, unbound_prefixes, actors = None, None, {}
+    #   3. SIGNATURE + BINDING (this layer, OAIP's own, in process): the
+    #      signature by the actor the record NAMES must verify under
+    #      `ed25519_verify` over the WarrantID OAIP recomputed, AND name a key
+    #      bound to that actor in `.oaip/trust.json`, which only
+    #      `cmd_accept`/`oaip bind` ever write. An accept signed by an unknown key
+    #      — or by no key at all — gets NO EDGE, whatever any subprocess says.
+    #      Other signatures are reported and cannot un-decide it (C2-F1b).
+    report, unbound_sigs, actors = None, None, {}
     if wrec_files:
         report, rerr = store_report()
         if rerr:
@@ -1424,7 +1476,22 @@ def _rebuild(a):
             actors, aerr = read_trust()
             if aerr:
                 store_bad.append(f"keyring: {aerr}")
-            unbound_prefixes = unbound_by_warrant()
+            unbound_sigs = unbound_by_warrant()
+
+    # What the CURRENT projection asserts, read before it is replaced. A rebuild
+    # that drops the protocol's central edge must not report success (C2-F1b):
+    # one appended co-signature made `oaip rebuild` print `warrant=0`, exit 0,
+    # and `oaip log` lose its WARRANT line — a fact deleted, announced as a
+    # successful reconstruction.
+    prev_edges = set()
+    if DB.is_file():
+        try:
+            con0 = db()
+            prev_edges = {(r[0], r[1]) for r in
+                          con0.execute("SELECT claim_id, warrant_id FROM warrants")}
+            con0.close()
+        except sqlite3.Error:
+            prev_edges = set()          # unreadable: nothing to compare against
 
     if art_bad or store_bad:
         for e in art_bad + store_bad:
@@ -1525,38 +1592,53 @@ def _rebuild(a):
     cutoff = note_convention_since()
     counts["warrant@edge"] = 0
 
+    derived, refused_why = set(), {}
+
     def edge(cid, wid, wts):
         cur = con.execute("INSERT OR IGNORE INTO warrants(claim_id,warrant_id,"
                           "created_at) VALUES (?,?,?)", (cid, wid, wts))
         counts["warrant@edge"] += cur.rowcount or 0
+        derived.add((cid, wid))
 
-    refuse_signer = signer_gate(report, actors, unbound_prefixes)
+    assess_signer = signer_gate(report, actors, unbound_sigs)
 
     for acc in accepts:
         subj_hash, wid, wts, note = (acc["subject"], acc["wid"], acc["ts"],
                                      acc["note"])
-        # WHO ACCEPTED, before WHAT was accepted. An acceptance whose signer is
-        # not bound to the actor it claims is not this actor's decision, however
-        # well-formed the rest of the record is (F7).
-        why = refuse_signer(wid, acc["env"])
+        # WHO ACCEPTED, before WHAT was accepted. An acceptance whose named actor
+        # did not sign it — or signed with a key nobody vouches for — is not that
+        # actor's decision, however well-formed the rest of the record is (F7).
+        why, notes = assess_signer(wid, acc["env"])
+        for n in notes:
+            # Reported, never fatal: §5 lets anyone append a co-signature, so a
+            # co-signature must not be able to delete a decision (C2-F1b).
+            print(f"NOTE  accept {wid[:12]}: {n}", file=sys.stderr)
         if why is not None:
-            print(f"WARN  accept {wid[:12]}: {why} — the signer is NOT bound to "
-                  "the actor it claims, so this is not that actor's decision; "
-                  "no acceptance edge derived (`oaip bind --actor <id>` if the "
-                  "key really is this ledger's)", file=sys.stderr)
+            refused_why[wid] = why
+            print(f"WARN  accept {wid[:12]}: {why} — no valid signature by a key "
+                  "bound to the actor this record NAMES, so this is not that "
+                  "actor's decision; no acceptance edge derived (`oaip bind "
+                  "--actor <id>` if the key really is this ledger's)",
+                  file=sys.stderr)
             continue
         if note[:len(NOTE_PREFIX)].lower() == NOTE_PREFIX:
             cid = note[len(NOTE_PREFIX):]
             c = claims_by_id.get(cid)
             if c is None:
+                refused_why[wid] = (f"it names claim {cid}, which is no longer "
+                                    "in the canonical layer")
                 print(f"WARN  accept {wid[:12]} names claim {cid} — no such "
                       "claim record in the canonical layer; edge not derived",
                       file=sys.stderr)
             elif c.get("subject") != subj_hash:
+                refused_why[wid] = (f"it names claim {cid} but carries a "
+                                    "different subject than that claim's")
                 print(f"WARN  accept {wid[:12]} names claim {cid} but the "
                       "warrant's subject is not that claim's subject; edge "
                       "not derived", file=sys.stderr)
             elif not c.get("supported"):
+                refused_why[wid] = (f"it names claim {cid}, whose own validation "
+                                    "check FAILED")
                 print(f"WARN  accept {wid[:12]} names claim {cid} whose own "
                       "check FAILED; cmd_accept would refuse it, so rebuild "
                       "refuses the edge", file=sys.stderr)
@@ -1644,6 +1726,25 @@ def _rebuild(a):
     UNTRUSTED.unlink(missing_ok=True)   # this projection WAS derived; it stands
     print("rebuilt projection from the canonical layer: "
           + ", ".join(f"{k.split('@')[0]}={v}" for k, v in sorted(counts.items())))
+
+    # A DROPPED EDGE IS NOT A SUCCESSFUL REBUILD (C2-F1b, third adversarial
+    # round). §5's "the same graph" is the promise; when the rebuild cannot keep
+    # it, the exit status must not say otherwise. The new projection stands —
+    # it is what the canonical layer actually supports — and the loss is named,
+    # edge by edge, with the reason the derivation refused it.
+    dropped = sorted(prev_edges - derived)
+    if dropped:
+        for cid, wid in dropped:
+            why = refused_why.get(wid, "the accept record is no longer in the "
+                                       "store, or no longer names this claim")
+            print(f"ERR   this rebuild LOST an acceptance edge the previous "
+                  f"projection asserted: claim {cid} -> warrant {wid[:12]} — "
+                  f"{why}", file=sys.stderr)
+        sys.exit(f"rebuilt, but {len(dropped)} acceptance edge(s) the previous "
+                 "projection asserted are NOT derivable from this canonical "
+                 "layer. The new projection is in place and no longer asserts "
+                 "them; that is a change to the graph, not a successful "
+                 "reconstruction.")
 
 
 def verify_artifacts():
@@ -1741,14 +1842,19 @@ def cmd_verify(_):
             print("ERR ", aerr)
             dec_errs.append(aerr)
         else:
-            refuse_signer = signer_gate(report, actors, unbound_by_warrant())
+            assess_signer = signer_gate(report, actors, unbound_by_warrant())
             for acc in accepts:
                 if not acc["note"].lower().startswith(NOTE_PREFIX):
                     continue        # not an OAIP claim acceptance; not ours to judge
-                why = refuse_signer(acc["wid"], acc["env"])
+                why, notes = assess_signer(acc["wid"], acc["env"])
+                for n in notes:
+                    # A co-signature is a fact about the record worth printing,
+                    # and not an error: §5 permits appending one (C2-F1b).
+                    print(f"NOTE  accept {acc['wid'][:12]}: {n}")
                 if why is not None:
-                    msg = (f"accept {acc['wid'][:12]} claims an OAIP claim but its "
-                           f"signer is not bound to the actor it claims: {why}")
+                    msg = (f"accept {acc['wid'][:12]} claims an OAIP claim but no "
+                           "key bound to the actor it names signed it: "
+                           f"{why}")
                     print("ERR ", msg)
                     dec_errs.append(msg)
         print(f"decision layer:  {report['records']} records, "

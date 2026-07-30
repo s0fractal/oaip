@@ -161,6 +161,19 @@ property is not enforced at all, that is written down rather than implied away.
     Warrant's `--trust-config` grade reports the same finding but by
     specification never fails on it, and its machine-readable report omits the
     finding entirely in quiet mode — so it is used as corroboration only.
+  - *The signature that must be valid and bound is the one by the actor the
+    record NAMES* (`body.actor.id`) — not every signature on it. Demanding all of
+    them handed a deletion primitive to anyone with store write access: Warrant
+    SPEC §5 permits appending a co-signature and will not let a junk one
+    invalidate a good record, so one appended, cryptographically VALID co-sig by
+    a second endorser left `warrant verify` at 0 errors and made `oaip rebuild`
+    print `warrant=0` **and exit 0**, deleting the acceptance edge and the
+    WARRANT line in `oaip log`. Extra signatures are now reported as `NOTE`s;
+    they endorse, they do not decide, and they cannot un-decide.
+  - *A rebuild that drops an edge the previous projection asserted exits
+    non-zero* and names each lost edge with the reason it was refused. §5's
+    promise is "the same graph"; when a rebuild cannot keep it, the exit status
+    must not say otherwise.
   - *A refused rebuild withdraws the projection's authority.* The refusal leaves
     the projection's bytes alone (fail-closed must not mean destroy-first), but
     writes `.oaip/projection.untrusted`, and `oaip log` / `oaip verify` then

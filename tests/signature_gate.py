@@ -318,9 +318,107 @@ def part_b():
              f"{edges(work)} vs {honest}")
 
 
+def ed25519_sign(seed, msg):
+    """(public key, signature) — RFC 8032, reusing the implementation's own point
+    arithmetic. A test that only ever produces JUNK signatures cannot show that a
+    VALID one is handled correctly, and C2-F1b is entirely about a valid one."""
+    h = bytearray(hashlib.sha512(seed).digest())
+    h[0] &= 248
+    h[31] &= 127
+    h[31] |= 64
+    a = int.from_bytes(h[:32], "little")
+
+    def compress(P):
+        inv = pow(P[2], O._ED_P - 2, O._ED_P)
+        x, y = P[0] * inv % O._ED_P, P[1] * inv % O._ED_P
+        return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+    pub = compress(O._ed_mul(a, O._ED_G))
+    r = int.from_bytes(hashlib.sha512(bytes(h[32:]) + msg).digest(),
+                       "little") % O._ED_L
+    R = compress(O._ed_mul(r, O._ED_G))
+    k = int.from_bytes(hashlib.sha512(R + pub + msg).digest(),
+                       "little") % O._ED_L
+    return pub, R + ((r + k * a) % O._ED_L).to_bytes(32, "little")
+
+
+def part_c():
+    with tempfile.TemporaryDirectory() as tmp:
+        work, run = make_repo(tmp, "cosign")
+        r = run("do", "--intent", "real work", "--check", "test -f f.txt",
+                "--actor", "tester@local", "--", "sh", "-c", "echo hi > f.txt")
+        if "ACCEPTED" not in r.stdout:
+            case("setup(C): the one-shot flow accepted", False, r.stdout + r.stderr)
+            return
+        honest = edges(work)
+        case("setup(C): there is an acceptance edge to lose", len(honest) == 1,
+             honest)
+        p, env = real_accept(work)
+        wid = p.stem
+
+        # A SECOND ENDORSER. Warrant SPEC §5 permits appending a co-signature to a
+        # filed record — the envelope is not hashed, only the body is — and
+        # deliberately will not let one invalidate a good record.
+        pub, sig = ed25519_sign(bytes.fromhex("11" * 32), bytes.fromhex(wid))
+        env["sigs"].append({"actor": "cosigner@other", "key": pub.hex(),
+                            "sig": sig.hex()})
+        p.write_text(json.dumps(env))
+        vr = subprocess.run(wcli() + ["--store", ".oaip/warrants", "verify"],
+                            cwd=work, capture_output=True, text=True)
+        case("negative control: `warrant verify` still reports 0 errors "
+             "(§5: an appended co-sig cannot invalidate a good record)",
+             vr.returncode == 0, (vr.stdout + vr.stderr)[-300:])
+        case("negative control: the co-signature really is VALID under OAIP's "
+             "own check", O.signature_verifies(wid, env["sigs"][-1]))
+        case("negative control: the record's own actor is still signed for",
+             O.signature_verifies(wid, env["sigs"][0]))
+
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("an appended VALID co-signature does NOT delete the acceptance edge",
+             edges(work) == honest, f"{edges(work)} vs {honest} | {out[-400:]}")
+        case("and the rebuild that keeps it exits 0", r.returncode == 0,
+             out[-300:])
+        case("the co-signature is REPORTED as a note, not acted on as a refusal",
+             "NOTE" in out and "co-signature" in out, out[-400:])
+        log = run("log")
+        case("`oaip log` still shows the WARRANT line", "WARRANT" in log.stdout,
+             log.stdout)
+        v = run("verify")
+        case("`oaip verify` passes a co-signed acceptance", v.returncode == 0,
+             (v.stdout + v.stderr)[-400:])
+
+        # A JUNK co-signature must not delete it either — same §5 reasoning, and
+        # this is the case Warrant reports as "excluded" rather than passing over.
+        env["sigs"].append({"actor": "griefer@other", "key": "cd" * 32,
+                            "sig": "ef" * 64})
+        p.write_text(json.dumps(env))
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("an appended JUNK co-signature does not delete the edge either",
+             edges(work) == honest and r.returncode == 0,
+             f"{edges(work)} | {out[-400:]}")
+        case("the junk entry is named as excluded",
+             "EXCLUDED" in out or "excluded" in out, out[-400:])
+
+        # THE OTHER HALF OF C2-F1b: when an edge really is dropped, say so and
+        # do not exit 0. Removing the accept record from the store is the
+        # simplest honest way to lose one.
+        p.unlink()
+        r = run("rebuild")
+        out = r.stdout + r.stderr
+        case("an edge that vanishes from the canonical layer is a LOUD failure, "
+             "not a silent success", r.returncode != 0, out[-400:])
+        case("the loud failure names the lost edge and the reason",
+             "LOST an acceptance edge" in out and wid[:12] in out, out[-500:])
+        case("and the new projection no longer asserts it", edges(work) == [],
+             edges(work))
+
+
 def main():
     part_a()
     part_b()
+    part_c()
     print("\nSIGNATURE-GATE: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1
 

@@ -383,7 +383,10 @@ def main():
 
         # P2: an accept whose claim record is gone from the canonical layer was
         # skipped SILENTLY. A missing half of the protocol's central edge is at
-        # least a warning.
+        # least a warning — and, since the third adversarial round (C2-F1b), a
+        # non-zero exit: the previous projection asserted that edge, this one
+        # cannot, and "the same graph" is exactly what §5 promised. A rebuild
+        # that drops the protocol's central fact must not report success.
         for p in (work / ".oaip" / "artifacts").iterdir():
             try:
                 doc = json.loads(p.read_text())
@@ -394,8 +397,9 @@ def main():
         r = run("rebuild")
         out = r.stdout + r.stderr
         case("an accept naming a vanished claim: edge skipped WITH a warning",
-             r.returncode == 0 and "WARN" in out and "no such claim" in out,
-             out[-300:])
+             "WARN" in out and "no such claim" in out, out[-300:])
+        case("...and the rebuild that dropped the edge does NOT exit 0",
+             r.returncode != 0 and "LOST an acceptance edge" in out, out[-400:])
 
     with tempfile.TemporaryDirectory() as tmp:
         # --- case 8: the subject COLLISION. One execution, one predicate, two
