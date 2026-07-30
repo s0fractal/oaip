@@ -1389,14 +1389,27 @@ def _accept(a):
     # binding records what actually signed; when `init` captured the public half
     # it is cross-checked, and a mismatch is fatal — it would mean the store was
     # signed by a key this ledger does not custody.
-    signed_key = next((s.get("key") for s in env.get("sigs", [])
-                       if isinstance(s, dict) and s.get("actor") == a.actor), None)
+    signed = next((s for s in env.get("sigs", [])
+                   if isinstance(s, dict) and s.get("actor") == a.actor), None)
+    signed_key = signed.get("key") if isinstance(signed, dict) else None
     if not (isinstance(signed_key, str) and HEX64.match(signed_key)):
         sys.exit(f"filed warrant {wid[:12]} carries no signature by {a.actor}; "
                  "refusing to record an acceptance nothing signed")
     if PUBKEY.is_file() and PUBKEY.read_text().strip() != signed_key:
         sys.exit(f"filed warrant {wid[:12]} was signed by {signed_key[:12]}, "
                  f"not by this ledger's own key ({PUBKEY.read_text().strip()[:12]})")
+    # AND THE SIGNATURE IS VERIFIED HERE TOO, by OAIP, before anything is
+    # recorded. `rebuild` and `verify` do it (C2-F1a) — but until they run, the
+    # LIVE projection would assert an acceptance whose only evidence was that the
+    # program named by $WARRANT_CLI said it had signed one. OAIP asks that
+    # program to sign, so it cannot avoid delegating the SIGNING; it can decline
+    # to take the result on trust.
+    if not signature_verifies(wid, signed):
+        sys.exit(f"filed warrant {wid[:12]}: the signature attributed to "
+                 f"{a.actor} does NOT verify against key {signed_key[:12]} "
+                 "(OAIP's own Ed25519 check). The record is in the store and "
+                 "nothing was recorded here — whatever produced it is not "
+                 "signing with the key it claims.")
     bind_actor(a.actor, signed_key)
     con.execute("INSERT OR IGNORE INTO warrants(claim_id,warrant_id,created_at)"
                 " VALUES (?,?,?)", (a.claim, wid, wts))

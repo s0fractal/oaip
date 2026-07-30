@@ -415,10 +415,54 @@ def part_c():
              edges(work))
 
 
+def part_d():
+    # `oaip accept` cannot avoid delegating the SIGNING — it does not hold an
+    # Ed25519 signer and asks the Warrant CLI to sign — but it can decline to
+    # take the result on trust. Until it did, a hostile $WARRANT_CLI could make
+    # the LIVE projection assert an acceptance nothing had signed; only a later
+    # rebuild or verify would have caught it.
+    with tempfile.TemporaryDirectory() as tmp:
+        work, run = make_repo(tmp, "acceptcheck")
+        # A wrapper that is the REAL Warrant CLI in every respect except that it
+        # corrupts the signature of the record it has just filed.
+        wrapper = work / "sabotage.py"
+        wrapper.write_text(
+            "import json, subprocess, sys\n"
+            "from pathlib import Path\n"
+            f"REAL = {wcli()!r}\n"
+            "r = subprocess.run(REAL + sys.argv[1:], capture_output=True, text=True)\n"
+            "sys.stderr.write(r.stderr)\n"
+            "if 'accept' in sys.argv and r.returncode == 0 and '--store' in sys.argv:\n"
+            "    wid = (r.stdout.strip().splitlines() or [''])[-1]\n"
+            "    p = (Path(sys.argv[sys.argv.index('--store') + 1]) / 'records'\n"
+            "         / (wid + '.json'))\n"
+            "    if p.is_file():\n"
+            "        env = json.loads(p.read_text())\n"
+            "        env['sigs'][0]['sig'] = 'ab' * 64\n"
+            "        p.write_text(json.dumps(env))\n"
+            "sys.stdout.write(r.stdout)\n"
+            "sys.exit(r.returncode)\n")
+        env = {"WARRANT_CLI": f"{sys.executable} {wrapper}"}
+        iid = run("intent", "sabotaged", env=env).stdout.strip()
+        eid = run("run", "--intent", iid, "--", "sh", "-c", "echo hi > f.txt",
+                  env=env).stdout.split()[1]
+        cid = run("claim", "--execution", eid, "--predicate", "p",
+                  "--check", "true", env=env).stdout.split()[1]
+        r = run("accept", "--claim", cid, "--actor", "tester@local", env=env)
+        out = r.stdout + r.stderr
+        case("a CLI that files an unsigned record: accept REFUSES",
+             r.returncode != 0 and "ACCEPTED" not in r.stdout, out[-400:])
+        case("the refusal names OAIP's own check, not the CLI's exit status",
+             "does NOT verify" in out, out[-400:])
+        case("and no acceptance edge reached the live projection",
+             all(c != cid for c, _ in edges(work)), edges(work))
+
+
 def main():
     part_a()
     part_b()
     part_c()
+    part_d()
     print("\nSIGNATURE-GATE: " + ("ALL PASS" if ok else "FAILURES"))
     return 0 if ok else 1
 

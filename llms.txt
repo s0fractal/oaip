@@ -152,7 +152,10 @@ property is not enforced at all, that is written down rather than implied away.
     recomputed from the record's own bytes** before any edge is derived. That is
     why no program named by `$WARRANT_CLI` can manufacture an acceptance any
     more; Warrant is still consulted and its errors still refuse a rebuild — a
-    delegate may veto, it may not vouch.
+    delegate may veto, it may not vouch. `oaip accept` verifies the record it
+    just asked the CLI to sign, before recording anything: OAIP holds no signer,
+    so it cannot avoid delegating the SIGNING, but it does not take the result on
+    trust either.
   - *Binding* is enforced alongside it, and it is **OAIP's own rule, not
     Warrant's**: an acceptance edge is derived only if the signature is valid AND
     names a key bound to the actor it claims in `.oaip/trust.json`, which only
