@@ -22,6 +22,25 @@ Because those treat **an agent's own JSON as fact**: it wrote "fixed auth", so t
 
 So the bridge **refuses** to accept a claim whose check failed — even if the command returned 0. That refusal is the whole product.
 
+## Install
+
+```bash
+pipx install oaip
+pipx install warrant-verify
+```
+
+`oaip` 0.3.0 is the current release on PyPI. The second line is not optional
+scenery: SPEC §1 and §3 make [Warrant](https://github.com/s0fractal/warrant) a
+**normative dependency**, invoked as an external CLI (`$WARRANT_CLI`, or a
+sibling checkout) rather than imported, so a venv holding only the first one has
+no decision layer and can accept nothing. It must be Warrant SPEC v0.4 / package
+≥ 0.6.0; older versions sign a different message and every acceptance is
+refused.
+
+Everything below is written in the checkout form (`python3 $oaip …`) because
+that is what a contributor runs; with the wheel installed, `oaip …` is the same
+program.
+
 ## Ten seconds
 
 ```bash

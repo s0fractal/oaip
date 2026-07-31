@@ -5,14 +5,24 @@ stored anywhere. Cutting a GitHub Release builds, validates, and publishes the
 package (`.github/workflows/publish.yml`). You do a **one-time** setup on PyPI,
 then every release publishes itself.
 
-- **Distribution name:** `oaip` (checked 2026-07-30:
-  <https://pypi.org/simple/oaip/> returns **404**, i.e. the name is free — but
-  PyPI is first-come, and this is only true until someone else takes it).
+- **Distribution name:** `oaip` — claimed, and held by this repository's Trusted
+  Publisher: <https://pypi.org/project/oaip/>.
 - **Import module & CLI command:** `oaip` (the flat `impl/oaip.py`, unchanged).
 - **What ships:** one stdlib-only module and the `oaip` console script. Nothing
   else — no `examples/`, no `tests/`, no Warrant.
-- **Nothing has ever been published from this repository.** There are no tags
-  and no releases. Everything below is the first time.
+- **Released so far:** **0.1.0**, **0.2.0** and **0.2.1** (all 2026-07-30) and
+  **0.3.0** (2026-07-31, current). Tags `v0.1.0` … `v0.3.0`. Every one went out
+  through the workflow below; none was uploaded by hand.
+- **One of the four shipped broken.** 0.2.0 passed the release gate as it then
+  stood and `pip install oaip==0.2.0 && cd /tmp && oaip records` raised
+  `FileNotFoundError` for the entire life of that release; 0.2.1 exists to fix
+  it, and the gate was rewritten to measure the artifact instead of the
+  checkout (step 3 below). A publish path that runs is not a publish path that
+  catches things.
+- **What has been checked about the published artifact:** the maintainer
+  installed 0.3.0 from PyPI into a clean venv and ran `oaip records` to
+  `OAIP-RECORDS: ALL PASS (117/117)`. Nobody else is known to have installed
+  any release. If this file and PyPI ever disagree, PyPI is right.
 
 ## Warrant is NOT installed with this package, and that matters
 
@@ -27,10 +37,15 @@ is the observer, not the whole stack.
 
 ## One-time setup (you, on the web — I can't do this part)
 
+> **Already done.** The publisher exists and has minted tokens for four
+> releases. Kept for the next project, and for re-establishing the publisher if
+> it is ever lost — but the project now exists on PyPI, so re-establishing it is
+> an ordinary publisher, not a *pending* one.
+
 ### 1. Add a "pending publisher" on PyPI
 
-The project does not exist on PyPI yet, so this is a *pending* publisher: it
-creates the project on the first publish. Go to
+Before the first publish the project did not exist on PyPI, so this was a
+*pending* publisher: it creates the project on the first publish. Go to
 <https://pypi.org/manage/account/publishing/> → "Add a pending publisher" and
 enter **exactly**:
 
@@ -49,18 +64,20 @@ Repeat on <https://test.pypi.org/manage/account/publishing/> with Environment
 
 In the repo → Settings → Environments, create `pypi` (and optionally `testpypi`).
 Add protection to `pypi` if you want a manual approval gate before each publish
-(recommended: "Required reviewers" = you). The first publish is the one that
-claims the name; a gate there is cheap.
+(recommended: "Required reviewers" = you). The name is already claimed; the gate
+is now about not shipping a bad artifact — which has happened once — and a
+version number on PyPI cannot be reused even after a delete.
 
 ## Releasing (every version, automated)
 
 1. Bump `version` in `pyproject.toml` and merge to `main` through the normal
    branch + review path.
-2. Cut a GitHub Release with tag **`v0.1.0`** — the `v` plus the exact pyproject
-   version. The workflow fails the build if they disagree:
+2. Cut a GitHub Release with tag **`v0.3.1`** — the `v` plus the exact pyproject
+   version (which is `0.3.0` right now, so it must be bumped first). The
+   workflow fails the build if they disagree:
 
    ```bash
-   gh release create v0.1.0 --generate-notes
+   gh release create v0.3.1 --generate-notes
    ```
 3. The `publish` workflow builds, runs `twine check`, installs the wheel into a
    fresh venv, and runs `tools/check_release_surface.py` against that install.
@@ -92,10 +109,12 @@ claims the name; a gate there is cheap.
    oaip --help
    ```
 
-## Dry run before the first real release (recommended)
+## Dry run on TestPyPI (never actually performed)
 
-After the TestPyPI pending publisher + `testpypi` environment exist, trigger the
-workflow manually to publish to TestPyPI only:
+All four real releases went straight to PyPI; the `testpypi` job has never
+executed, so this is a documented plan and not a tested procedure — and 0.2.0 is
+what it would have been for. After the TestPyPI pending publisher + `testpypi`
+environment exist, trigger the workflow manually to publish to TestPyPI only:
 
 ```bash
 gh workflow run publish.yml
@@ -128,13 +147,13 @@ python3 -m build && python3 -m venv /tmp/ov && /tmp/ov/bin/pip install dist/*.wh
 python3 tools/check_release_surface.py --wheel dist/*.whl --bin /tmp/ov/bin
 ```
 
-## After the first publish
+## After the first publish — done
 
-- Add the one-liner (`pipx install oaip`) to `README.md`, which currently only
-  documents the checkout form (`python3 $oaip …`). The release-surface gate reads
-  both forms, so the new lines are checked from the moment they are written.
-- Record the published version here, and remember that if this file and PyPI ever
-  disagree, PyPI is right.
+- `README.md` carries the installed form (`pipx install oaip`) beside the
+  checkout form (`python3 $oaip …`). The release-surface gate reads both, so
+  those lines have been checked against the real parser since the moment they
+  were written.
+- The published versions are recorded at the top of this file.
 
 ## Manual fallback (if you ever bypass CI)
 
