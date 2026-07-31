@@ -7,7 +7,7 @@ name = "oaip"
 # Tracks SPEC.md ("Specification v0.1"). Tags: v0.1.0, v0.2.0.
 # 0.2.1 is a defect release: 0.2.0 is on PyPI with `oaip conformance` and
 # `oaip records` raising FileNotFoundError anywhere but a checkout.
-version = "0.2.1"
+version = "0.3.0"
 description = "Observed Action & Intent Protocol: a content-addressed causal graph of what humans, agents, and tools actually did — and on what observed basis you accepted the result."
 readme = "README.md"
 requires-python = ">=3.9"
