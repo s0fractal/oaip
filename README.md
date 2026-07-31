@@ -1,6 +1,17 @@
 # OAIP — Observed Action & Intent Protocol
 
-**A content-addressed causal graph of what humans, agents, and tools actually did — and on what observed basis you accepted the result.**
+**An agent reports that it fixed the thing. The pipeline exits 0. Who checked, and
+who decided that what they checked was the thing?**
+
+That is one question, not two, and the second half is where it goes wrong. Almost
+every tool in this area takes an agent's own account of its work as the record of
+that work: it wrote "fixed auth", so the dashboard says auth is fixed. Even when a
+check runs, the party being checked usually supplied the check, chose its scope,
+and reported the result. OAIP is built so that the account of what happened is
+**observed** rather than reported, and so that accepting it is a separate act by a
+separate key: *what* changed and *from which* workspace state are measured, not
+narrated; *why* and *by whom* are recorded with honest uncertainty; and the
+acceptance is a signed record citing a validation that anyone can re-run.
 
 Git remembers **what** changed. OAIP remembers the rest: *why* (intent), *by whom*, *from which workspace state*, *on what observed evidence*, *what was validated*, and — the part that matters for agents — that a change was **accepted**, not just that a command exited 0.
 
