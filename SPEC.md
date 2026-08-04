@@ -1384,6 +1384,17 @@ Book III territory); signing of OAIP records themselves; a normative threat mode
 (§8 states one, and states it as informative about the format); and any opinion
 on whether an intent was satisfied or which policy has authority.
 
+**Anomaly-oriented experience profile (future).** A future profile may exchange
+experience primarily as deviations from an explicitly referenced expectation
+rather than as an exhaustive event stream. An anomaly is relative to an
+observer, model, and context: it must cite both the observation and the
+expectation against which it was classified. A baseline coverage statement or
+aggregate baseline digest is required so that omitted ordinary events are not
+mistaken for absence of observation. An anomaly is evidence from which a claim
+may be constructed; it is not itself a decision, warrant, policy consequence, or
+authorization. This paragraph is informative and adds no v0.1 record type or
+conformance requirement.
+
 ## 12. Reference implementation
 
 `impl/oaip.py` — `init`; the four recording verbs `intent`, `run`, `claim`,
