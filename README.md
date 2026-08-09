@@ -143,7 +143,9 @@ taking a hard dependency on Warrant. See
 [`examples/graduate-decision.sh`](examples/graduate-decision.sh). So the four
 repos compose into one stack: Σ-GLYPH computes checks, OAIP observes doing,
 mind-os records reasoning, and Warrant is the signed-decision tier both provenance
-halves graduate into.
+halves graduate into. Which of these links are CI-gated contracts and which are
+still proposals is indexed in the
+[ecosystem relationship map](https://github.com/s0fractal/protocol-ecosystem).
 
 ## Who can forge an acceptance here
 
